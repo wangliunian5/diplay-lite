@@ -1147,24 +1147,14 @@ class CarPlayController(
                     return@postDelayed
                 }
                 debugLog("wireless handoff timed out waiting for tunnel iAP2 readiness")
-                Thread(
-                    {
-                        if (
-                            closed ||
-                            phase != Phase.WIRELESS ||
-                            generation != wirelessGeneration.get() ||
-                            wirelessActiveReported.get()
-                        ) {
-                            return@Thread
-                        }
-                        closeWirelessStack()
-                        fail(IOException("Wireless CarPlay handoff timed out waiting for tunnel iAP2"))
-                    },
-                    "xcertplay-wireless-handoff-timeout",
-                ).apply {
-                    isDaemon = true
-                    start()
-                }
+                // TEST-A: 超时后不再拆栈/失败，降级保持「蓝牙 iAP2 控制 + Wi-Fi 音视频」继续运行。
+                // iPhone 一旦建立 type-130 隧道，onWirelessTunnelReady -> maybeCompleteWirelessHandoff
+                // 会自动完成切换；若 iPhone 主动关闭蓝牙 RFCOMM，CHANNEL_CLOSED 分支会因
+                // handoffInProgress=true 而保持 Wi-Fi AirPlay 会话，不会 fail。
+                debugLog(
+                    "handoff degraded (TEST-A): keeping Bluetooth iAP2 + Wi-Fi A/V; " +
+                        "will upgrade when iPhone opens type-130 data stream",
+                )
             },
             WIRELESS_HANDOFF_TIMEOUT_MILLIS,
         )
