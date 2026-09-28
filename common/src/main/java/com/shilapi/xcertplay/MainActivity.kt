@@ -44,12 +44,12 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.padding(padding).padding(24.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        Text("Board I2C diagnostic")
+                        Text("板载 I2C 诊断")
                         OutlinedTextField(
                             value = devicePath,
                             onValueChange = { devicePath = it },
                             modifier = Modifier.fillMaxWidth(),
-                            label = { Text("Linux I2C device") },
+                            label = { Text("Linux I2C 设备") },
                             singleLine = true,
                             enabled = status !is DiagnosticStatus.Running,
                         )
@@ -57,11 +57,11 @@ class MainActivity : ComponentActivity() {
                             onClick = { runSelfCheck(devicePath) },
                             enabled = status !is DiagnosticStatus.Running,
                         ) {
-                            Text("Run MFi self-check")
+                            Text("运行 MFi 自检")
                         }
                         Spacer(Modifier.height(4.dp))
                         Text(status.message())
-                        Text("CH341 requires deployment-specific VID/PID configuration.")
+                        Text("CH341 需要针对部署配置特定的 VID/PID。")
                     }
                 }
             }
@@ -80,7 +80,7 @@ class MainActivity : ComponentActivity() {
                 LinuxI2cTransport.open(devicePath).use { MfiSelfCheck(it).run() }
                     .let { DiagnosticStatus.Result(it) }
             } catch (error: LinkageError) {
-                DiagnosticStatus.Failure(error.message ?: "I2C native library is unavailable")
+                DiagnosticStatus.Failure(error.message ?: "I2C 原生库不可用")
             } catch (error: Exception) {
                 DiagnosticStatus.Failure(error.message ?: error.javaClass.simpleName)
             }
@@ -98,21 +98,21 @@ private sealed class DiagnosticStatus {
     data class Failure(val message: String) : DiagnosticStatus()
 
     fun message(): String = when (this) {
-        Idle -> "Idle"
-        Running -> "Running…"
-        is Failure -> "Failed: $message"
+        Idle -> "空闲"
+        Running -> "运行中…"
+        is Failure -> "失败：$message"
         is Result -> {
             val chip = selfCheck.chip ?: return if (selfCheck.discovery.interrupted) {
-                "MFi scan interrupted"
+                "MFi 扫描被中断"
             } else {
-                "Found: none"
+                "未发现设备"
             }
             val major = when (val result = chip.protocolMajor) {
                 is MfiProtocolMajorResult.Value -> "%d".format(result.major)
                 is MfiProtocolMajorResult.MfiFailure -> result.error.message ?: result.error.javaClass.simpleName
                 is MfiProtocolMajorResult.TransportFailure -> result.error.message ?: result.error.javaClass.simpleName
             }
-            "Found: 0x%02X; device version: 0x%02X; protocol major (raw): %s".format(
+            "发现：0x%02X；设备版本：0x%02X；协议主版本（原始）：%s".format(
                 chip.address7Bit,
                 chip.deviceVersion,
                 major,

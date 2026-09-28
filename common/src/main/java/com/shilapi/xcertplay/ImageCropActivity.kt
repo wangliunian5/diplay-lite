@@ -46,7 +46,7 @@ class ImageCropActivity : Activity() {
             textSize = 16f
             gravity = Gravity.CENTER
             setPadding(dp(12), dp(8), dp(12), dp(8))
-            text = "Loading image"
+            text = "正在加载图片"
         }
 
         val controls = LinearLayout(this).apply {
@@ -56,7 +56,7 @@ class ImageCropActivity : Activity() {
         }
         controls.addView(
             Button(this).apply {
-                text = "Cancel"
+                text = "取消"
                 isAllCaps = false
                 setOnClickListener {
                     setResult(RESULT_CANCELED)
@@ -67,7 +67,7 @@ class ImageCropActivity : Activity() {
         )
         controls.addView(
             Button(this).apply {
-                text = "Save 1:1"
+                text = "保存 1:1"
                 isAllCaps = false
                 setOnClickListener { saveCrop() }
             },
@@ -116,10 +116,10 @@ class ImageCropActivity : Activity() {
                     return@runOnUiThread
                 }
                 if (bitmap == null) {
-                    statusView.text = "Could not decode image"
+                    statusView.text = "无法解码图片"
                 } else {
                     cropView.setBitmap(bitmap)
-                    statusView.text = "Drag to move, pinch to zoom"
+                    statusView.text = "拖动移动，双指缩放"
                 }
             }
         }
@@ -133,13 +133,13 @@ class ImageCropActivity : Activity() {
 
     private fun saveCrop() {
         val cropped = cropView.cropToSquare() ?: run {
-            statusView.text = "Image is not ready"
+            statusView.text = "图片未就绪"
             return
         }
         val encoded = ByteArrayOutputStream().use { output ->
             if (!cropped.compress(Bitmap.CompressFormat.PNG, 100, output)) {
                 cropped.recycle()
-                statusView.text = "Could not encode image"
+                statusView.text = "无法编码图片"
                 return
             }
             cropped.recycle()
@@ -153,7 +153,7 @@ class ImageCropActivity : Activity() {
             )
             finish()
         } catch (_: Exception) {
-            statusView.text = "Could not save image"
+            statusView.text = "无法保存图片"
         }
     }
 

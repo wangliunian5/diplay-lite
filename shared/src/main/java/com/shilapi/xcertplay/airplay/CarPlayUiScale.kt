@@ -10,10 +10,10 @@ object CarPlayUiScale {
     fun sanitize(percent: Int): Int = percent.takeIf { it in presets } ?: DEFAULT
 
     fun label(percent: Int): String = when (sanitize(percent)) {
-        75 -> "Smaller"
-        85 -> "Small"
-        115 -> "Large"
-        else -> "Default"
+        75 -> "更小"
+        85 -> "小"
+        115 -> "大"
+        else -> "默认"
     }
 
     fun apply(display: AirPlayDisplayConfig, percent: Int): AirPlayDisplayConfig {

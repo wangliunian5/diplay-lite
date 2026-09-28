@@ -38,3 +38,6 @@ release-signing.properties
 *.key
 *.apk
 *.aab
+
+# Allow archived release APKs (keep only the last 3)
+!apks/*.apk

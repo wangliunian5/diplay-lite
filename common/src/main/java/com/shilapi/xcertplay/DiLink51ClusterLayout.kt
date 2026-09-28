@@ -14,10 +14,10 @@ internal object DiLink51ClusterLayout {
     private const val PREFS = "diplay_cluster_layout"
 
     enum class Theme(val label: String) {
-        SCENARIO("Scenario · side map"), MAP("Map · full map"), SIMPLE("Simple · side map")
+        SCENARIO("场景 · 侧边地图"), MAP("地图 · 全屏地图"), SIMPLE("简洁 · 侧边地图")
     }
     enum class Contrast(val label: String) {
-        DEFAULT("Theme default"), LIGHT("Light background · dark instruments"), DARK("Dark background · light instruments")
+        DEFAULT("主题默认"), LIGHT("浅色背景 · 深色仪表"), DARK("深色背景 · 浅色仪表")
     }
     data class Plan(val left: Int, val top: Int, val width: Int, val height: Int, val fullMap: Boolean) {
         // Crop at native pixel scale around the centered car marker, retaining the bottom

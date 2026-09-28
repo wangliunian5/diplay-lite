@@ -38,7 +38,7 @@ class StandaloneHudDemoActivity : Activity() {
                 transmit(BydStandalonePackets.guidance(if (turn == 1) 2 else 3, 0, distance, road)!!)
                 if (turn != lastTurn) Log.i(TAG, "APP_GUIDANCE uid=${Process.myUid()} turn=$turn distance=$distance")
                 lastTurn = turn
-                status.text = (if (turn == 1) "LEFT — 500 m" else "RIGHT — 800 m") + "\n" + road
+                status.text = (if (turn == 1) "左转 — 500 米" else "右转 — 800 米") + "\n" + road
                 handler.postDelayed(this, 1_000)
             } catch (error: Exception) {
                 Log.e(TAG, "Demo failed", error)
@@ -49,24 +49,24 @@ class StandaloneHudDemoActivity : Activity() {
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
-        status = TextView(this).apply { textSize = 32f; text = "Standalone HUD test ready" }
+        status = TextView(this).apply { textSize = 32f; text = "独立 HUD 测试已就绪" }
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(40, 40, 40, 40)
             addView(status)
             addView(TextView(this@StandaloneHudDemoActivity).apply {
-                text = "Parked test: Muscat Road / left 500 m, then Sultan Qaboos Street / right 800 m; 8 seconds each, then clear."
+                text = "静态测试：Muscat Road / 左转 500 米，随后 Sultan Qaboos Street / 右转 800 米；每段 8 秒，然后清除。"
                 textSize = 22f
             })
             addView(Button(this@StandaloneHudDemoActivity).apply {
-                text = "Start 16-second test"
+                text = "开始 16 秒测试"
                 setOnClickListener { startDemo() }
             })
             addView(Button(this@StandaloneHudDemoActivity).apply {
-                text = "Clear HUD"
+                text = "清除 HUD"
                 setOnClickListener {
                     try { validateTarget(); showing = true; clear("button") }
-                    catch (error: Exception) { status.text = "Clear unavailable: ${error.message}" }
+                    catch (error: Exception) { status.text = "无法清除：${error.message}" }
                 }
             })
         })
@@ -112,7 +112,7 @@ class StandaloneHudDemoActivity : Activity() {
             handler.postDelayed(tick, 250)
         } catch (error: Exception) {
             Log.e(TAG, "Standalone preflight/start failed", error)
-            status.text = "Test unavailable: ${error.message}"
+            status.text = "测试不可用：${error.message}"
             clear("start failed")
         }
     }
@@ -131,10 +131,10 @@ class StandaloneHudDemoActivity : Activity() {
                 // Broadcast delivery is not a hardware acknowledgement.
                 Log.i(TAG, "APP_CLEAR_SENT uid=${Process.myUid()} reason=$reason")
                 showing = false
-                status.text = "Clear sent — check windshield"
+                status.text = "清除指令已发送 — 请查看挡风玻璃"
             } catch (error: Exception) {
                 Log.e(TAG, "Clear failed; retry with Clear HUD", error)
-                status.text = "Clear failed — tap Clear HUD"
+                status.text = "清除失败 — 请点击清除 HUD"
             }
         }
 

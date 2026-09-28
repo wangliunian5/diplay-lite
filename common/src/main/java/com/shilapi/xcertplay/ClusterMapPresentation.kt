@@ -108,7 +108,7 @@ internal class ClusterMapPresentation(
             root.addView(surfaceView, videoParams)
         }
         waitingLabel = TextView(context).apply {
-            text = "DiPlay · waiting for the CarPlay map"
+            text = "DiPlay · 正在等待 CarPlay 地图"
             setTextColor(if (plan != null && !dark) Color.DKGRAY else Color.WHITE)
             textSize = 26f
             gravity = Gravity.CENTER

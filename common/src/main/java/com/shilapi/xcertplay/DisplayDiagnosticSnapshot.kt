@@ -53,6 +53,6 @@ internal object DisplayDiagnosticSnapshot {
     fun report(context: Context): String {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         return fields.mapNotNull { prefs.getString(it, null)?.let(DiagnosticRedactor::redact) }
-            .joinToString("\n").ifEmpty { "No display negotiation recorded yet." }
+            .joinToString("\n").ifEmpty { "尚无显示协商记录。" }
     }
 }
