@@ -93,7 +93,7 @@ class DiPlayActivity : ComponentActivity() {
     /** 每次启动软件时展示免责提示。本版本为第三方汉化修改版，供用户自行承担后果地学习/测试。 */
     private fun showDisclaimerDialog() {
         val notice =
-            "本应用为“DiPlay汉化版”，基于开源 DiPlay 汉化修改，并非 Apple 官方或项目作者的版本。\n\n" +
+            "本应用为“DiPlay汉化”，基于开源 DiPlay 汉化修改，并非 Apple 官方或项目作者的版本。\n\n" +
                 "免责声明：\n" +
                 "1. 本版本仅供个人学习与技术测试使用，请遵守所在地区法律法规。\n" +
                 "2. 使用 CarPlay 功能时请遵守交通法规，切勿在行车过程中进行任何分散注意力的操作，安全驾驶第一。\n" +
