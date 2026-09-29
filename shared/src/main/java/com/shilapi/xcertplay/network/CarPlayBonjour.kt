@@ -135,7 +135,8 @@ class CarPlayBonjour(
     private val lifecycleLock = Any()
     private val localAdvertisedAddress = advertisedHostAddress()
     private val multicastLock = (context.applicationContext ?: context)
-        .getSystemService(WifiManager::class.java)
+        .getSystemService(Context.WIFI_SERVICE)
+        .let { it as WifiManager }
         .createMulticastLock("carplay-bonjour").apply { setReferenceCounted(false) }
 
     private var started = false

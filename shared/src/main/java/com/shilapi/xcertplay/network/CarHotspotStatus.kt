@@ -18,7 +18,7 @@ object CarHotspotStatus {
      * while tethering is off.
      */
     fun isEnabled(context: Context): Boolean? {
-        val wifi = context.applicationContext.getSystemService(WifiManager::class.java) ?: return null
+        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return null
         return runCatching {
             WifiManager::class.java.getMethod("getWifiApState").invoke(wifi) as Int == WIFI_AP_STATE_ENABLED
         }.recoverCatching {

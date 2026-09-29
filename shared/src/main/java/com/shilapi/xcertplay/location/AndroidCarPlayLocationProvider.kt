@@ -24,7 +24,7 @@ class AndroidCarPlayLocationProvider(
     private val preferredLocationAgeMillis: Long = DEFAULT_PREFERRED_LOCATION_AGE_MILLIS,
 ) : Iap2LocationProvider {
     private val locationManager =
-        context.applicationContext.getSystemService(LocationManager::class.java)
+        context.applicationContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
     private val stateLock = Any()
     private val preferredProviders = buildList {
         add(LocationManager.GPS_PROVIDER)

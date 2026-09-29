@@ -154,9 +154,9 @@ class CarPlayController(
     private enum class Phase { IDLE, MFI, WIRELESS, IPHONE, REENUMERATION, DATAPATHS, CONTROL }
 
     private val appContext = context.applicationContext
-    private val usbManager = context.getSystemService(UsbManager::class.java)
+    private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager? ?: throw IllegalStateException("UsbManager unavailable")
     private val bluetoothAdapter =
-        appContext.getSystemService(BluetoothManager::class.java)?.adapter
+        (appContext.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
     private val iphoneHost = IphoneUsbHost(
         appContext,
         usbManager,

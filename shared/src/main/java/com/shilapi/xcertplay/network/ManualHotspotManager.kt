@@ -40,8 +40,8 @@ class ManualHotspotManager(
 ) : WirelessHotspotManager {
     private val appContext = context.applicationContext
     private val connectivityManager =
-        appContext.getSystemService(ConnectivityManager::class.java)
-    private val wifiManager = appContext.getSystemService(WifiManager::class.java)
+        appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private val wifiManager = appContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         ?: throw IllegalStateException("WifiManager is unavailable")
     private val expectedSsid = ssid
     private val passphrase = passphrase

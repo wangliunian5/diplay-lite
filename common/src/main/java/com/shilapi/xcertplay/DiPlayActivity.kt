@@ -532,7 +532,13 @@ class DiPlayActivity : ComponentActivity() {
             setPadding(0, dp(16), 0, dp(16))
         })
         body.addView(button("复制命令", false) {
-            getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(
+            val clipboard = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                getSystemService(android.content.ClipboardManager::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            }
+            clipboard.setPrimaryClip(
                 android.content.ClipData.newPlainText("DiPlay 使用情况访问权限", command))
             toast("已复制到车机剪贴板。请在电脑上运行该命令。")
         }, matchButton(0, 56))
@@ -635,7 +641,12 @@ class DiPlayActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
             bluetoothPermission.launch(Manifest.permission.BLUETOOTH_CONNECT); return
         }
-        val adapter = getSystemService(BluetoothManager::class.java)?.adapter
+        val adapter: android.bluetooth.BluetoothAdapter? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            getSystemService(BluetoothManager::class.java)?.adapter
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(android.content.Context.BLUETOOTH_SERVICE) as android.bluetooth.BluetoothAdapter?
+        }
         if (adapter == null || !adapter.isEnabled) {
             AlertDialog.Builder(this).setTitle("开启蓝牙")
                 .setMessage("请先开启车机蓝牙并配对您的 iPhone。")
@@ -687,7 +698,12 @@ class DiPlayActivity : ComponentActivity() {
     }
 
     private fun resetWirelessGroup() {
-        val manager = getSystemService(android.net.wifi.p2p.WifiP2pManager::class.java)
+        val manager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            getSystemService(android.net.wifi.p2p.WifiP2pManager::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(android.content.Context.WIFI_P2P_SERVICE) as android.net.wifi.p2p.WifiP2pManager?
+        }
         if (manager == null) { toast("此车机不支持 Wi-Fi Direct。"); return }
         val channel = manager.initialize(this, mainLooper, null)
         try {
