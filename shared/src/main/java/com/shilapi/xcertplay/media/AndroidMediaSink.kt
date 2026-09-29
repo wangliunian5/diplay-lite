@@ -532,6 +532,13 @@ private class AudioRenderer(
     private var underrunsAtPlaybackStart = 0
     private var lastPcmWriteNs = 0L
     private var rebufferCount = 0
+    // P0: RTP frame-loss compensation state (see compensateMissingFrames).
+    private var lastTimestampUs = -1L
+    private var lastIncrementUs = 0L
+    private var expectedTimestampUs = -1L
+    private var silenceScratch = ByteArray(0)
+    private var packetsCompensated = 0L
+    private var gapUsCompensated = 0L
     private val thread = Thread(::run, "carplay-audio").apply { isDaemon = true }
 
     fun start() {
@@ -741,6 +748,7 @@ private class AudioRenderer(
     private fun handle(packet: AudioPacket) {
         val rtp = packet.rtp
         val timestampUs = sampleTimestampUs(packet.sample)
+        compensateMissingFrames(timestampUs)
         when (format.codec) {
             AudioCodecKind.LPCM -> writePcm(byteSwapS16(rtp.copyOfRange(12, rtp.size)))
             AudioCodecKind.AAC_LC -> {
@@ -780,6 +788,60 @@ private class AudioRenderer(
 
     private fun sampleTimestampUs(sample: Int): Long =
         (sample.toLong() and 0xffff_ffffL) * 1_000_000L / format.sampleRate
+
+    /**
+     * P0: fill holes left by lost RTP packets so the decoded PCM timeline stays continuous.
+     *
+     * The RTP timestamps of packets that actually arrive are contiguous; a positive gap against
+     * the expected timestamp means whole frames never reached this device (logs show
+     * lateOrDuplicate=0, so lost frames never arrive late). For such gaps we synthesize silence
+     * of exactly the missing duration and write it to the track, instead of letting the decoder
+     * emit a hole that AudioTrack renders as an audible dropout.
+     *
+     * A legitimate stream pause (user stops audio, Siri burst ends) also produces a timestamp
+     * jump, so compensation is bounded: only gaps up to [MAX_COMPENSATE_US] while packets keep
+     * flowing within [MAX_PACKET_IDLE_NS] are filled; larger jumps reset the tracking state.
+     */
+    private fun compensateMissingFrames(timestampUs: Long) {
+        if (lastTimestampUs < 0L) {
+            lastTimestampUs = timestampUs
+            expectedTimestampUs = timestampUs
+            return
+        }
+        val incrementUs = timestampUs - lastTimestampUs
+        if (incrementUs > 0L && incrementUs <= MAX_FRAME_US) lastIncrementUs = incrementUs
+        val gapUs = timestampUs - expectedTimestampUs
+        lastTimestampUs = timestampUs
+        if (gapUs <= 0L || lastIncrementUs <= 0L) {
+            expectedTimestampUs = timestampUs + lastIncrementUs
+            return
+        }
+        val streamActive = System.nanoTime() - lastArrivalNs.get() <= MAX_PACKET_IDLE_NS
+        if (streamActive && gapUs <= MAX_COMPENSATE_US) {
+            val missingBytes = (gapUs * bytesPerSecond / 1_000_000L).toInt()
+            if (missingBytes > 0) {
+                writePcmSilence(missingBytes)
+                packetsCompensated++
+                gapUsCompensated += gapUs
+                if (packetsCompensated <= MAX_COMPENSATE_LOG || packetsCompensated % 100 == 0L) {
+                    Log.i(
+                        TAG,
+                        "audio gap compensated codec=${format.codec} gapMs=${gapUs / 1000} " +
+                            "bytes=$missingBytes total=$packetsCompensated",
+                    )
+                }
+            }
+        }
+        expectedTimestampUs = timestampUs + lastIncrementUs
+    }
+
+    private fun writePcmSilence(bytes: Int) {
+        val track = track ?: return
+        if (bytes <= 0 || bytesPerSecond <= 0) return
+        if (silenceScratch.size < bytes) silenceScratch = ByteArray(bytes)
+        java.util.Arrays.fill(silenceScratch, 0, bytes, 0)
+        writePcm(silenceScratch, 0, bytes)
+    }
 
     private fun feedCodec(payload: ByteArray, presentationTimeUs: Long) {
         val codec = codec ?: return
@@ -927,12 +989,15 @@ private class AudioRenderer(
         val line = "audio stats audioType=${format.audioType} codec=${format.codec} rx=${packetsReceived.getAndSet(0)} " +
             "dropped=${packetsDropped.getAndSet(0)} underruns=+${underruns - statsLastUnderruns} queue=${queue.size} " +
             "playing=$playbackStarted maxGapMs=${maxArrivalGapMs.getAndSet(0)} " +
+            "gapCompMs=${gapUsCompensated / 1000} gapFrames=$packetsCompensated " +
             "sinceRxMs=${if (lastRx == 0L) -1 else (now - lastRx) / 1_000_000L} maxWriteMs=$maxWriteMs " +
             "decoderDroppedTotal=$inputDropped outputBuffersTotal=$outputBuffers rebuffers=$rebufferCount ended=$force"
         Log.i(STATS_TAG, line)
         report(line)
         statsLastUnderruns = underruns
         maxWriteMs = 0L
+        gapUsCompensated = 0L
+        packetsCompensated = 0L
         statsWindowStartNs = now
     }
 
@@ -1009,5 +1074,10 @@ private class AudioRenderer(
         const val STATS_TAG = "DiPlay-AudioStats"
         const val STATS_WINDOW_NS = 5_000_000_000L
         const val DECODED_BUFFER_LOG_INTERVAL = 50
+        // P0: frame-loss compensation bounds. Worst observed wireless loss burst is ~640 ms.
+        const val MAX_FRAME_US = 1_000_000L
+        const val MAX_COMPENSATE_US = 1_000_000L
+        const val MAX_PACKET_IDLE_NS = 1_000_000_000L
+        const val MAX_COMPENSATE_LOG = 20
     }
 }

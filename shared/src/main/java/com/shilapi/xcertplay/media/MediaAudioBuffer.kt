@@ -12,6 +12,9 @@ object MediaAudioBuffer {
     private const val HEADROOM_MILLIS = 200 // room above the start level so bursts after a gap fit
     private const val MIN_TRACK_BUFFER_BYTES = 16 * 1024
     private const val MIN_START_BUFFER_BYTES = 4 * 1024
+    // P0: raise the low-latency start level for non-media streams (speech/Siri/nav).
+    // Wireless logs show periodic gaps up to ~260 ms that previously underran an ~80 ms buffer.
+    private const val NON_MEDIA_START_MILLIS = 200
 
     fun sanitize(millis: Int): Int = millis.takeIf { it in presets } ?: DEFAULT_MILLIS
 
@@ -19,12 +22,21 @@ object MediaAudioBuffer {
 
     /** AudioTrack capacity and the amount to queue before play() for one output stream. */
     fun plan(audioType: String, sampleRate: Int, channels: Int, minBufferBytes: Int, mediaMillis: Int): Plan {
+        val bytesPerSecond = sampleRate.toLong() * channels.coerceIn(1, 2) * 2
         val lowLatency = Plan(
             trackBufferBytes = maxOf(minBufferBytes * 4, MIN_TRACK_BUFFER_BYTES),
             startBytes = maxOf(minBufferBytes, MIN_START_BUFFER_BYTES),
         )
-        if (audioType != "media") return lowLatency
-        val bytesPerSecond = sampleRate.toLong() * channels.coerceIn(1, 2) * 2
+        if (audioType != "media") {
+            // P0: non-media streams used to start after ~80 ms of buffering, so any wireless gap
+            // above that caused an underrun. Pre-buffer to a fixed ~200 ms with headroom instead.
+            val nonMediaStart = (bytesPerSecond * NON_MEDIA_START_MILLIS / 1000).toInt()
+            val nonMediaCapacity = (bytesPerSecond * (NON_MEDIA_START_MILLIS + HEADROOM_MILLIS) / 1000).toInt()
+            return Plan(
+                trackBufferBytes = maxOf(nonMediaCapacity, lowLatency.trackBufferBytes),
+                startBytes = maxOf(nonMediaStart, lowLatency.startBytes),
+            )
+        }
         val start = (bytesPerSecond * sanitize(mediaMillis) / 1000).toInt()
         val capacity = (bytesPerSecond * (sanitize(mediaMillis) + HEADROOM_MILLIS) / 1000).toInt()
         return Plan(
