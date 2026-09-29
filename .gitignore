@@ -30,8 +30,7 @@ Thumbs.db
 release-signing.properties
 
 # Never commit credential containers or installable distribution artifacts.
-*.pk8
-*.p7b
+# 注：*.pk8 / *.p7b 已放开以在仓库留存 CarPlay 认证（user 要求）
 *.p12
 *.pfx
 *.pem
