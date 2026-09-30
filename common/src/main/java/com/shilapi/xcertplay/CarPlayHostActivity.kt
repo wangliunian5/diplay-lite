@@ -64,6 +64,7 @@ import com.shilapi.xcertplay.airplay.SafeAreaRect
 import com.shilapi.xcertplay.host.R
 import com.shilapi.xcertplay.location.AndroidCarPlayLocationProvider
 import com.shilapi.xcertplay.media.AndroidMediaSink
+import com.shilapi.xcertplay.media.BandwidthMonitor
 import com.shilapi.xcertplay.media.CarPlayTouchMapper
 import com.shilapi.xcertplay.network.CarPlayVpnService
 import com.shilapi.xcertplay.orchestration.CarPlayController
@@ -276,6 +277,7 @@ class CarPlayHostActivity : ComponentActivity() {
     private var advancedAudioChannelMappingSupported = false
     private var advancedAudioChannelMapping = false
     private var debugLogsEnabled = false
+    private var bandwidthOverlay: BandwidthOverlayView? = null
     private var autoStartOnBoot = false
     private var manufacturer = AirPlayPersistence.DEFAULT_MANUFACTURER
     private var model = AirPlayPersistence.DEFAULT_MODEL
@@ -794,6 +796,16 @@ class CarPlayHostActivity : ComponentActivity() {
             textSize = 13f; gravity = Gravity.CENTER; setTextColor(Color.rgb(168, 182, 202)); setPadding(0, dp(20), 0, 0)
         })
         root.addView(panel, FrameLayout.LayoutParams(-1, -1))
+        bandwidthOverlay = BandwidthOverlayView(this) { bandwidthOverlay?.visibility = View.GONE }.apply {
+            visibility = if (debugLogsEnabled || BandwidthMonitor.overlayRequested) View.VISIBLE else View.GONE
+        }
+        root.addView(
+            bandwidthOverlay,
+            FrameLayout.LayoutParams(
+                dp(260), dp(180),
+                Gravity.TOP or Gravity.START,
+            ),
+        )
         videoView = video
         gestureOverlay = gestureLayer
         stageStatusView = stage
@@ -1764,9 +1776,10 @@ class CarPlayHostActivity : ComponentActivity() {
         settingsSwitchRow(
             label = "调试日志",
             checked = debugLogsEnabled,
-            description = "在屏幕上显示调试日志",
+            description = "显示带宽曲线调试面板，并记录 BW 日志",
         ) { checked ->
             debugLogsEnabled = checked
+            if (!checked) BandwidthMonitor.overlayRequested = false
             appendLog("Debug logs ${if (debugLogsEnabled) "enabled" else "disabled"}")
             updateDebugOverlays()
         }
@@ -2906,6 +2919,12 @@ class CarPlayHostActivity : ComponentActivity() {
     ): AndroidMediaSink {
         // Capture this session's log: late decoder shutdown must not write into a new session.
         val diagnosticLog = sessionLog
+        // Persist the bandwidth chart's per-second line to the exported diplay.log so it can be
+        // cross-checked against the on-screen overlay and audio/video stats by timestamp.
+        BandwidthMonitor.onBwSample = { message ->
+            diagnosticLog?.append(formattedLogLine("BW $message", System.currentTimeMillis()))
+        }
+        BandwidthMonitor.reset()
         return AndroidMediaSink(
             surface = null,
             videoWidth = videoWidth,
@@ -3466,6 +3485,7 @@ class CarPlayHostActivity : ComponentActivity() {
     private fun updateDebugOverlays() {
         statusScrollView?.visibility = View.GONE
         connectionPanel?.visibility = if (activeScreenStreamTypes.isEmpty()) View.VISIBLE else View.GONE
+        bandwidthOverlay?.visibility = if (debugLogsEnabled || BandwidthMonitor.overlayRequested) View.VISIBLE else View.GONE
     }
 
     private fun friendlyStage(message: String): String = when {

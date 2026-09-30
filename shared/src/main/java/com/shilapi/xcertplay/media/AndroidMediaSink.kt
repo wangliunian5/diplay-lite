@@ -15,6 +15,7 @@ import com.shilapi.xcertplay.airplay.MediaSink
 import com.shilapi.xcertplay.airplay.MicrophoneConfig
 import com.shilapi.xcertplay.airplay.VideoCodec
 import com.shilapi.xcertplay.airplay.toHexString
+import com.shilapi.xcertplay.media.BandwidthMonitor
 import java.io.Closeable
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
@@ -207,6 +208,7 @@ private class VideoDecoder(
 
     fun submit(nalus: ByteArray) {
         stats.onReceived(nalus.size)
+        BandwidthMonitor.onVideoBytes(nalus.size)
         queue.offer(VideoJob.Frame(nalus))
     }
 
@@ -550,6 +552,7 @@ private class AudioRenderer(
     fun submit(rtp: ByteArray, sample: Int) {
         if (started) {
             packetsReceived.incrementAndGet()
+            BandwidthMonitor.onAudioBytes(rtp.size)
             val now = System.nanoTime()
             val previous = lastArrivalNs.getAndSet(now)
             if (previous != 0L) maxArrivalGapMs.accumulateAndGet((now - previous) / 1_000_000L, ::maxOf)
@@ -986,6 +989,11 @@ private class AudioRenderer(
         if (!force && now - statsWindowStartNs < STATS_WINDOW_NS) return
         val underruns = track?.underrunCount ?: 0
         val lastRx = lastArrivalNs.get()
+        BandwidthMonitor.setAudioMetrics(
+            maxArrivalGapMs.get().toInt(),
+            (underruns - statsLastUnderruns).toInt(),
+            rebufferCount,
+        )
         val line = "audio stats audioType=${format.audioType} codec=${format.codec} rx=${packetsReceived.getAndSet(0)} " +
             "dropped=${packetsDropped.getAndSet(0)} underruns=+${underruns - statsLastUnderruns} queue=${queue.size} " +
             "playing=$playbackStarted maxGapMs=${maxArrivalGapMs.getAndSet(0)} " +

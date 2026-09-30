@@ -1147,14 +1147,36 @@ class CarPlayController(
                     return@postDelayed
                 }
                 debugLog("wireless handoff timed out waiting for tunnel iAP2 readiness")
-                // TEST-A: 超时后不再拆栈/失败，降级保持「蓝牙 iAP2 控制 + Wi-Fi 音视频」继续运行。
-                // iPhone 一旦建立 type-130 隧道，onWirelessTunnelReady -> maybeCompleteWirelessHandoff
-                // 会自动完成切换；若 iPhone 主动关闭蓝牙 RFCOMM，CHANNEL_CLOSED 分支会因
-                // handoffInProgress=true 而保持 Wi-Fi AirPlay 会话，不会 fail。
-                debugLog(
-                    "handoff degraded (TEST-A): keeping Bluetooth iAP2 + Wi-Fi A/V; " +
-                        "will upgrade when iPhone opens type-130 data stream",
-                )
+                Thread(
+                    {
+                        if (
+                            closed ||
+                            phase != Phase.WIRELESS ||
+                            generation != wirelessGeneration.get() ||
+                            wirelessActiveReported.get()
+                        ) {
+                            return@Thread
+                        }
+                        // 合并方案A与作者 hasRenderedFrame 判定：以是否确已渲染视频帧作为分类依据。
+                        // - 已渲染帧：iPhone 已建立 Wi-Fi A/V 但始终未请求 type-130 iAP2 隧道，属合法降级场景，
+                        //   不再拆栈/失败，保持「蓝牙 iAP2 控制 + Wi-Fi A/V」继续运行，避免可见重连循环。
+                        // - 未渲染帧：会话并未真正建立，走作者逻辑拆栈并 fail。
+                        if (wirelessConnectionProof.hasRenderedFrame(generation)) {
+                            debugLog(
+                                "handoff degraded: keeping Bluetooth iAP2 + Wi-Fi A/V " +
+                                    "(hasRenderedFrame, no type-130 iAP2 tunnel)",
+                            )
+                            onStatus(CarPlayStatus.WirelessActive)
+                            return@Thread
+                        }
+                        closeWirelessStack()
+                        fail(IOException("Wireless CarPlay handoff timed out"))
+                    },
+                    "xcertplay-wireless-handoff-timeout",
+                ).apply {
+                    isDaemon = true
+                    start()
+                }
             },
             WIRELESS_HANDOFF_TIMEOUT_MILLIS,
         )

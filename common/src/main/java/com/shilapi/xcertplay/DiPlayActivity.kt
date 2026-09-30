@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -30,9 +31,11 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.shilapi.xcertplay.airplay.CarPlayClusterDisplay
 import com.shilapi.xcertplay.host.R
+import com.shilapi.xcertplay.media.BandwidthMonitor
 import com.shilapi.xcertplay.orchestration.WirelessHotspotMode
 import java.io.File
 import java.text.SimpleDateFormat
+import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
 
@@ -51,6 +54,7 @@ class DiPlayActivity : ComponentActivity() {
     private var notificationTransport = true
     private var exportInProgress = false
     private var exportButton: Button? = null
+    private val logoTapTimes = ArrayDeque<Long>()
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         connect(notificationTransport)
     }
@@ -62,6 +66,21 @@ class DiPlayActivity : ComponentActivity() {
     }
     private val export = registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
         if (uri != null) exportDiagnostics(uri)
+    }
+
+    /**
+     * 点 5 次主界面中央的 DiPlay 图标以启动调试日志（带宽监测面板 + BW 日志）。进程级开关，
+     * 冷启动后失效，需重新点 5 次。
+     */
+    private fun onLogoDebugTap() {
+        val now = SystemClock.elapsedRealtime()
+        logoTapTimes.addLast(now)
+        while (logoTapTimes.isNotEmpty() && now - logoTapTimes.first() > 2500) logoTapTimes.removeFirst()
+        if (logoTapTimes.size >= 5) {
+            logoTapTimes.clear()
+            BandwidthMonitor.overlayRequested = true
+            toast("调试日志已开启：CarPlay 界面将显示带宽面板")
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -189,6 +208,7 @@ class DiPlayActivity : ComponentActivity() {
             setImageResource(R.drawable.ic_carplay)
             contentDescription = "CarPlay 图标"
             scaleType = ImageView.ScaleType.FIT_CENTER
+            setOnClickListener { onLogoDebugTap() }
         }
         val branding = column().apply {
             gravity = Gravity.CENTER
