@@ -278,34 +278,30 @@ private class VideoDecoder(
         val codecData = config.codecData
         val mime = if (codec == VideoCodec.H265) MediaFormat.MIMETYPE_VIDEO_HEVC
         else MediaFormat.MIMETYPE_VIDEO_AVC
-        val format = MediaFormat.createVideoFormat(mime, width, height).apply {
-            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_SIZE)
-            setInteger(MediaFormat.KEY_PRIORITY, 0)
-        }
-        if (codec == VideoCodec.H265) {
-            val csd = MediaCodecSupport.hevcCodecSpecificData(codecData)
-            if (csd.isNotEmpty()) format.setByteBuffer("csd-0", ByteBuffer.wrap(csd))
+        val csd = if (codec == VideoCodec.H265) {
+            MediaCodecSupport.hevcCodecSpecificData(codecData).takeIf { it.isNotEmpty() }
+                ?.let { listOf(it) } ?: emptyList()
         } else {
             val (sps, pps) = MediaCodecSupport.avcParameterSets(codecData)
-            if (sps.isNotEmpty()) format.setByteBuffer("csd-0", ByteBuffer.wrap(START_CODE + sps))
-            if (pps.isNotEmpty()) format.setByteBuffer("csd-1", ByteBuffer.wrap(START_CODE + pps))
+            listOfNotNull(
+                sps.takeIf { it.isNotEmpty() }?.let { START_CODE + it },
+                pps.takeIf { it.isNotEmpty() }?.let { START_CODE + it },
+            )
         }
-        var candidate: MediaCodec? = null
-        val next = try {
-            createDecoder(mime).also {
-                candidate = it
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
-                    it.codecInfo.getCapabilitiesForType(mime).isFeatureSupported("low-latency")) {
-                    format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-                }
-                it.configure(format, surface, null, 0)
-                it.start()
-            }
-        } catch (error: Exception) {
-            runCatching { candidate?.release() }
-            Log.e(TAG, "video decoder configure failed mime=$mime size=${width}x$height", error)
-            report("decoder configuration failed mime=$mime size=${width}x$height error=${error.javaClass.simpleName}")
-            null
+        // Some vendor hardware decoders (e.g. MediaTek/Mali) reject the tuned parameters
+        // with BAD_VALUE. Fall back to a minimal format on the default hardware decoder path;
+        // createDecoder already selects a software HEVC decoder when preferSoftwareHevcDecoder.
+        val attempts = listOf(
+            DecoderAttempt(tuned = true),
+            DecoderAttempt(tuned = false),
+        )
+        var next: MediaCodec? = null
+        for (attempt in attempts) {
+            next = tryConfigure(mime, csd, surface, attempt)
+            if (next != null) break
+        }
+        if (next == null) {
+            report("decoder configuration failed mime=$mime size=${width}x$height")
         }
         decoder = next
         renderedFrameLogged = false
@@ -316,6 +312,46 @@ private class VideoDecoder(
                 TAG,
                 "video decoder configured name=${next.name} mime=$mime size=${width}x$height",
             )
+        }
+    }
+
+    private data class DecoderAttempt(val tuned: Boolean)
+
+    private fun buildFormat(mime: String, csd: List<ByteArray>, tuned: Boolean): MediaFormat =
+        MediaFormat.createVideoFormat(mime, width, height).apply {
+            if (tuned) {
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_SIZE)
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+            }
+            csd.forEachIndexed { index, bytes -> setByteBuffer("csd-$index", ByteBuffer.wrap(bytes)) }
+        }
+
+    private fun tryConfigure(
+        mime: String,
+        csd: List<ByteArray>,
+        surface: Surface,
+        attempt: DecoderAttempt,
+    ): MediaCodec? {
+        var candidate: MediaCodec? = null
+        return try {
+            val format = buildFormat(mime, csd, attempt.tuned)
+            val codec = createDecoder(mime)
+            candidate = codec
+            if (attempt.tuned && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                codec.codecInfo.getCapabilitiesForType(mime).isFeatureSupported("low-latency")) {
+                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            }
+            codec.configure(format, surface, null, 0)
+            codec.start()
+            codec
+        } catch (error: Exception) {
+            runCatching { candidate?.release() }
+            Log.w(
+                TAG,
+                "video decoder configure failed tuned=${attempt.tuned} mime=$mime size=${width}x$height",
+                error,
+            )
+            null
         }
     }
 

@@ -1437,8 +1437,9 @@ class CarPlayController(
             val carkit = try {
                 carKitClient.open(pairRecord, config.label)
             } catch (error: Throwable) {
-                if (!isInvalidPairRecord(error)) throw error
-                debugLog("saved Lockdown pair record rejected; pairing again")
+                val rejection = rejectedPairRecordError(error)
+                if (savedPairRecord == null || rejection == null) throw error
+                debugLog("saved Lockdown pair record rejected by Lockdown error=$rejection; clearing and pairing again")
                 clearPairRecord()
                 pairRecord = pairNewRecord(pairingClient)
                 carKitClient.open(pairRecord, config.label)
@@ -1532,13 +1533,15 @@ class CarPlayController(
             isCancelled = { closed },
         ).pairRecord.also(savePairRecord)
 
-    private fun isInvalidPairRecord(error: Throwable): Boolean {
+    private fun rejectedPairRecordError(error: Throwable): String? {
         var cause: Throwable? = error
         while (cause != null) {
-            if (cause.message?.contains("InvalidPairRecord", ignoreCase = true) == true) return true
+            val message = cause.message.orEmpty()
+            if (message.contains("InvalidPairRecord", ignoreCase = true)) return "InvalidPairRecord"
+            if (message.contains("InvalidHostID", ignoreCase = true)) return "InvalidHostID"
             cause = cause.cause
         }
-        return false
+        return null
     }
 
     private fun isBluetoothHandoffCommand(type: String): Boolean =
