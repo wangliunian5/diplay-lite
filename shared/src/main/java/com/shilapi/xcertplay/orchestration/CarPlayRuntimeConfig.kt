@@ -93,7 +93,10 @@ class CarPlayRuntimeConfig(
         require(remoteMfiToken?.contains('\u0000') != true) {
             "Remote MFi token must not contain U+0000"
         }
-        if (wirelessHotspotMode == WirelessHotspotMode.MANUAL) {
+        // Only WIRELESS sessions use the hotspot configuration. In WIRED (USB) mode the
+        // hotspot SSID/passphrase are irrelevant, so they must not be required even when a
+        // stored/default wirelessHotspotMode fell back to MANUAL.
+        if (transport == CarPlayTransport.WIRELESS && wirelessHotspotMode == WirelessHotspotMode.MANUAL) {
             val ssid = manualHotspotSsid
             require(!ssid.isNullOrBlank()) {
                 "manualHotspotSsid is required in manual hotspot mode"
