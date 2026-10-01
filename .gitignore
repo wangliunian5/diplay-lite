@@ -8,6 +8,8 @@
 .kotlin/
 build/
 local.properties
+# Machine/JDK-specific Gradle settings (e.g. sandbox org.gradle.java.home path)
+gradle.properties
 
 # Native build output
 .cxx/
