@@ -75,18 +75,18 @@ internal class MicrophoneUplink(
             )
         }
         val bufferSize = maxOf(minBuffer * 2, config.frameBytes * 4)
+        // AudioRecord.Builder()/AudioFormat.Builder() are API 23+; on Android 5.x they throw
+        // NoSuchMethodError (an Error the catch below cannot intercept) and crash the app.
+        // The plain constructor works from API 21: bad parameters only throw from API 23,
+        // earlier builds land in the state check below as STATE_UNINITIALIZED.
         val nextRecorder = try {
-            AudioRecord.Builder()
-                .setAudioSource(source)
-                .setAudioFormat(
-                    AndroidAudioFormat.Builder()
-                        .setEncoding(AndroidAudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(config.sampleRate)
-                        .setChannelMask(channelMask)
-                        .build(),
-                )
-                .setBufferSizeInBytes(bufferSize)
-                .build()
+            AudioRecord(
+                source,
+                config.sampleRate,
+                channelMask,
+                AndroidAudioFormat.ENCODING_PCM_16BIT,
+                bufferSize,
+            )
         } catch (error: Exception) {
             Log.e(TAG, "microphone recorder creation failed", error)
             nextEncoder?.close()

@@ -2,6 +2,7 @@ package com.shilapi.xcertplay.media
 
 import android.media.AudioAttributes
 import android.media.AudioFormat as AndroidAudioFormat
+import android.media.AudioManager
 import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -693,20 +694,47 @@ private class AudioRenderer(
         val plan = MediaAudioBuffer.plan(format.audioType, format.sampleRate, format.channels, minBuffer, mediaBufferMillis)
         val frameBytes = if (format.channels >= 2) 4 else 2
         bytesPerSecond = format.sampleRate * frameBytes
-        val built = AudioTrack.Builder()
-            .setAudioAttributes(audioAttributes())
-            .setAudioFormat(
-                AndroidAudioFormat.Builder()
-                    .setEncoding(encoding)
-                    .setSampleRate(format.sampleRate)
-                    .setChannelMask(channelMask)
-                    .build(),
+        // AudioTrack.Builder()/AudioFormat.Builder()/getBufferSizeInFrames() are API 23+; calling
+        // them on Android 5.x throws NoSuchMethodError (an Error no catch() intercepts) as soon
+        // as the first audio stream starts. API 23+ keeps the builder (zero behaviour change on
+        // every tested device); API 21/22 falls back to the legacy constructor with a stream type
+        // approximating the mapped AudioAttributes usage, using the requested buffer as capacity.
+        val attributes = audioAttributes()
+        val built = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            AudioTrack.Builder()
+                .setAudioAttributes(attributes)
+                .setAudioFormat(
+                    AndroidAudioFormat.Builder()
+                        .setEncoding(encoding)
+                        .setSampleRate(format.sampleRate)
+                        .setChannelMask(channelMask)
+                        .build(),
+                )
+                .setBufferSizeInBytes(plan.trackBufferBytes)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+        } else {
+            val streamType = if (attributes.usage == AudioAttributes.USAGE_VOICE_COMMUNICATION) {
+                AudioManager.STREAM_VOICE_CALL
+            } else {
+                AudioManager.STREAM_MUSIC
+            }
+            @Suppress("DEPRECATION")
+            AudioTrack(
+                streamType,
+                format.sampleRate,
+                channelMask,
+                encoding,
+                plan.trackBufferBytes,
+                AudioTrack.MODE_STREAM,
             )
-            .setBufferSizeInBytes(plan.trackBufferBytes)
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
+        }
         track = built
-        val capacityBytes = built.bufferSizeInFrames * frameBytes
+        val capacityBytes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            built.bufferSizeInFrames * frameBytes
+        } else {
+            plan.trackBufferBytes
+        }
         startThresholdBytes = MediaAudioBuffer.startBytesFor(plan.startBytes, capacityBytes, PREBUFFER_WRITE_CHUNK_BYTES)
         report("Audio: ready audioType=${format.audioType} codec=${format.codec} " +
             "rate=${format.sampleRate} channels=${format.channels} " +
