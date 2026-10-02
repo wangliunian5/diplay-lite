@@ -11,10 +11,11 @@ import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayDeviceInfo
 import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
-import com.shilapi.xcertplay.airplay.AirPlayMediaHandler
 import com.shilapi.xcertplay.airplay.AirPlaySession
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
+import com.shilapi.xcertplay.airplay.CarPlayMediaEngine
 import com.shilapi.xcertplay.airplay.PairingStore
+import com.shilapi.xcertplay.media.AndroidMediaSink
 import com.shilapi.xcertplay.mfi.LocalMfiAuthenticationClient
 import com.shilapi.xcertplay.orchestration.CarPlayController
 import com.shilapi.xcertplay.orchestration.CarPlayRuntimeConfig
@@ -31,7 +32,7 @@ import java.security.MessageDigest
  *
  * M2：接线 shared 的 CarPlayController——本地离线 MFi 证书 + MANUAL 车机热点 +
  * 蓝牙 RFCOMM 引导的无线流水线；状态经 CarPlayStatus/LiteState 回流到 MainActivity。
- * 媒体面（视频/音频）留待 M3 接入，此处用空 AirPlayMediaHandler。
+ * M3：媒体面接 CarPlayMediaEngine + AndroidMediaSink（MediaCodec 解码 → SurfaceView）。
  *
  * 注意 4.1 兼容：startForeground(id, Notification) 为 API 5；
  * Notification.Builder(Context) 单参构造为 API 11；build() 是 API 24 才有，须用 getNotification()。
@@ -41,8 +42,9 @@ class LiteSessionService : Service() {
 
     private var controller: CarPlayController? = null
 
-    /** M3 再接真媒体；接口方法全有空默认实现。 */
-    private val mediaHandler = object : AirPlayMediaHandler {}
+    /** M3 媒体面：每轮 startController 新建一套（AndroidMediaSink.close() 后不可复用）。 */
+    private var mediaSink: AndroidMediaSink? = null
+    private var mediaEngine: CarPlayMediaEngine? = null
 
     private val sessionListener = object : AirPlaySessionListener {
         override fun onSessionActive(session: AirPlaySession) {
@@ -92,6 +94,10 @@ class LiteSessionService : Service() {
         // 拆栈线程随进程存续（MainActivity 在前台时进程不会先死）。
         controller?.close()
         controller = null
+        mediaSink?.close()
+        mediaSink = null
+        mediaEngine = null
+        LiteVideoBridge.bindSink(null)
         LiteState.running = false
         LiteState.phase = LiteState.Phase.IDLE
         LiteState.statusText = "未连接"
@@ -110,6 +116,10 @@ class LiteSessionService : Service() {
             old.close()
             old.awaitClosed(2000)
         }
+        mediaSink?.close()
+        mediaSink = null
+        mediaEngine = null
+        LiteVideoBridge.bindSink(null)
         val config = LiteConfig.load(this)
         if (config.ssid.isBlank()) {
             fail("车机热点 SSID 未配置")
@@ -131,6 +141,16 @@ class LiteSessionService : Service() {
                 "screen=${size.first}x${size.second} ssid=${config.ssid} " +
                 "channel=${config.channel} security=${config.security}",
         )
+        // M3：MediaCodec 解码到 SurfaceView；SurfaceView 的 Surface 由 LiteVideoBridge 补齐。
+        val sink = AndroidMediaSink(
+            videoWidth = size.first,
+            videoHeight = size.second,
+            onAudioDiagnostic = { LiteLog.log("media", it) },
+        )
+        val engine = CarPlayMediaEngine(sink = sink)
+        mediaSink = sink
+        mediaEngine = engine
+        LiteVideoBridge.bindSink(sink)
         val newController = try {
             CarPlayController(
                 context = this,
@@ -169,7 +189,7 @@ class LiteSessionService : Service() {
                 identity = identity,
                 pairings = createPairingStore(),
                 listener = sessionListener,
-                media = mediaHandler,
+                media = engine,
                 reportStatus = ::onStatus,
             )
         } catch (error: IllegalArgumentException) {

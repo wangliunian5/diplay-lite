@@ -37,12 +37,27 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
 
     fun listen(listener: Listener): Int {
         this.listener = listener
-        val bound = ServerSocket()
-        bound.reuseAddress = true
-        bound.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+        val bound = bindAnyPort()
         server = bound
         thread = Thread({ accept(bound) }, "airplay-screen").apply { isDaemon = true; start() }
         return bound.localPort
+    }
+
+    // API16 车机实测：绑 IPv6 通配 [::] 抛异常会让该流被拒，回退 IPv4 通配（本热点对端为 IPv4）。
+    private fun bindAnyPort(): ServerSocket {
+        val primary = ServerSocket()
+        primary.reuseAddress = true
+        return try {
+            primary.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+            primary
+        } catch (error: Exception) {
+            onDiagnostic("video 端口 IPv6 通配绑定失败，回退 IPv4: ${error.message}")
+            safeClose(primary)
+            ServerSocket().apply {
+                reuseAddress = true
+                bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
+            }
+        }
     }
 
     override fun close() {

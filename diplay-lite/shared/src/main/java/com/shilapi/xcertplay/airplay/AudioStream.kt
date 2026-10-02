@@ -175,11 +175,21 @@ class AudioStream(
         }
     }
 
+    // API16 车机实测：绑 IPv6 通配 [::] 抛异常会让该流被拒，回退 IPv4 通配（本热点对端为 IPv4）。
     private fun bindAnyPort(): DatagramSocket {
         val socket = DatagramSocket(null)
         socket.reuseAddress = true
-        socket.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
-        return socket
+        return try {
+            socket.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+            socket
+        } catch (error: Exception) {
+            onDiagnostic("audio 端口 IPv6 通配绑定失败，回退 IPv4: ${error.message}")
+            runCatching { socket.close() }
+            DatagramSocket(null).apply {
+                reuseAddress = true
+                bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
+            }
+        }
     }
 
     private fun readU32Be(source: ByteArray, offset: Int): Int =

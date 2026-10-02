@@ -7,6 +7,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.text.InputType
 import android.view.Gravity
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -69,6 +71,29 @@ class MainActivity : Activity() {
 
     private fun buildUi(): View {
         val pad = dip(12)
+        val outer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(BG)
+        }
+        // M3：CarPlay 画面镜像到该 SurfaceView；Surface 经 LiteVideoBridge 交给后台 MediaCodec。
+        val video = SurfaceView(this)
+        video.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                LiteVideoBridge.updateSurface(holder.surface)
+                LiteLog.log("ui", "视频 Surface 就绪")
+            }
+
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                LiteVideoBridge.updateSurface(null)
+                LiteLog.log("ui", "视频 Surface 销毁")
+            }
+        })
+        outer.addView(
+            video,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dip(300)),
+        )
         val scroll = ScrollView(this)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -76,6 +101,7 @@ class MainActivity : Activity() {
             setBackgroundColor(BG)
         }
         scroll.addView(root)
+        outer.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
         // 标题行：状态圆点 + 标题
         val title = LinearLayout(this).apply {
@@ -174,7 +200,7 @@ class MainActivity : Activity() {
         }
         root.addView(logView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
-        return scroll
+        return outer
     }
 
     private fun fieldRow(label: String, input: View): View {
