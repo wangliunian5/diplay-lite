@@ -938,17 +938,31 @@ class CarPlayController(
 
     private fun closeWirelessStack() {
         wirelessConnectionProof.clear()
+
+        // 断链顺序（10-02 八轮实测调整）：先优雅结束 AirPlay 会话（关闭 control/event/timing/keepalive，
+        // 向 iPhone 发出 TCP FIN），让 iOS 先从 WiFi/AirPlay 侧感知会话结束；随后才断 iAP2 隧道与蓝牙。
+        // 原顺序「先断蓝牙后关 AirPlay」会让 iOS 把蓝牙掉线当瞬时抖动而保持 CarPlay（用户实测：
+        // 必须手动关车机热点/蓝牙才退）。每步补文件日志，供下一轮无 adb 的实机日志定位。
+        val activeServer = airPlayServer
+        airPlayServer = null
+        debugLog("wireless teardown step=1/5 closing AirPlay server and sessions")
+        if (activeServer != null) closeBestEffort("AirPlay server") { activeServer.detach() }
+
+        debugLog("wireless teardown step=2/5 releasing iAP2 tunnel handler")
         media.setIapTunnelHandler(null)
         val activeTunnel = wirelessTunnelChannel
         wirelessTunnelChannel = null
         if (activeTunnel != null) closeBestEffort("tunneled iAP2 link") { activeTunnel.close() }
 
+        debugLog("wireless teardown step=3/5 closing Bluetooth bootstrap transport")
         closeBluetoothBootstrapTransport()
 
+        debugLog("wireless teardown step=4/5 closing Bonjour")
         val activeBonjour = bonjour
         bonjour = null
         if (activeBonjour != null) closeBestEffort("Bonjour") { activeBonjour.close() }
 
+        debugLog("wireless teardown step=5/5 releasing hotspot handle")
         val activeHotspot = hotspot
         hotspot = null
         if (activeHotspot != null) closeBestEffort("wireless hotspot") { activeHotspot.close() }
@@ -957,10 +971,7 @@ class CarPlayController(
         wirelessHandoffRequested.set(false)
         wirelessTunnelReady.set(false)
         wirelessActiveReported.set(false)
-
-        val activeServer = airPlayServer
-        airPlayServer = null
-        if (activeServer != null) closeBestEffort("AirPlay server") { activeServer.detach() }
+        debugLog("wireless teardown complete")
     }
 
     private fun isBluetoothDeviceConnected(device: BluetoothDevice): Boolean = try {
