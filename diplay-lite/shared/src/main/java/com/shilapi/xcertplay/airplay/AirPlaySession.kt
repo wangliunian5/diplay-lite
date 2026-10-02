@@ -460,18 +460,17 @@ class AirPlaySession(
             response["keepAlivePort"] = openKeepAlive()
         }
         val requested = (dict["features"] as? List<*>).orEmpty().mapNotNull { it as? String }
-        // 车机基础能力
+        // 车机基础能力（只回自己真正支持的能力，不回显 iPhone 请求的能力！）
+        // T16 实证：曾尝试 <基础能力 ∪ iPhone 请求>，一旦回显 altScreen/uiContext，
+        // iPhone 随即在 /info 里改问 altScreenURLs/uiContextURLs；而车机 /info 只提供
+        // 一个 type=110 display、无 cluster/altScreen/uiContext 支撑 → iPhone 在 RECORD 后
+        // 立即发空 TEARDOWN 并 peer EOF，画面完全出不来。故必须回退为仅基础能力。
+        // 保留下方 requested/enabledFeatures 双列表日志（既是诊断、也兼作 build 标识）。
         val features = linkedSetOf<String>()
         if (config.hevc) features.add("hevc")
         features.add("iAPChannel")
         features.add("viewAreas")
         if (config.cluster != null) features.add("altScreen")
-        // 历史上这里只回硬编码的 [iAPChannel, viewAreas]，导致 iPhone 在 SETUP 里请求的能力
-        // （uiContext/viewAreas/cornerMasks/focusTransfer/h.264Level5.1/mainBuffered/altScreen/
-        // enhancedSiri/hevc）几乎全被砍掉——iPhone 随后只下发 type=110 视频流、零音频流。
-        // 这里改为 <车机基础能力 ∪ iPhone 请求的能力>，把能力面补齐，并在日志里同时打印
-        // requested / enabledFeatures，便于下一次实测判定 iPhone 是否因此下发音频流。
-        features.addAll(requested)
         response["enabledFeatures"] = features.toList()
         debugLog(
             "airplay SETUP enabledFeatures=${features.joinToString(",")} " +
