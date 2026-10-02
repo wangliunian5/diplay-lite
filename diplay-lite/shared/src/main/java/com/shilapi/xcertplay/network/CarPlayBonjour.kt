@@ -127,11 +127,14 @@ class CarPlayBonjour(
     useInterfaceMdns: Boolean = false,
     private val onEvent: (CarPlayBonjourEvent) -> Unit = {},
 ) : Closeable {
-    // API16 适配：NsdManager 的 NsdServiceInfo 构造与全部读写方法（getServiceName/
-    // getServiceType/getPort/getHost/getAttributes）都是 API 21+，4.x 上整条 NsdManager
-    // 路径不可用，强制改走 JmDNS（纯 Java，API 16 可跑）；NsdManager 路径仅 5.0+ 使用。
+    // API16 适配：NsdServiceInfo 的 getter（getServiceName/getServiceType/getPort/
+    // getHost/getAttributes）是 API 21+，故 4.x 上 discovery 队列恒空、probe 不跑；
+    // 但广播只依赖 setter（API16 可用），由系统 NsdManager 完成，不绑接口地址。
     private val useInterfaceMdns =
-        useInterfaceMdns || Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP
+        // 4.1 实测修正（10-02 20:17）：JmDNS 绑热点接口 setsockopt 报 ENODEV，
+        // API16 改走系统 NsdManager 广播（setter API16 可用、系统处理接口与多播）。
+        // 接口模式（绑多播接口地址）仅保留给 5.0+ 完整版 VPN 多接口场景。
+        useInterfaceMdns && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP
     private val nsdManager = (context.applicationContext ?: context)
         .getSystemService(Context.NSD_SERVICE) as NsdManager
     private val services = LinkedBlockingQueue<NsdServiceInfo>()
@@ -329,9 +332,8 @@ class CarPlayBonjour(
 
     @Suppress("DEPRECATION")
     private fun registerAirPlay() {
-        // API16 适配：NsdServiceInfo 构造/setter 是 API 21+，低版本 start() 已强制走
-        // JmDNS 注册分支，此 NsdManager 注册仅在 5.0+ 可达（双保险守卫）。
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return
+        // API16 适配：NsdServiceInfo 的 setter（serviceName/type/port/setAttribute）API16
+        // 即可用（只有 getter 是 API 21+）；低版本 discovery 队列恒空，但广播不受影响。
         val serviceInfo = NsdServiceInfo().apply {
             serviceName = config.deviceName
             serviceType = AIRPLAY_SERVICE_TYPE
@@ -339,7 +341,10 @@ class CarPlayBonjour(
             CarPlayBonjourProtocol.airPlayTxtRecords(config, identity).forEach { (key, value) ->
                 setAttribute(key, value)
             }
-            localAdvertisedAddress?.let(::setHost)
+            // setHost 是 API 21+；低版本不设 host，NsdManager 用当前网络接口。
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                localAdvertisedAddress?.let(::setHost)
+            }
         }
         nsdManager.registerService(
             serviceInfo,
