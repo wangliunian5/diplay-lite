@@ -266,6 +266,21 @@ class CarPlayBonjour(
                         "$AIRPLAY_SERVICE_TYPE.local.", config.deviceName, config.port,
                         0, 0, CarPlayBonjourProtocol.airPlayTxtRecords(config, identity),
                     ))
+                } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+                    // API16 实测修正（10-02 20:26）：NsdManager 的 setAttribute 是 API 21+，
+                    // 4.1 广播带不了 txt（CarPlay 必需）；JmDNS 绑热点接口 ENODEV，改无接口
+                    // 模式由内核选默认多播出口。discovery 仍不可用（getter 21+），不影响广播。
+                    val dns = try {
+                        JmDNS.create("carplay-${config.deviceId.replace(":", "")}")
+                    } catch (error: IOException) {
+                        throw IOException("JmDNS mDNS(UDP 5353) 无接口绑定失败: ${error.message}", error)
+                    }
+                    interfaceMdns = dns
+                    dns.addServiceListener("$CARPLAY_CONTROL_SERVICE_TYPE.local.", interfaceListener)
+                    dns.registerService(ServiceInfo.create(
+                        "$AIRPLAY_SERVICE_TYPE.local.", config.deviceName, config.port,
+                        0, 0, CarPlayBonjourProtocol.airPlayTxtRecords(config, identity),
+                    ))
                 } else {
                     registerAirPlay()
                     registrationRequested = true
@@ -332,16 +347,18 @@ class CarPlayBonjour(
 
     @Suppress("DEPRECATION")
     private fun registerAirPlay() {
-        // API16 适配：NsdServiceInfo 的 setter（serviceName/type/port/setAttribute）API16
-        // 即可用（只有 getter 是 API 21+）；低版本 discovery 队列恒空，但广播不受影响。
+        // API16 实测修正（10-02 20:26）：NsdServiceInfo 的 setter 中仅
+        // serviceName/serviceType/port 是 API 16，setAttribute/setHost 是 API 21+。
+        // 低版本广播由 JmDNS 无接口分支接管，此处守卫仅作防御。
         val serviceInfo = NsdServiceInfo().apply {
             serviceName = config.deviceName
             serviceType = AIRPLAY_SERVICE_TYPE
             port = config.port
             CarPlayBonjourProtocol.airPlayTxtRecords(config, identity).forEach { (key, value) ->
-                setAttribute(key, value)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    setAttribute(key, value)
+                }
             }
-            // setHost 是 API 21+；低版本不设 host，NsdManager 用当前网络接口。
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 localAdvertisedAddress?.let(::setHost)
             }

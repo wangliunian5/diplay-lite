@@ -8,6 +8,7 @@ import com.shilapi.xcertplay.airplay.AirPlaySession
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
 import com.shilapi.xcertplay.airplay.PairingStore
 import com.shilapi.xcertplay.mfi.MfiAuthenticator
+import java.io.File
 import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -87,20 +88,59 @@ class AirPlayTcpServer {
         generation: Int,
         replacement: AirPlayAttachment,
     ) {
-        val server = ServerSocket()
-        // API16 适配：bind 前开 SO_REUSEADDR，避免上一会话 socket TIME_WAIT 时 EADDRINUSE。
-        server.reuseAddress = true
-        server.bind(InetSocketAddress(replacement.address, replacement.config.port))
-        attachment = replacement
-        serverSocket = server
-        Thread(
-            { acceptLoop(generation, server) },
-            "airplay-accept",
-        ).apply {
-            isDaemon = true
-            start()
+        val port = replacement.config.port
+        var lastError: IOException? = null
+        for (attempt in 1..BIND_ATTEMPTS) {
+            val server = ServerSocket()
+            // API16 适配：bind 前开 SO_REUSEADDR，避免上一会话 socket TIME_WAIT 时 EADDRINUSE。
+            server.reuseAddress = true
+            try {
+                server.bind(InetSocketAddress(replacement.address, port))
+                attachment = replacement
+                serverSocket = server
+                Thread(
+                    { acceptLoop(generation, server) },
+                    "airplay-accept",
+                ).apply {
+                    isDaemon = true
+                    start()
+                }
+                return
+            } catch (error: IOException) {
+                runCatching { server.close() }
+                lastError = error
+                Log.w(TAG, "airplay bind $port attempt=$attempt failed: ${error.message}")
+                if (attempt < BIND_ATTEMPTS) {
+                    try {
+                        Thread.sleep(BIND_RETRY_MILLIS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                }
+            }
         }
+        active.set(false)
+        throw IOException(
+            "AirPlay 监听端口 $port 绑定失败（重试${BIND_ATTEMPTS}次）：" +
+                "${lastError?.message}；占用诊断 ${tcpPortOwners(port)}",
+            lastError,
+        )
     }
+
+    /** 读 /proc/net/tcp 列出占用指定端口的 socket（本地地址、状态、inode），用于定位 EADDRINUSE 来源。 */
+    private fun tcpPortOwners(port: Int): String = runCatching {
+        val wanted = String.format("%04X", port)
+        val found = StringBuilder()
+        val lines = File("/proc/net/tcp").readLines()
+        for (line in lines.drop(1)) {
+            val parts = line.trim().split(Regex("\\s+"))
+            if (parts.size > 9 && parts[1].endsWith(":$wanted")) {
+                found.append("[").append(parts[1]).append(" state=").append(parts[3])
+                    .append(" inode=").append(parts[9]).append("]")
+            }
+        }
+        if (found.isEmpty()) "(无占用记录)" else found.toString()
+    }.getOrElse { "诊断不可用" }
 
     private fun acceptLoop(
         generation: Int,
@@ -203,5 +243,7 @@ class AirPlayTcpServer {
 
     companion object {
         private const val TAG = "xcertplay-airplay"
+        private const val BIND_ATTEMPTS = 3
+        private const val BIND_RETRY_MILLIS = 500L
     }
 }
