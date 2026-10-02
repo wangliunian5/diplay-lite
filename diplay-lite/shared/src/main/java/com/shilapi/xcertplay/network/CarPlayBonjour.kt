@@ -251,7 +251,12 @@ class CarPlayBonjour(
                     val address = requireNotNull(localAdvertisedAddress ?: fallbackLocalAddress()) {
                         "Interface mDNS requires a local advertised address"
                     }
-                    val dns = JmDNS.create(address, "carplay-${config.deviceId.replace(":", "")}")
+                    val dns = try {
+                        JmDNS.create(address, "carplay-${config.deviceId.replace(":", "")}")
+                    } catch (error: IOException) {
+                        // 实测坑：报错需可区分 mDNS(5353) 与 AirPlay(7000) 的端口占用。
+                        throw IOException("JmDNS mDNS(UDP 5353) 绑定失败: ${error.message}", error)
+                    }
                     interfaceMdns = dns
                     dns.addServiceListener("$CARPLAY_CONTROL_SERVICE_TYPE.local.", interfaceListener)
                     dns.registerService(ServiceInfo.create(

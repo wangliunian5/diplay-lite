@@ -88,6 +88,8 @@ class AirPlayTcpServer {
         replacement: AirPlayAttachment,
     ) {
         val server = ServerSocket()
+        // API16 适配：bind 前开 SO_REUSEADDR，避免上一会话 socket TIME_WAIT 时 EADDRINUSE。
+        server.reuseAddress = true
         server.bind(InetSocketAddress(replacement.address, replacement.config.port))
         attachment = replacement
         serverSocket = server

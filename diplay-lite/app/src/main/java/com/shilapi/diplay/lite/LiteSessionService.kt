@@ -103,6 +103,13 @@ class LiteSessionService : Service() {
     // ---------- M2：无线流水线接线 ----------
 
     private fun startController() {
+        // 重复 onStartCommand（START_STICKY 自启恢复 / 用户再点连接）时先按序拆除旧
+        // controller，避免残留的 7000 监听让新会话 EADDRINUSE（10-02 20:01 实测）。
+        controller?.let { old ->
+            controller = null
+            old.close()
+            old.awaitClosed(2000)
+        }
         val config = LiteConfig.load(this)
         if (config.ssid.isBlank()) {
             fail("车机热点 SSID 未配置")
