@@ -10,6 +10,7 @@ import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
 import java.io.BufferedReader
 import java.io.Closeable
+import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
 import java.net.Inet4Address
@@ -273,7 +274,11 @@ class CarPlayBonjour(
                     val dns = try {
                         JmDNS.create("carplay-${config.deviceId.replace(":", "")}")
                     } catch (error: IOException) {
-                        throw IOException("JmDNS mDNS(UDP 5353) 无接口绑定失败: ${error.message}", error)
+                        throw IOException(
+                            "JmDNS mDNS(UDP 5353) 无接口绑定失败: ${error.message}" +
+                                "；接口诊断 ${networkInterfaceDiagnostics()}",
+                            error,
+                        )
                     }
                     interfaceMdns = dns
                     dns.addServiceListener("$CARPLAY_CONTROL_SERVICE_TYPE.local.", interfaceListener)
@@ -399,6 +404,35 @@ class CarPlayBonjour(
             }
     } catch (_: Exception) {
         null
+    }
+
+    /**
+     * 网络接口诊断（第五轮实测 10-02 20:45）：JmDNS 无接口模式仍报
+     * setsockopt ENODEV。枚举 /sys/class/net 各接口的 flags、up 状态、
+     * supportsMulticast 与地址列表，定位是接口不支持多播还是内核多播出口缺失。
+     */
+    private fun networkInterfaceDiagnostics(): String = try {
+        val out = StringBuilder()
+        val base = File("/sys/class/net")
+        base.listFiles()?.forEach { iface ->
+            val name = iface.name
+            val flags = runCatching { File(iface, "flags").readText().trim() }.getOrElse { "?" }
+            val ni = runCatching { NetworkInterface.getByName(name) }.getOrNull()
+            val multicast = ni?.let {
+                if (runCatching { it.supportsMulticast() }.getOrElse { false }) "Y" else "N"
+            } ?: "?"
+            val up = ni?.let {
+                if (runCatching { it.isUp }.getOrElse { false }) "up" else "down"
+            } ?: "?"
+            val addrs = ni?.let {
+                runCatching { Collections.list(it.inetAddresses) }.getOrElse { emptyList<InetAddress>() }
+                    .joinToString(",") { addr -> addr.hostAddress ?: "" }
+            } ?: ""
+            out.append("[$name flags=$flags up=$up multicast=$multicast $addrs]")
+        }
+        out.toString().ifEmpty { "(/sys/class/net 为空)" }
+    } catch (error: Exception) {
+        "接口诊断不可用: ${error.message}"
     }
 
     private fun runWorker() {
