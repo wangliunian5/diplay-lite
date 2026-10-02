@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * transmit stamps. The resulting offset and round-trip time steer a local monotonic clock onto
  * the phone's media-clock domain, which /feedback reports.
  */
-class NtpClock : Closeable {
+class NtpClock(private val log: (String) -> Unit = {}) : Closeable {
     private val running = AtomicBoolean(false)
     private val socketLock = Any()
     private val clockLock = Any()
@@ -35,6 +35,13 @@ class NtpClock : Closeable {
     private var pendingT1: BigInteger? = null
     private var synced = false
 
+    // 诊断计数（M4d）：确认时序交换是否真的发生（音频 RTP 依赖 NTP 时钟域）。
+    private var requestsSent = 0
+    private var responsesSeen = 0
+    private var peerRequestsSeen = 0
+    private var syncCount = 0
+    private var mismatchLogged = false
+
     fun listen(): Int {
         check(!running.getAndSet(true)) { "NtpClock is already running" }
         // API16 车机实测：绑 IPv6 通配 [::] 抛异常会让 AirPlay SETUP 返回 500，回退 IPv4 通配
@@ -43,7 +50,8 @@ class NtpClock : Closeable {
                 reuseAddress = true
                 bind(InetSocketAddress(InetAddress.getByName("::"), 0))
             }
-        } catch (_: Exception) {
+        } catch (error: Exception) {
+            log("listen bind [::] failed: ${error.message}; falling back to 0.0.0.0")
             DatagramSocket(null).apply {
                 reuseAddress = true
                 bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
@@ -51,6 +59,7 @@ class NtpClock : Closeable {
         }
         synchronized(socketLock) { socket = bound }
         receiver = Thread(::runReceiver, "airplay-ntp-rx").apply { isDaemon = true; start() }
+        log("listen ready port=${bound.localPort}")
         return bound.localPort
     }
 
@@ -58,6 +67,7 @@ class NtpClock : Closeable {
         require(port > 0) { "timing port must be positive" }
         peer = InetSocketAddress(peerAddress, port)
         sender = Thread(::runSender, "airplay-ntp-tx").apply { isDaemon = true; start() }
+        log("sender started peer=${peerAddress.hostAddress}:$port")
     }
 
     /** Now in the phone's synchronized clock domain, as an unsigned NTP64 value. */
@@ -102,6 +112,10 @@ class NtpClock : Closeable {
         synchronized(clockLock) { pendingT1 = t1 }
         ntpBytes(t1).copyInto(packet, NTP_TRANSMIT_OFFSET)
         currentSocket()?.send(DatagramPacket(packet, packet.size, destination))
+        requestsSent++
+        if (requestsSent <= 3 || requestsSent % 30 == 0) {
+            log("tx request #$requestsSent to ${destination.address.hostAddress}:${destination.port}")
+        }
     }
 
     private fun runReceiver() {
@@ -138,6 +152,10 @@ class NtpClock : Closeable {
         ntpBytes(syncedNtp()).copyInto(response, NTP_RECEIVE_OFFSET)
         ntpBytes(syncedNtp()).copyInto(response, NTP_TRANSMIT_OFFSET)
         currentSocket()?.send(DatagramPacket(response, response.size, source))
+        peerRequestsSeen++
+        if (peerRequestsSeen <= 3 || peerRequestsSeen % 30 == 0) {
+            log("rx peer request #$peerRequestsSeen from ${source.address?.hostAddress}:${source.port} -> responded")
+        }
     }
 
     private fun handleResponse(response: ByteArray) {
@@ -146,15 +164,32 @@ class NtpClock : Closeable {
         val t2 = readNtp(response, NTP_RECEIVE_OFFSET)
         val t3 = readNtp(response, NTP_TRANSMIT_OFFSET)
 
-        synchronized(clockLock) {
+        var havePending = false
+        val matched = synchronized(clockLock) {
             val pending = pendingT1
-            if (pending == null || pending != t1) return
-            pendingT1 = null
+            havePending = pending != null
+            if (pending == null || pending != t1) {
+                false
+            } else {
+                pendingT1 = null
+                true
+            }
         }
+        if (!matched) {
+            if (!mismatchLogged) {
+                mismatchLogged = true
+                log("response ignored: originate mismatch (havePending=$havePending)")
+            }
+            return
+        }
+        responsesSeen++
 
         val offset = t2.subtract(t1).add(t3.subtract(t4)).toDouble() * 0.5 / TWO32_DOUBLE
         val rtt = t4.subtract(t1).subtract(t3.subtract(t2)).toDouble() / TWO32_DOUBLE
         if (rtt < 0.0) return
+        if (responsesSeen <= 3) {
+            log("response #$responsesSeen rttMs=${rtt * 1000.0} offsetMs=${offset * 1000.0}")
+        }
 
         if (rtt < pickRtt) {
             pickRtt = rtt
@@ -184,6 +219,10 @@ class NtpClock : Closeable {
             delayIndex = 0
             pendingT1 = null
             synced = true
+        }
+        syncCount++
+        if (syncCount == 1) {
+            log("clock synced first time stepping=$stepping offsetMs=${offsetSec * 1000.0}")
         }
     }
 

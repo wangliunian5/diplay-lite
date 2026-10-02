@@ -26,6 +26,9 @@ import com.shilapi.xcertplay.transport.Iap2IdentificationConfig
 import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * 前台会话服务：无线 CarPlay 期间保活，避免 4.1 后台回收。
@@ -84,6 +87,8 @@ class LiteSessionService : Service() {
         LiteState.phase = LiteState.Phase.CONNECTING
         LiteState.statusText = "正在初始化…"
         LiteLog.log("service", "前台会话服务已启动")
+        // 构建标识：实机每次启动都打印，用于区分本轮跑的是哪个包（T17 归档约定）。
+        LiteLog.log("service", "构建标识 version=${buildVersion()} apk=${apkStamp()}")
         startController()
         return START_STICKY
     }
@@ -336,6 +341,22 @@ class LiteSessionService : Service() {
         val width = display.width
         val height = display.height
         return if (width > 0 && height > 0) width to height else DEFAULT_SCREEN
+    }
+
+    /** build.gradle.kts 的 versionName（每轮出包带阶段后缀），用于日志区分构建。 */
+    private fun buildVersion(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "unknown"
+    } catch (_: Exception) {
+        "unknown"
+    }
+
+    /** 已安装 APK 的时间戳，配合 versionName 交叉确认跑的是哪个产物。 */
+    private fun apkStamp(): String {
+        val path = applicationInfo?.sourceDir ?: return "unknown"
+        val file = File(path)
+        if (!file.exists()) return file.name
+        val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(file.lastModified()))
+        return "${file.name}@$stamp"
     }
 
     private fun buildNotification(): Notification {

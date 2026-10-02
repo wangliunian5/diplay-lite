@@ -78,7 +78,7 @@ class AirPlaySession(
     private var pendingNightMode: Boolean? = null
     private val firstTouchSendLogged = AtomicBoolean(false)
     private val touchSendFailureLogged = AtomicBoolean(false)
-    private val ntp = NtpClock()
+    private val ntp = NtpClock { message -> debugLog("airplay ntp $message") }
     private var keepAliveSocket: DatagramSocket? = null
     private var keepAliveThread: Thread? = null
     private val eventWriteLock = Any()
@@ -537,7 +537,9 @@ class AirPlaySession(
         debugLog("airplay command type=$type keys=${params.keys.sorted()}")
         if (type == "requestUI") listener.onHostUiRequested(this)
         listener.onCommand(this, type, params)
-        return RtspMessage.Response(status = 200)
+        val response = RtspMessage.Response(status = 200)
+        debugLog("airplay command response type=$type status=200 body=${response.body.size} params=${params.keys.sorted()}")
+        return response
     }
 
     private fun handleTeardown(request: RtspMessage.Request): RtspMessage.Response {
