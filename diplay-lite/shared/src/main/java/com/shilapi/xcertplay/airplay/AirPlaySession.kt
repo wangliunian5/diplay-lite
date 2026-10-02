@@ -303,6 +303,11 @@ class AirPlaySession(
                             "airplay handler failed ${request.method} ${request.path} cseq=$cseq",
                             error,
                         )
+                        // 实机无 adb：异常此前只进 logcat，文件日志里看不到根因，此处补写
+                        debugLog(
+                            "airplay handler failed ${request.method} ${request.path} cseq=$cseq: " +
+                                Log.getStackTraceString(error),
+                        )
                         RtspMessage.Response(status = 500)
                     }
                     debugLog(
@@ -559,9 +564,20 @@ class AirPlaySession(
     }
 
     private fun openKeepAlive(): Int {
-        val socket = DatagramSocket(null)
-        socket.reuseAddress = true
-        socket.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+        // API16 车机实测：绑 IPv6 通配 [::] 抛异常会让 AirPlay SETUP 返回 500。
+        // 优先 [::]，失败回退 IPv4 通配（本热点对端为 IPv4）
+        val socket = try {
+            DatagramSocket(null).apply {
+                reuseAddress = true
+                bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+            }
+        } catch (error: Exception) {
+            debugLog("airplay keepalive 端口 IPv6 通配绑定失败，回退 IPv4: ${error.message}")
+            DatagramSocket(null).apply {
+                reuseAddress = true
+                bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
+            }
+        }
         keepAliveSocket = socket
         keepAliveThread = Thread({ runKeepAlive(socket) }, "airplay-keepalive").apply {
             isDaemon = true
@@ -582,7 +598,14 @@ class AirPlaySession(
     }
 
     private fun openEvent(): Int {
-        val server = ServerSocket(0, 50, InetAddress.getByName("::"))
+        // API16 车机实测：绑 IPv6 通配 [::] 抛异常会让 AirPlay SETUP 返回 500。
+        // 优先 [::]（双栈，兼容 IPv6 对端），失败回退 IPv4 通配（本热点对端为 IPv4）
+        val server = try {
+            ServerSocket(0, 50, InetAddress.getByName("::"))
+        } catch (error: Exception) {
+            debugLog("airplay event 端口 IPv6 通配绑定失败，回退 IPv4: ${error.message}")
+            ServerSocket(0, 50, InetAddress.getByName("0.0.0.0"))
+        }
         eventServer = server
         spawnEvent("airplay-event-accept") { acceptEvent(server) }
         return server.localPort
