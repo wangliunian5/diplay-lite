@@ -459,12 +459,24 @@ class AirPlaySession(
         if (dict["keepAliveLowPower"] == true || dict["keepAliveLowPower"] == 1L) {
             response["keepAlivePort"] = openKeepAlive()
         }
-        val features = mutableListOf<String>()
+        val requested = (dict["features"] as? List<*>).orEmpty().mapNotNull { it as? String }
+        // 车机基础能力
+        val features = linkedSetOf<String>()
         if (config.hevc) features.add("hevc")
         features.add("iAPChannel")
         features.add("viewAreas")
         if (config.cluster != null) features.add("altScreen")
-        response["enabledFeatures"] = features
+        // 历史上这里只回硬编码的 [iAPChannel, viewAreas]，导致 iPhone 在 SETUP 里请求的能力
+        // （uiContext/viewAreas/cornerMasks/focusTransfer/h.264Level5.1/mainBuffered/altScreen/
+        // enhancedSiri/hevc）几乎全被砍掉——iPhone 随后只下发 type=110 视频流、零音频流。
+        // 这里改为 <车机基础能力 ∪ iPhone 请求的能力>，把能力面补齐，并在日志里同时打印
+        // requested / enabledFeatures，便于下一次实测判定 iPhone 是否因此下发音频流。
+        features.addAll(requested)
+        response["enabledFeatures"] = features.toList()
+        debugLog(
+            "airplay SETUP enabledFeatures=${features.joinToString(",")} " +
+                "requested=${requested.joinToString(",")}",
+        )
         return RtspMessage.Response(
             headers = mapOf("Content-Type" to PLIST_CONTENT_TYPE),
             body = BplistCodec.encode(response),
