@@ -1556,7 +1556,7 @@ class CarPlayController(
         } else {
             config.wirelessHotspotMode
         }
-        if (hotspotMode == WirelessHotspotMode.MANUAL &&
+        if (hotspotMode.isManualHotspot &&
             com.shilapi.xcertplay.network.CarHotspotStatus.isEnabled(appContext) == false
         ) {
             throw IOException("The car hotspot is off. Turn it on in the car settings and connect again.")
@@ -1564,7 +1564,7 @@ class CarPlayController(
         val manager: WirelessHotspotManager = when (hotspotMode) {
             WirelessHotspotMode.WIFI_P2P -> WifiP2pGroupManager(appContext, ::debugLog)
             WirelessHotspotMode.LOCAL_ONLY_HOTSPOT -> LocalOnlyHotspotManager(appContext, ::debugLog)
-            WirelessHotspotMode.MANUAL -> ManualHotspotManager(
+            WirelessHotspotMode.MANUAL, WirelessHotspotMode.MANUAL_IPV4 -> ManualHotspotManager(
                 context = appContext,
                 ssid = config.manualHotspotSsid
                     ?: throw IOException("Manual hotspot SSID is not configured"),
@@ -1572,6 +1572,7 @@ class CarPlayController(
                 band = config.manualHotspotBand,
                 channel = config.manualHotspotChannel,
                 security = config.manualHotspotSecurity,
+                preferIpv4 = hotspotMode == WirelessHotspotMode.MANUAL_IPV4,
                 onDiagnostic = ::debugLog,
             )
         }

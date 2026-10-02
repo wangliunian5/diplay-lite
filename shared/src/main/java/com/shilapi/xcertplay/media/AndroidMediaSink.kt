@@ -4,6 +4,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat as AndroidAudioFormat
 import android.media.AudioTrack
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
@@ -131,7 +132,7 @@ class AndroidMediaSink(
     }
 
     override fun onMicrophoneStarted(type: Int, config: MicrophoneConfig) {
-        val uplink = microphoneUplinks.computeIfAbsent(type) { MicrophoneUplink(config) }
+        val uplink = microphoneUplinks.computeIfAbsent(type) { MicrophoneUplink(config, onAudioDiagnostic) }
         if (!uplink.start()) microphoneUplinks.remove(type, uplink)
     }
 
@@ -290,7 +291,7 @@ private class VideoDecoder(
         }
         // Some vendor hardware decoders (e.g. MediaTek/Mali) reject the tuned parameters
         // with BAD_VALUE. Fall back to a minimal format on the default hardware decoder path;
-        // createDecoder already selects a software HEVC decoder when preferSoftwareHevcDecoder.
+        // createDecoder already selects a software decoder when preferSoftwareHevcDecoder.
         val attempts = listOf(
             DecoderAttempt(tuned = true),
             DecoderAttempt(tuned = false),
@@ -356,23 +357,32 @@ private class VideoDecoder(
     }
 
     private fun createDecoder(mime: String): MediaCodec {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-            mime == MediaFormat.MIMETYPE_VIDEO_HEVC &&
-            preferSoftwareHevcDecoder
-        ) {
+        // Old head units (Android 5-9) often ship broken vendor decoders: green frames,
+        // ~300 ms/frame stalls and endless keyframe recovery. Prefer a stock software
+        // decoder for both AVC and HEVC when the user opts in. API < 29 has no
+        // MediaCodecInfo.isSoftwareOnly(), so fall back to name prefixes there.
+        if (preferSoftwareHevcDecoder) {
             val software = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull {
-                !it.isEncoder && it.isSoftwareOnly && mime in it.supportedTypes
+                !it.isEncoder && it.isSoftwareDecoder() && mime in it.supportedTypes
             }
             if (software != null) {
                 try {
                     return MediaCodec.createByCodecName(software.name)
                 } catch (error: Exception) {
-                    Log.w(TAG, "software HEVC decoder unavailable name=${software.name}", error)
+                    Log.w(TAG, "software decoder unavailable name=${software.name} mime=$mime", error)
                 }
             }
         }
         return MediaCodec.createDecoderByType(mime)
     }
+
+    private fun MediaCodecInfo.isSoftwareDecoder(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            isSoftwareOnly
+        } else {
+            name.startsWith("OMX.google.") || name.startsWith("c2.android.") ||
+                name.startsWith("c2.soft.")
+        }
 
     private fun changeSurface(surface: Surface?) {
         if (outputSurface === surface) return

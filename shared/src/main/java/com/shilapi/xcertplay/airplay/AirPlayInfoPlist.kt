@@ -46,7 +46,11 @@ object AirPlayInfoPlist {
         )
         if (!config.disableAudioOutput) {
             info["audioLatencies"] = audioLatencies()
-            info["audioFormats"] = audioFormats(config.entertainmentSampleRate, config.microphone)
+            info["audioFormats"] = audioFormats(
+                config.entertainmentSampleRate,
+                config.microphone,
+                config.opusEncoderAvailable,
+            )
         }
         info["extendedFeatures"] = listOf("vocoderInfo", "enhancedRequestCarUI")
         info["displays"] = displays
@@ -110,6 +114,7 @@ object AirPlayInfoPlist {
     private fun audioFormats(
         entertainmentRate: Int,
         microphone: Boolean,
+        opusEncoderAvailable: Boolean,
     ): List<Map<String, Any?>> {
         fun format(type: Int, audioType: String, outputFormats: Int, inputFormats: Int? = null): Map<String, Any?> {
             val entry = linkedMapOf<String, Any?>(
@@ -128,16 +133,21 @@ object AirPlayInfoPlist {
         val opus = 0x70000000
         val aacLc = if (is48) 0x800000 else 0x400000
         val pcmInput = if (microphone) pcmMono else null
-        val wirelessInput = if (microphone) pcmMono or opus else null
+        // Devices without an OPUS encoder (Android < 10) must not advertise the OPUS input
+        // bit: the phone would negotiate an OPUS microphone uplink that can never encode.
+        val opusBits = if (opusEncoderAvailable) opus else 0
+        val wirelessInput = if (microphone) pcmMono or opusBits else null
 
         return listOf(
             format(100, "compatibility", pcm, pcmInput),
             format(101, "compatibility", pcm),
-            format(100, "default", pcm or opus, wirelessInput),
+            // Streams that carry the wireless microphone input negotiate one codec for both
+            // directions, so their OPUS output bit must go away together with the input bit.
+            format(100, "default", pcm or opusBits, wirelessInput),
             format(100, "alert", pcm or opus),
             format(100, "media", pcm),
-            format(100, "telephony", pcmMono or opus, wirelessInput),
-            format(100, "speechRecognition", pcmMono or opus, wirelessInput),
+            format(100, "telephony", pcmMono or opusBits, wirelessInput),
+            format(100, "speechRecognition", pcmMono or opusBits, wirelessInput),
             format(101, "default", pcm or opus),
             format(102, "media", aacLc),
         )

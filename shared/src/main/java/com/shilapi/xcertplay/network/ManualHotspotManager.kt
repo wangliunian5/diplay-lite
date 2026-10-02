@@ -36,6 +36,7 @@ class ManualHotspotManager(
     band: ManualHotspotBand,
     channel: Int,
     security: ManualHotspotSecurity,
+    private val preferIpv4: Boolean = false,
     private val onDiagnostic: (String) -> Unit = {},
 ) : WirelessHotspotManager {
     private val appContext = context.applicationContext
@@ -107,6 +108,7 @@ class ManualHotspotManager(
                 onDiagnostic("Manual hotspot configReadable=${apConfiguration != null} " +
                     "security=$security channelKnown=${channel > 0} " +
                     "hardwareAddressKnown=${localInterface.hardwareAddress != null} iface=${localInterface.name} " +
+                    "ipv4Preferred=$preferIpv4 " +
                     "family=${if (localInterface.hostAddress is Inet6Address) "IPv6" else "IPv4"}")
                 if (security != Iap2WirelessSecurity.NONE && passphrase.isEmpty()) {
                     throw IOException("Manual hotspot is secured but no passphrase was provided")
@@ -255,7 +257,7 @@ class ManualHotspotManager(
     }
 
     private fun NetworkInterface.hotspotAddress(): InetAddress? =
-        wirelessHostAddress(Collections.list(inetAddresses), index)
+        wirelessHostAddress(Collections.list(inetAddresses), index, preferIpv4)
 
     private fun frequencyFromConnectionInfo(): Int? {
         val connectionInfo = try {

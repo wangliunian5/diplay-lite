@@ -301,7 +301,7 @@ class CarPlayHostActivity : ComponentActivity() {
     private var remoteMfiServer = ""
     private var remoteMfiToken = ""
     private var wirelessPermissionsReady = false
-    private var wirelessHotspotMode = WirelessHotspotMode.WIFI_P2P
+    private var wirelessHotspotMode = WirelessHotspotMode.MANUAL
     private var manualHotspotSsid = ""
     private var manualHotspotPassphrase = ""
     private var manualHotspotBand = ManualHotspotBand.AUTO
@@ -433,9 +433,7 @@ class CarPlayHostActivity : ComponentActivity() {
         // Size is now chosen only through CarPlaySize; ignore the canvas scale older builds stored.
         uiScalePercent = CarPlayUiScale.DEFAULT
         hevcEnabled = AirPlayPersistence.loadHevcEnabled(this)
-        hevcSoftwareDecoderEnabled =
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-                AirPlayPersistence.loadHevcSoftwareDecoderEnabled(this)
+        hevcSoftwareDecoderEnabled = AirPlayPersistence.loadHevcSoftwareDecoderEnabled(this)
         advancedAudioChannelMapping =
             advancedAudioChannelMappingSupported &&
                 AirPlayPersistence.loadAdvancedAudioChannelMapping(this)
@@ -1212,12 +1210,12 @@ class CarPlayHostActivity : ComponentActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         softwareHevcRow.addView(
-            menuText("HEVC 软件解码器", 20f, MENU_SECONDARY),
+            menuText("软件解码（旧车机）", 20f, MENU_SECONDARY),
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
         )
         val softwareHevcSwitch = Switch(this).apply {
             isChecked = hevcSoftwareDecoderEnabled
-            contentDescription = "使用软件 HEVC 解码器"
+            contentDescription = "优先使用软件视频解码器（H.264 与 HEVC），兼容解码异常的老车机"
             showText = false
             thumbTintList = ColorStateList(
                 arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
@@ -1231,7 +1229,7 @@ class CarPlayHostActivity : ComponentActivity() {
                 if (hevcSoftwareDecoderEnabled == checked) return@setOnCheckedChangeListener
                 hevcSoftwareDecoderEnabled = checked
                 appendLog(
-                    "HEVC software decoder ${if (hevcSoftwareDecoderEnabled) "enabled" else "disabled"}; " +
+                    "Software video decoder ${if (hevcSoftwareDecoderEnabled) "enabled" else "disabled"}; " +
                         "applies when settings close",
                 )
                 updateResolutionMenu()
@@ -1244,15 +1242,13 @@ class CarPlayHostActivity : ComponentActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ),
         )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            content.addView(
-                softwareHevcRow,
-                LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                ).apply { topMargin = dp(16) },
-            )
-        }
+        content.addView(
+            softwareHevcRow,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(16) },
+        )
 
         content.addView(
             buildSafeAreaSection(),
@@ -1302,8 +1298,8 @@ class CarPlayHostActivity : ComponentActivity() {
             )
             content.addView(
                 menuText(
-                    "以下设置在 Android 9 (API 28) 上不可用且已隐藏：\n" +
-                        "• Wi-Fi P2P (5 GHz) — 改用 LocalOnlyHotspot。\n" +
+                    "以下设置在本版本不可用且已隐藏：\n" +
+                        "• Wi-Fi Direct — 本版本不可用，已由车机自带热点 IPv6/IPv4 选项取代。\n" +
                         "• HEVC 软件解码器 — 改用硬件解码。",
                     16f,
                     MENU_SECONDARY,
@@ -2263,11 +2259,10 @@ class CarPlayHostActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(8), 0, 0)
         }
+        // Wi-Fi Direct is unavailable on this build; offer the car hotspot over IPv6 and IPv4.
         val modes = buildList {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                add(WirelessHotspotMode.WIFI_P2P to "Wi-Fi P2P (5 GHz)")
-            }
-            add(WirelessHotspotMode.MANUAL to "车机自带热点")
+            add(WirelessHotspotMode.MANUAL to "车机自带热点IPV6")
+            add(WirelessHotspotMode.MANUAL_IPV4 to "车机自带热点IPV4")
         }
         var selectedId = View.NO_ID
         for ((mode, label) in modes) {
@@ -2423,7 +2418,7 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     private fun updateManualHotspotFields() {
-        val visible = wirelessHotspotMode == WirelessHotspotMode.MANUAL
+        val visible = wirelessHotspotMode.isManualHotspot
         manualHotspotFields?.visibility = if (visible) View.VISIBLE else View.GONE
         if (!visible) manualHotspotErrorView?.visibility = View.GONE
     }
@@ -2449,7 +2444,7 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     private fun validateManualHotspotSettings(): Boolean {
-        if (wirelessHotspotMode != WirelessHotspotMode.MANUAL) return true
+        if (!wirelessHotspotMode.isManualHotspot) return true
         val error = when {
             manualHotspotSsid.isBlank() -> "必须填写热点 SSID"
             manualHotspotSsid.encodeToByteArray().size > 32 ->
@@ -2476,7 +2471,8 @@ class CarPlayHostActivity : ComponentActivity() {
     private fun hotspotModeLabel(mode: WirelessHotspotMode): String = when (mode) {
         WirelessHotspotMode.WIFI_P2P -> "Wi-Fi P2P (5 GHz)"
         WirelessHotspotMode.LOCAL_ONLY_HOTSPOT -> "LocalOnlyHotspot"
-        WirelessHotspotMode.MANUAL -> "手动热点"
+        WirelessHotspotMode.MANUAL -> "车机自带热点IPv6"
+        WirelessHotspotMode.MANUAL_IPV4 -> "车机自带热点IPv4"
     }
 
     private fun menuText(
@@ -2611,7 +2607,7 @@ class CarPlayHostActivity : ComponentActivity() {
                 "${negotiated.widthPixels} x ${negotiated.heightPixels}"
         }
         val transport = if (!hevcEnabled) {
-            "H.264"
+            if (hevcSoftwareDecoderEnabled) "H.264（软件）" else "H.264"
         } else {
             "HEVC (H.265，${if (hevcSoftwareDecoderEnabled) "软件" else "硬件"})"
         }
@@ -2678,7 +2674,7 @@ class CarPlayHostActivity : ComponentActivity() {
                 display.widthPixels, display.heightPixels, display.fps.toDouble()) == true
             val reason = when {
                 !hardware -> "software_decoder"
-                hevcEnabled && hevcSoftwareDecoderEnabled -> "software_hevc_selected"
+                hevcSoftwareDecoderEnabled -> "software_decoder_selected"
                 video == null -> "no_video_capabilities"
                 !sizeSupported -> "canvas_dimensions_unsupported"
                 !rateSupported -> "frame_rate_unsupported"
@@ -2749,6 +2745,11 @@ class CarPlayHostActivity : ComponentActivity() {
         appendLog(requestSummary)
         appendLog(support.details)
         appendLog(effectiveSummary)
+        val opusEncoderAvailable = hasOpusEncoder()
+        appendLog(
+            "Microphone OPUS encoder available=$opusEncoderAvailable api=${Build.VERSION.SDK_INT}; " +
+                "wireless uplink will negotiate ${if (opusEncoderAvailable) "OPUS" else "PCM"}",
+        )
         return AirPlayConfig(
             deviceName = "DiPlay",
             deviceId = DiPlayBootstrap.deviceId(airPlayIdentity),
@@ -2759,6 +2760,7 @@ class CarPlayHostActivity : ComponentActivity() {
             rightHandDrive = rightHandDrive,
             hevc = hevcEnabled,
             microphone = microphoneAvailable,
+            opusEncoderAvailable = opusEncoderAvailable,
             manufacturer = normalizedManufacturer(),
             model = normalizedModel(),
             oemLabel = oemLabel,
@@ -2908,6 +2910,19 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun normalizedManufacturer(): String =
         manufacturer.trim().ifBlank { AirPlayPersistence.DEFAULT_MANUFACTURER }
+
+    /**
+     * True when this device can encode OPUS. Android 10 (API 29) added the platform OPUS
+     * encoder; older builds only decode it, so the wireless microphone uplink must fall
+     * back to advertising PCM-only inputs and let the phone negotiate PCM.
+     */
+    private fun hasOpusEncoder(): Boolean = try {
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any {
+            it.isEncoder && MediaFormat.MIMETYPE_AUDIO_OPUS in it.supportedTypes
+        }
+    } catch (_: Exception) {
+        false
+    }
 
     private fun normalizedModel(): String =
         model.trim().ifBlank { AirPlayPersistence.DEFAULT_MODEL }
@@ -3192,6 +3207,17 @@ class CarPlayHostActivity : ComponentActivity() {
         } else if (menuOpen || handshakeResetInProgress) {
             appendLog(
                 "Display updated while handshake is reset: " +
+                    "${previous.width}x${previous.height} -> ${size.width}x${size.height}",
+            )
+        } else if (Math.abs(size.width - previous.width) <= DISPLAY_JITTER_TOLERANCE_PIXELS &&
+            Math.abs(size.height - previous.height) <= DISPLAY_JITTER_TOLERANCE_PIXELS
+        ) {
+            // EMUI-style skins flap the surface size by a status-bar/cutout inset (e.g.
+            // 1080x2190 <-> 1080x2280) every few seconds. Restarting CarPlay for each
+            // flap kills an otherwise healthy wireless session, so keep it running and
+            // let the canvas letterbox slightly instead.
+            appendLog(
+                "Display jitter tolerated: " +
                     "${previous.width}x${previous.height} -> ${size.width}x${size.height}",
             )
         } else {
@@ -3608,6 +3634,7 @@ class CarPlayHostActivity : ComponentActivity() {
         const val SCREEN_TYPE_ALT = 111
         const val LOG_RETENTION_MILLIS = 5 * 60_000L
         const val DISPLAY_CHANGE_DEBOUNCE_MILLIS = 500L
+        const val DISPLAY_JITTER_TOLERANCE_PIXELS = 120
         const val RECONNECT_DELAY_MILLIS = 2_000L
         const val IAP_TUNNEL_RECONNECT_DELAY_MILLIS = 15_000L
         const val CONTROLLER_CLOSE_TIMEOUT_MILLIS = 4_000L

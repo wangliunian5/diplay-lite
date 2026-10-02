@@ -22,13 +22,24 @@ import java.util.concurrent.atomic.AtomicBoolean
  * The recorder runs only while the matching audio stream is active, so callers start this after
  * the first downlink audio packet and close it on stream teardown.
  */
-internal class MicrophoneUplink(private val config: MicrophoneConfig) : Closeable {
+internal class MicrophoneUplink(
+    private val config: MicrophoneConfig,
+    private val diagnostics: ((String) -> Unit)? = null,
+) : Closeable {
     private val running = AtomicBoolean(false)
     private val firstPacketLogged = AtomicBoolean(false)
     @Volatile private var recorder: AudioRecord? = null
     @Volatile private var socket: DatagramSocket? = null
     @Volatile private var opusEncoder: OpusEncoder? = null
     private var thread: Thread? = null
+
+    /** Reports a start failure into the diagnostic log so field reports show why calls went silent. */
+    private fun fail(message: String): Boolean {
+        Log.w(TAG, message)
+        diagnostics?.invoke("Microphone uplink failed: $message")
+        running.set(false)
+        return false
+    }
 
     fun start(): Boolean {
         if (!running.compareAndSet(false, true)) return true
@@ -44,9 +55,7 @@ internal class MicrophoneUplink(private val config: MicrophoneConfig) : Closeabl
             AndroidAudioFormat.ENCODING_PCM_16BIT,
         )
         if (minBuffer <= 0) {
-            Log.w(TAG, "microphone unavailable rate=${config.sampleRate} channels=${config.channels}")
-            running.set(false)
-            return false
+            return fail("microphone unavailable rate=${config.sampleRate} channels=${config.channels}")
         }
 
         val source = when (config.audioType) {
@@ -60,9 +69,10 @@ internal class MicrophoneUplink(private val config: MicrophoneConfig) : Closeabl
             null
         }
         if (config.codec == AudioCodecKind.OPUS && nextEncoder == null) {
-            Log.w(TAG, "microphone Opus encoder is unavailable")
-            running.set(false)
-            return false
+            return fail(
+                "Opus encoder is unavailable on this device; the phone negotiated " +
+                    "an OPUS microphone uplink this build cannot encode",
+            )
         }
         val bufferSize = maxOf(minBuffer * 2, config.frameBytes * 4)
         val nextRecorder = try {
@@ -80,15 +90,13 @@ internal class MicrophoneUplink(private val config: MicrophoneConfig) : Closeabl
         } catch (error: Exception) {
             Log.e(TAG, "microphone recorder creation failed", error)
             nextEncoder?.close()
-            running.set(false)
-            return false
+            return fail("recorder creation failed: ${error.message}")
         }
         if (nextRecorder.state != AudioRecord.STATE_INITIALIZED) {
             Log.w(TAG, "microphone recorder failed to initialize")
             nextRecorder.release()
             nextEncoder?.close()
-            running.set(false)
-            return false
+            return fail("recorder failed to initialize")
         }
 
         val nextSocket = try {
@@ -100,8 +108,7 @@ internal class MicrophoneUplink(private val config: MicrophoneConfig) : Closeabl
             Log.e(TAG, "microphone socket creation failed", error)
             nextRecorder.release()
             nextEncoder?.close()
-            running.set(false)
-            return false
+            return fail("socket creation failed: ${error.message}")
         }
 
         recorder = nextRecorder
@@ -122,6 +129,7 @@ internal class MicrophoneUplink(private val config: MicrophoneConfig) : Closeabl
             true
         } catch (error: Exception) {
             Log.e(TAG, "microphone recording failed", error)
+            fail("recording failed to start: ${error.message}")
             release()
             false
         }

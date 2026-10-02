@@ -45,6 +45,13 @@ data class AirPlayConfig(
     val hevc: Boolean = false,
     val disableAudioOutput: Boolean = false,
     val microphone: Boolean = false,
+    /**
+     * Whether the device has an OPUS encoder (MediaCodec "audio/opus" encoder).
+     * Android 10 (API 29) ships the OPUS encoder; older devices only decode OPUS.
+     * When false, /info advertises PCM-only inputs so the phone negotiates PCM
+     * uplink audio instead of OPUS, which would silently fail to encode.
+     */
+    val opusEncoderAvailable: Boolean = true,
     val manufacturer: String = "xcertplay",
     val model: String = "xcertplay",
     val oemLabel: String = "xcertplay",

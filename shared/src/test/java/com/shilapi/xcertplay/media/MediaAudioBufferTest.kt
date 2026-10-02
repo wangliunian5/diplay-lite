@@ -15,7 +15,9 @@ class MediaAudioBufferTest {
     @Test
     fun `calls and prompts keep the low-latency buffer`() {
         val plan = MediaAudioBuffer.plan("telephony", 16_000, 1, minBufferBytes = 1_280, mediaMillis = 1000)
-        assertEquals(4 * 1024, plan.startBytes)
+        // P0: non-media starts are a fixed ~200 ms (16 kHz mono = 32 000 B/s → 6 400) to survive
+        // the ~260 ms wireless gaps that used to underrun the old ~80 ms start level.
+        assertEquals(6_400, plan.startBytes)
         assertEquals(16 * 1024, plan.trackBufferBytes)
         assertEquals(plan, MediaAudioBuffer.plan("alert", 16_000, 1, minBufferBytes = 1_280, mediaMillis = 1000))
     }

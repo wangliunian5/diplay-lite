@@ -44,6 +44,7 @@ class DiPlayActivity : ComponentActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var page = "home"
     private var pendingCarHotspotSetup = false
+    private var pendingHotspotMode = WirelessHotspotMode.MANUAL
     private var setupError: String? = null
     private var status: TextView? = null
     private var connectButton: Button? = null
@@ -97,6 +98,9 @@ class DiPlayActivity : ComponentActivity() {
             "无法加载 CarPlay 认证。请在此应用上安装完整的 DiPlay 构建。无需卸载或更改热点。"
         }
         pendingCarHotspotSetup = savedInstanceState?.getBoolean("pending_car_hotspot") ?: false
+        pendingHotspotMode = savedInstanceState?.getString("pending_hotspot_mode")
+            ?.let { stored -> WirelessHotspotMode.entries.firstOrNull { it.name == stored } }
+            ?.takeIf { it.isManualHotspot } ?: WirelessHotspotMode.MANUAL
         page = savedInstanceState?.getString("page") ?: intent.getStringExtra("page") ?: "home"
         render()
         handleWirelessRecovery()
@@ -131,7 +135,12 @@ class DiPlayActivity : ComponentActivity() {
         page = intent.getStringExtra("page") ?: "home"; render()
         handleWirelessRecovery()
     }
-    override fun onSaveInstanceState(outState: Bundle) { outState.putString("page", page); outState.putBoolean("pending_car_hotspot", pendingCarHotspotSetup); super.onSaveInstanceState(outState) }
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("page", page)
+        outState.putBoolean("pending_car_hotspot", pendingCarHotspotSetup)
+        outState.putString("pending_hotspot_mode", pendingHotspotMode.name)
+        super.onSaveInstanceState(outState)
+    }
     override fun onConfigurationChanged(newConfig: Configuration) { super.onConfigurationChanged(newConfig); render() }
     override fun onResume() {
         super.onResume(); handler.removeCallbacks(tick); handler.post(tick)
@@ -188,7 +197,8 @@ class DiPlayActivity : ComponentActivity() {
         }
         card.addView(connectButton, matchButton())
         val connectionHint = when (AirPlayPersistence.loadWirelessHotspotMode(this)) {
-            WirelessHotspotMode.MANUAL -> "车机自带热点 · 请保持车机热点、蓝牙和 iPhone 的 Wi-Fi 开启。"
+            WirelessHotspotMode.MANUAL -> "车机自带热点IPv6 · 请保持车机热点、蓝牙和 iPhone 的 Wi-Fi 开启。"
+            WirelessHotspotMode.MANUAL_IPV4 -> "车机自带热点IPv4 · 请保持车机热点、蓝牙和 iPhone 的 Wi-Fi 开启。"
             WirelessHotspotMode.LOCAL_ONLY_HOTSPOT -> "打开连接设置以保存车机自带热点的信息。"
             else -> "Wi-Fi Direct · 请保持车机的 Wi-Fi 开关、蓝牙和 iPhone 的 Wi-Fi 开启。"
         }
@@ -276,6 +286,7 @@ class DiPlayActivity : ComponentActivity() {
             }
             choice(card, "帧率", listOf("30 帧/秒 · 负载较轻", "60 帧/秒 · 更流畅"), if (AirPlayPersistence.loadFps(this) == 60) 1 else 0) { AirPlayPersistence.saveFps(this, if (it == 1) 60 else 30) }
             toggle(card, "高效视频", "使用 HEVC。如需最广的车机兼容性，请保持关闭。", AirPlayPersistence.loadHevcEnabled(this)) { AirPlayPersistence.saveHevcEnabled(this, it) }
+            toggle(card, "软件解码", "画面绿屏或卡顿的老车机请开启：改用兼容的软件视频解码器（H.264 与 HEVC 均生效）。", AirPlayPersistence.loadHevcSoftwareDecoderEnabled(this)) { AirPlayPersistence.saveHevcSoftwareDecoderEnabled(this, it) }
             toggle(card, "右手驾驶", "将 CarPlay 的控件放置在更靠近驾驶员的一侧。", AirPlayPersistence.loadRightHandDrive(this)) { AirPlayPersistence.saveRightHandDrive(this, it) }
             toggle(card, "全屏", "CarPlay 打开时隐藏车机系统栏。", AirPlayPersistence.loadHideTopBar(this) && AirPlayPersistence.loadHideBottomBar(this)) {
                 AirPlayPersistence.saveHideTopBar(this, it); AirPlayPersistence.saveHideBottomBar(this, it)
@@ -366,7 +377,7 @@ class DiPlayActivity : ComponentActivity() {
 
     // The car hotspot link needs the hotspot on; DiPlay only checks it (turning it on needs ADB-only permission).
     private fun carHotspotOff(): Boolean =
-        AirPlayPersistence.loadWirelessHotspotMode(this) == WirelessHotspotMode.MANUAL &&
+        AirPlayPersistence.loadWirelessHotspotMode(this).isManualHotspot &&
             com.shilapi.xcertplay.network.CarHotspotStatus.isEnabled(this) == false
 
     private fun carHotspotOffDialog() {
@@ -394,14 +405,6 @@ class DiPlayActivity : ComponentActivity() {
         openSystem(Intent(Settings.ACTION_WIRELESS_SETTINGS))
     }
 
-    private fun openCarClientWifiSettings() {
-        val wifi = Intent(Settings.ACTION_WIFI_SETTINGS)
-        if (packageManager.resolveActivity(wifi, 0)?.activityInfo?.packageName == "com.byd.carsettings") {
-            runCatching { startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)) }
-        }
-        openSystem(wifi)
-    }
-
     private fun connectionSetup(content: LinearLayout) {
         content.addView(label("连接设置", 34, TEXT, true))
         content.addView(label("只需设置一次。你的详细信息会保存到下次驾驶。更改将在下次连接时生效。", 17, MUTED).apply { setPadding(0, dp(8), 0, dp(24)) })
@@ -424,12 +427,13 @@ class DiPlayActivity : ComponentActivity() {
     }
 
     private fun wirelessLinkControls(parent: LinearLayout) {
-        val mode = if (pendingCarHotspotSetup) WirelessHotspotMode.MANUAL else AirPlayPersistence.loadWirelessHotspotMode(this)
-        val modes = listOf(WirelessHotspotMode.MANUAL, WirelessHotspotMode.WIFI_P2P)
-        val titles = listOf("车机自带热点", "Wi-Fi Direct")
+        val mode = if (pendingCarHotspotSetup) pendingHotspotMode else AirPlayPersistence.loadWirelessHotspotMode(this)
+        // Wi-Fi Direct is unavailable on this build; the car hotspot is offered over IPv6 and IPv4.
+        val modes = listOf(WirelessHotspotMode.MANUAL, WirelessHotspotMode.MANUAL_IPV4)
+        val titles = listOf("车机自带热点IPV6", "车机自带热点IPV4")
         val descriptions = listOf(
-            "使用车机自带热点。如可用，请在车机设置中选择 5 GHz。",
-            "备选方案。需要打开车机的 Wi-Fi 开关；2.4 GHz 连接可能会出现卡顿。"
+            "使用车机自带热点，通过 IPv6 链路本地地址连接。如可用，请在车机设置中选择 5 GHz。",
+            "备选方案。使用同一个车机自带热点，改用 IPv4 地址连接；适合 IPv6 方式连不上的车型。"
         )
         val wide = resources.configuration.screenWidthDp >= 850
         val choices = if (wide) row().apply { gravity = Gravity.TOP } else column()
@@ -440,8 +444,9 @@ class DiPlayActivity : ComponentActivity() {
                 if (index > 0) marginStart = dp(16)
             } else LinearLayout.LayoutParams(-1, -2))
             option.addView(button("${if (mode == candidate) "✓  " else ""}${titles[index]}", mode == candidate) {
-                if (candidate == WirelessHotspotMode.MANUAL) {
+                if (candidate.isManualHotspot) {
                     pendingCarHotspotSetup = true
+                    pendingHotspotMode = candidate
                     render()
                 } else {
                     pendingCarHotspotSetup = false
@@ -450,7 +455,7 @@ class DiPlayActivity : ComponentActivity() {
             }, matchButton(12, 60))
             option.addView(label(descriptions[index], 15, MUTED).apply { setPadding(0, dp(6), 0, dp(12)) })
         }
-        if (mode == WirelessHotspotMode.MANUAL) {
+        if (mode.isManualHotspot) {
             parent.addView(label("热点设置", 22, TEXT, true))
             parent.addView(label("1. 打开车机热点设置，开启热点，如可用请选择 5 GHz。\n2. 在下方准确复制其名称和密码。\n3. 连接时保持车机热点开启。DiPlay 会通过蓝牙发送详细信息；你的 iPhone 会自动加入。", 16, MUTED).apply { setPadding(0, dp(8), 0, dp(12)) })
             parent.addView(button("打开车机热点设置", false) { openCarWifiSettings() }, matchButton(0, 60))
@@ -458,13 +463,10 @@ class DiPlayActivity : ComponentActivity() {
                 askHotspotCredentials { ssid, password ->
                     saveHotspotCredentials(ssid, password)
                     pendingCarHotspotSetup = false
-                    applyWirelessLink(WirelessHotspotMode.MANUAL)
+                    applyWirelessLink(pendingHotspotMode)
                 }
             }, matchButton(12, 60))
             parent.addView(label(if (pendingCarHotspotSetup) "完成设置 · 保存热点详情以使用此模式。" else if (carHotspotOff()) "热点已关闭 · 请在车机设置中开启。" else "详情已保存 · 连接前请确认车机热点已开启。", 15, if (carHotspotOff()) WARNING else MUTED).apply { setPadding(0, dp(12), 0, 0) })
-        } else {
-            parent.addView(label("打开车机的 Wi-Fi 开关。如被请求，请允许定位/附近设备权限，并在 Android 询问时启用定位。如果播放卡顿，请尝试使用 5 GHz 的车机自带热点。", 16, MUTED))
-            parent.addView(button("打开车机 Wi-Fi 设置", false) { openCarClientWifiSettings() }, matchButton(12, 60))
         }
     }
 
@@ -628,9 +630,10 @@ class DiPlayActivity : ComponentActivity() {
     private fun connect(wireless: Boolean) {
         if (wireless && pendingCarHotspotSetup) { toast("请先在连接设置中保存热点详情"); page = "connection"; render(); return }
         if (setupError != null) { toast(setupError!!); return }
-        if (wireless && AirPlayPersistence.loadWirelessHotspotMode(this) == WirelessHotspotMode.MANUAL &&
+        if (wireless && AirPlayPersistence.loadWirelessHotspotMode(this).isManualHotspot &&
             hotspotError(storedSsid(), storedPassword()) != null) {
             pendingCarHotspotSetup = true
+            pendingHotspotMode = AirPlayPersistence.loadWirelessHotspotMode(this)
             page = "connection"
             render()
             toast("请先从车机热点设置中保存名称和密码")

@@ -214,6 +214,34 @@ class AirPlayInfoPlistTest {
     }
 
     @Test
+    fun microphoneInputsDropOpusWhenEncoderUnavailable() {
+        val base = AirPlayConfig(
+            deviceName = "test",
+            deviceId = "02:00:00:00:00:02",
+            btMac = "02:00:00:00:00:02",
+            sourceVersion = "366.0",
+            main = AirPlayDisplayConfig(widthPixels = 1280, heightPixels = 720),
+        )
+
+        fun telephony(info: Map<String, Any?>): Map<*, *> =
+            (info["audioFormats"] as List<*>)
+                .map { it as Map<*, *> }
+                .single { it["audioType"] == "telephony" }
+
+        fun defaultAudio(info: Map<String, Any?>): Map<*, *> =
+            (info["audioFormats"] as List<*>)
+                .map { it as Map<*, *> }
+                .single { it["type"] == 100 && it["audioType"] == "default" }
+
+        val pcmOnly = AirPlayInfoPlist.build(base.copy(microphone = true, opusEncoderAvailable = false))
+        // No OPUS bit in the negotiated codec: the stream carries both directions in one codec,
+        // so the output bit must drop together with the input bit or the phone still picks OPUS.
+        assertEquals(0x4154, telephony(pcmOnly)["audioOutputFormats"])
+        assertEquals(0x4154, telephony(pcmOnly)["audioInputFormats"])
+        assertEquals(0x4154, defaultAudio(pcmOnly)["audioInputFormats"])
+    }
+
+    @Test
     fun mainAltAndHighAudioStreamsAreDeclared() {
         val info = AirPlayInfoPlist.build(
             AirPlayConfig(

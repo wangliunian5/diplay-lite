@@ -21,6 +21,11 @@ enum class WirelessHotspotMode {
     WIFI_P2P,
     LOCAL_ONLY_HOTSPOT,
     MANUAL,
+    MANUAL_IPV4,
+    ;
+
+    /** Both manual modes attach to the car's own hotspot; IPV4 only changes the address family. */
+    val isManualHotspot: Boolean get() = this == MANUAL || this == MANUAL_IPV4
 }
 
 enum class ManualHotspotBand {
@@ -96,7 +101,7 @@ class CarPlayRuntimeConfig(
         // Only WIRELESS sessions use the hotspot configuration. In WIRED (USB) mode the
         // hotspot SSID/passphrase are irrelevant, so they must not be required even when a
         // stored/default wirelessHotspotMode fell back to MANUAL.
-        if (transport == CarPlayTransport.WIRELESS && wirelessHotspotMode == WirelessHotspotMode.MANUAL) {
+        if (transport == CarPlayTransport.WIRELESS && wirelessHotspotMode.isManualHotspot) {
             val ssid = manualHotspotSsid
             require(!ssid.isNullOrBlank()) {
                 "manualHotspotSsid is required in manual hotspot mode"

@@ -30,9 +30,14 @@ class HotspotModeMigrationTest {
         assertEquals(WirelessHotspotMode.MANUAL, AirPlayPersistence.loadWirelessHotspotMode(context))
     }
 
-    @Test fun existingWifiDirectSelectionIsPreserved() {
+    @Test fun wifiDirectSelectionMigratesToCarHotspot() {
         AirPlayPersistence.saveWirelessHotspotMode(context, WirelessHotspotMode.WIFI_P2P)
-        assertEquals(WirelessHotspotMode.WIFI_P2P, AirPlayPersistence.loadWirelessHotspotMode(context))
+        assertEquals(WirelessHotspotMode.MANUAL, AirPlayPersistence.loadWirelessHotspotMode(context))
+    }
+
+    @Test fun manualIpv4SelectionIsPreserved() {
+        AirPlayPersistence.saveWirelessHotspotMode(context, WirelessHotspotMode.MANUAL_IPV4)
+        assertEquals(WirelessHotspotMode.MANUAL_IPV4, AirPlayPersistence.loadWirelessHotspotMode(context))
     }
 
     @Test @Config(sdk = [28]) fun olderAndroidDoesNotFallBackToRemovedLocalMode() {

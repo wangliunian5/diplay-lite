@@ -24,5 +24,16 @@ class WirelessHostAddressTest {
         assertNull(wirelessHostAddress(listOf(ip("0.0.0.0"), ip("127.0.0.1"), ip("224.0.0.251")), 7))
     }
 
+    @Test fun preferIpv4WinsOverScopedLinkLocal() {
+        val ipv4 = ip("192.168.43.1")
+        assertEquals(ipv4, wirelessHostAddress(listOf(ip("fe80::1234"), ipv4), 7, preferIpv4 = true))
+    }
+
+    @Test fun preferIpv4StillFallsBackToLinkLocalIpv6() {
+        val result = wirelessHostAddress(listOf(ip("fe80::1234")), 7, preferIpv4 = true) as Inet6Address
+        assertTrue(result.isLinkLocalAddress)
+        assertEquals(7, result.scopeId)
+    }
+
     private fun ip(value: String) = InetAddress.getByName(value)
 }
