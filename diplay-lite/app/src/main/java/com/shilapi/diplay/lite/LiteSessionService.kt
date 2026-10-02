@@ -2,14 +2,36 @@ package com.shilapi.diplay.lite
 
 import android.app.Notification
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
 import android.content.Intent
 import android.os.IBinder
+import android.util.Base64
+import android.view.WindowManager
+import com.shilapi.xcertplay.airplay.AirPlayConfig
+import com.shilapi.xcertplay.airplay.AirPlayDeviceInfo
+import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
+import com.shilapi.xcertplay.airplay.AirPlayIdentity
+import com.shilapi.xcertplay.airplay.AirPlayMediaHandler
+import com.shilapi.xcertplay.airplay.AirPlaySession
+import com.shilapi.xcertplay.airplay.AirPlaySessionListener
+import com.shilapi.xcertplay.airplay.PairingStore
+import com.shilapi.xcertplay.mfi.LocalMfiAuthenticationClient
+import com.shilapi.xcertplay.orchestration.CarPlayController
+import com.shilapi.xcertplay.orchestration.CarPlayRuntimeConfig
+import com.shilapi.xcertplay.orchestration.CarPlayStatus
+import com.shilapi.xcertplay.orchestration.ManualHotspotSecurity
+import com.shilapi.xcertplay.orchestration.WirelessHotspotMode
+import com.shilapi.xcertplay.transport.Iap2IdentificationConfig
+import java.io.File
+import java.io.FileOutputStream
+import java.security.MessageDigest
 
 /**
  * 前台会话服务：无线 CarPlay 期间保活，避免 4.1 后台回收。
  *
- * M0 骨架阶段：仅前台化 + 日志；
- * M2 接入点：在此构造 CarPlayController（裁剪后的 shared 模块），按 MANUAL 配置发起无线流水线。
+ * M2：接线 shared 的 CarPlayController——本地离线 MFi 证书 + MANUAL 车机热点 +
+ * 蓝牙 RFCOMM 引导的无线流水线；状态经 CarPlayStatus/LiteState 回流到 MainActivity。
+ * 媒体面（视频/音频）留待 M3 接入，此处用空 AirPlayMediaHandler。
  *
  * 注意 4.1 兼容：startForeground(id, Notification) 为 API 5；
  * Notification.Builder(Context) 单参构造为 API 11；build() 是 API 24 才有，须用 getNotification()。
@@ -17,26 +39,269 @@ import android.os.IBinder
 @Suppress("DEPRECATION")
 class LiteSessionService : Service() {
 
+    private var controller: CarPlayController? = null
+
+    /** M3 再接真媒体；接口方法全有空默认实现。 */
+    private val mediaHandler = object : AirPlayMediaHandler {}
+
+    private val sessionListener = object : AirPlaySessionListener {
+        override fun onSessionActive(session: AirPlaySession) {
+            LiteState.phase = LiteState.Phase.ACTIVE
+            LiteState.statusText = "CarPlay 会话已激活"
+            LiteLog.log("airplay", "会话已激活 peer=${session.host}")
+        }
+
+        override fun onSessionEnded(session: AirPlaySession) {
+            LiteState.phase = LiteState.Phase.IDLE
+            LiteState.statusText = "会话已结束"
+            LiteLog.log("airplay", "会话已结束")
+        }
+
+        override fun onTransportError(message: String) {
+            LiteLog.log("airplay", "传输错误：$message")
+        }
+
+        override fun onDeviceInfo(session: AirPlaySession, info: AirPlayDeviceInfo) {
+            LiteLog.log("airplay", "设备信息 name=${info.name} model=${info.model}")
+        }
+
+        override fun onHostUiRequested(session: AirPlaySession) {
+            LiteLog.log("airplay", "手机请求回到车机界面")
+        }
+
+        override fun onDebugLog(message: String) {
+            LiteLog.log("airplay", message)
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
         LiteState.running = true
         LiteState.phase = LiteState.Phase.CONNECTING
-        LiteState.statusText = "M0 骨架：前台服务运行中（连接逻辑待 M2 接入）"
+        LiteState.statusText = "正在初始化…"
         LiteLog.log("service", "前台会话服务已启动")
-        // TODO(M2): 读取 LiteConfig.load(this)，构造 CarPlayController 并 runWireless()
+        startController()
         return START_STICKY
     }
 
     override fun onDestroy() {
-        // TODO(M2): 先按序拆除 CarPlayController（AirPlay -> 隧道 -> 蓝牙），再退前台
+        // close() 在后台线程按序拆除：无线栈（AirPlay → 隧道 → 蓝牙）→ MFi → 定位。
+        // 拆栈可能等待 socket 关闭，onDestroy 在主线程，故不 awaitClosed()；
+        // 拆栈线程随进程存续（MainActivity 在前台时进程不会先死）。
+        controller?.close()
+        controller = null
         LiteState.running = false
         LiteState.phase = LiteState.Phase.IDLE
         LiteState.statusText = "未连接"
         stopForeground(true)
         LiteLog.log("service", "会话服务已停止")
         super.onDestroy()
+    }
+
+    // ---------- M2：无线流水线接线 ----------
+
+    private fun startController() {
+        val config = LiteConfig.load(this)
+        if (config.ssid.isBlank()) {
+            fail("车机热点 SSID 未配置")
+            return
+        }
+        val security = mapSecurity(config.security)
+        if (security != ManualHotspotSecurity.OPEN && config.password.length !in 8..63) {
+            fail("热点密码需 8-63 位（当前 ${config.password.length} 位）")
+            return
+        }
+        ensureMfiDirectory()
+        val identity = loadOrCreateIdentity()
+        val deviceId = deviceIdOf(identity)
+        val btMac = localBluetoothAddress() ?: deviceId
+        val size = screenMetrics()
+        LiteLog.log(
+            "service",
+            "构造 CarPlayController deviceId=$deviceId btMac=$btMac " +
+                "screen=${size.first}x${size.second} ssid=${config.ssid} " +
+                "channel=${config.channel} security=${config.security}",
+        )
+        val newController = try {
+            CarPlayController(
+                context = this,
+                config = CarPlayRuntimeConfig(
+                    hostMac = deviceId.split(":").map { it.toInt(16).toByte() }.toByteArray(),
+                    identification = Iap2IdentificationConfig(
+                        name = "DiPlay",
+                        modelIdentifier = "DiPlay",
+                        manufacturer = "DiPlay",
+                        serialNumber = "DIPLAY-" + deviceId.replace(":", ""),
+                        firmwareVersion = "0.1.0",
+                        hardwareVersion = "1.0",
+                        carPlayUsbInterfaceNumber = 3,
+                    ),
+                    label = "DiPlay",
+                    hostName = "diplay-" + deviceId.replace(":", "").lowercase(),
+                    wirelessHotspotMode = WirelessHotspotMode.MANUAL,
+                    manualHotspotSsid = config.ssid,
+                    manualHotspotPassphrase = if (security == ManualHotspotSecurity.OPEN) null else config.password,
+                    manualHotspotChannel = config.channel,
+                    manualHotspotSecurity = security,
+                    wirelessBluetoothDeviceAddress = config.bluetoothAddress.takeIf { it.isNotBlank() },
+                ),
+                airPlayConfig = AirPlayConfig(
+                    deviceName = "DiPlay",
+                    deviceId = deviceId,
+                    btMac = btMac,
+                    sourceVersion = "950.7.1",
+                    main = AirPlayDisplayConfig(
+                        widthPixels = size.first,
+                        heightPixels = size.second,
+                    ),
+                    manufacturer = "DiPlay",
+                    model = "DiPlay",
+                ),
+                identity = identity,
+                pairings = createPairingStore(),
+                listener = sessionListener,
+                media = mediaHandler,
+                reportStatus = ::onStatus,
+            )
+        } catch (error: IllegalArgumentException) {
+            fail("配置不合法：${error.message}")
+            return
+        } catch (error: Exception) {
+            fail("初始化失败：${error.message}")
+            return
+        }
+        controller = newController
+        newController.start()
+    }
+
+    /** CarPlayStatus -> LiteState 映射；controller 已投递到主线程回调。 */
+    private fun onStatus(status: CarPlayStatus) {
+        LiteLog.log("carplay", "状态：$status")
+        when (status) {
+            is CarPlayStatus.DiscoveringMfi -> connecting("正在加载 MFi 证书")
+            is CarPlayStatus.MfiReady -> connecting("MFi 证书就绪")
+            is CarPlayStatus.StartingHotspot -> connecting("正在加入车机热点…")
+            is CarPlayStatus.HotspotReady -> connecting("热点就绪 ssid=${status.ssid} band=${status.band}")
+            is CarPlayStatus.WaitingForPairedIphone -> connecting("等待 iPhone 连接热点（请先在蓝牙设置中配对）")
+            is CarPlayStatus.AttachingNetwork -> connecting("正在下发网络配置（0x5703）")
+            is CarPlayStatus.ConnectingBluetooth -> connecting("蓝牙 iAP2 握手中")
+            is CarPlayStatus.RunningWireless -> connecting("无线链路建立中")
+            is CarPlayStatus.WirelessActive -> {
+                LiteState.phase = LiteState.Phase.ACTIVE
+                LiteState.statusText = "无线 CarPlay 已激活"
+            }
+            is CarPlayStatus.ControlEnded -> {
+                LiteState.phase = LiteState.Phase.IDLE
+                LiteState.statusText = "控制通道已结束"
+            }
+            is CarPlayStatus.Failed -> fail(status.message)
+        }
+    }
+
+    private fun connecting(text: String) {
+        LiteState.phase = LiteState.Phase.CONNECTING
+        LiteState.statusText = text
+    }
+
+    private fun fail(text: String) {
+        LiteState.phase = LiteState.Phase.FAILED
+        LiteState.statusText = text
+        LiteLog.log("service", "失败：$text")
+    }
+
+    // ---------- 部署辅助 ----------
+
+    /** 首次启动把 assets 内的离线 MFi 证书释放到 filesDir/offline-mfi（controller 的固定加载路径）。 */
+    private fun ensureMfiDirectory(): File {
+        val directory = File(filesDir, LocalMfiAuthenticationClient.DIRECTORY)
+        if (!directory.exists()) directory.mkdirs()
+        for (name in MFI_FILES) {
+            val target = File(directory, name)
+            if (target.exists()) continue
+            assets.open("${LocalMfiAuthenticationClient.DIRECTORY}/$name").use { input ->
+                FileOutputStream(target).use { output -> input.copyTo(output) }
+            }
+            LiteLog.log("service", "已释放 MFi 证书 $name（${target.length()} 字节）")
+        }
+        return directory
+    }
+
+    /** Ed25519 长期身份持久化（Base64/SharedPreferences）；首次生成后不再变化。 */
+    private fun loadOrCreateIdentity(): AirPlayIdentity {
+        val prefs = getSharedPreferences(IDENTITY_PREFS, MODE_PRIVATE)
+        val privateKey = prefs.getString(KEY_PRIVATE_KEY, null)
+        val publicKey = prefs.getString(KEY_PUBLIC_KEY, null)
+        val pairingId = prefs.getString(KEY_PAIRING_ID, null)
+        if (privateKey != null && publicKey != null && pairingId != null) {
+            return AirPlayIdentity(
+                privateKey = Base64.decode(privateKey, Base64.NO_WRAP),
+                publicKey = Base64.decode(publicKey, Base64.NO_WRAP),
+                pairingId = pairingId,
+            )
+        }
+        val identity = AirPlayIdentity.generate()
+        prefs.edit()
+            .putString(KEY_PRIVATE_KEY, Base64.encodeToString(identity.privateKey, Base64.NO_WRAP))
+            .putString(KEY_PUBLIC_KEY, Base64.encodeToString(identity.publicKey, Base64.NO_WRAP))
+            .putString(KEY_PAIRING_ID, identity.pairingId)
+            .apply()
+        LiteLog.log("service", "已生成 AirPlay 身份 pairingId=${identity.pairingId}")
+        return identity
+    }
+
+    /**
+     * 与原版 DiPlayBootstrap.deviceId 一致：SHA-256(公钥) 前 6 字节，首字节置本地管理位，
+     * 输出 XX:XX:XX:XX:XX:XX。稳定派生自持久身份，重装前不变。
+     */
+    private fun deviceIdOf(identity: AirPlayIdentity): String {
+        val bytes = MessageDigest.getInstance("SHA-256").digest(identity.publicKey).copyOf(6)
+        bytes[0] = ((bytes[0].toInt() and 0xfc) or 0x02).toByte()
+        return bytes.joinToString(":") { "%02X".format(it.toInt() and 0xff) }
+    }
+
+    /** 4.1 上 BluetoothAdapter.getAddress() 可用（返回值非全零时才可信）。 */
+    private fun localBluetoothAddress(): String? = try {
+        BluetoothAdapter.getDefaultAdapter()?.address
+            ?.takeIf { it.isNotBlank() && !it.startsWith("02:00:00:00:00:00") }
+    } catch (_: Exception) {
+        null
+    }
+
+    /** 配对记录持久化：iPhone 侧长期公钥以 Base64 存 SharedPreferences，重启进程后恢复。 */
+    private fun createPairingStore(): PairingStore {
+        val prefs = getSharedPreferences(PAIRING_PREFS, MODE_PRIVATE)
+        val store = PairingStore { identifier, publicKey ->
+            prefs.edit()
+                .putString(identifier, Base64.encodeToString(publicKey, Base64.NO_WRAP))
+                .apply()
+        }
+        for ((identifier, value) in prefs.all) {
+            val encoded = value as? String ?: continue
+            try {
+                store.save(identifier, Base64.decode(encoded, Base64.NO_WRAP))
+            } catch (_: IllegalArgumentException) {
+                // 单条损坏不阻断启动
+            }
+        }
+        return store
+    }
+
+    private fun mapSecurity(value: String): ManualHotspotSecurity = when (value) {
+        "WPA2-WPA3" -> ManualHotspotSecurity.WPA3_TRANSITION
+        "WPA3" -> ManualHotspotSecurity.WPA3
+        "OPEN" -> ManualHotspotSecurity.OPEN
+        else -> ManualHotspotSecurity.WPA2
+    }
+
+    @Suppress("DEPRECATION")
+    private fun screenMetrics(): Pair<Int, Int> {
+        val manager = getSystemService(WINDOW_SERVICE) as? WindowManager
+        val display = manager?.defaultDisplay ?: return DEFAULT_SCREEN
+        val width = display.width
+        val height = display.height
+        return if (width > 0 && height > 0) width to height else DEFAULT_SCREEN
     }
 
     private fun buildNotification(): Notification {
@@ -50,5 +315,12 @@ class LiteSessionService : Service() {
 
     companion object {
         private const val NOTIFICATION_ID = 1
+        private const val IDENTITY_PREFS = "diplay_lite_identity"
+        private const val PAIRING_PREFS = "diplay_lite_pairings"
+        private const val KEY_PRIVATE_KEY = "private_key"
+        private const val KEY_PUBLIC_KEY = "public_key"
+        private const val KEY_PAIRING_ID = "pairing_id"
+        private val MFI_FILES = listOf("identity.pk8", "certificate.p7b")
+        private val DEFAULT_SCREEN = 800 to 480 // C8815 屏幕兜底
     }
 }
