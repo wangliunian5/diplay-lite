@@ -14,7 +14,7 @@ android {
         versionCode = 1
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
         // 每次出包改这里的阶段后缀，启动日志会打印它（见 LiteSessionService 构建标识行）。
-        versionName = "0.1-lite-m4d"
+        versionName = "0.1-lite-m4e"
     }
 
     compileOptions {

@@ -173,7 +173,11 @@ class LiteSessionService : Service() {
                     ),
                     label = "DiPlay",
                     hostName = "diplay-" + deviceId.replace(":", "").lowercase(),
-                    wirelessHotspotMode = WirelessHotspotMode.MANUAL,
+                    // MANUAL_IPV4：MANUAL 在 API19+ 上会优先选 IPv6 链路本地地址（fe80::），
+                    // iPhone 无法用它接入 Wi-Fi 侧（nova3e 实测：AirPlay 监听绑 fe80::…:7000、
+                    // 会话永远建不起来）。C8815 之所以"碰巧"正常，是因为 API16 的
+                    // NetworkInterface.getIndex 取不到（回退 0），IPv6 分支被跳过而落到 IPv4。
+                    wirelessHotspotMode = WirelessHotspotMode.MANUAL_IPV4,
                     manualHotspotSsid = config.ssid,
                     manualHotspotPassphrase = if (security == ManualHotspotSecurity.OPEN) null else config.password,
                     manualHotspotChannel = config.channel,
