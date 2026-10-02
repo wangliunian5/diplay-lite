@@ -497,8 +497,22 @@ class CarPlayController(
                 onEvent = { event -> debugLog("wireless bonjour: ${event.diagnosticSummary()}") },
             )
             bonjour = bonjourClient
-            bonjourClient.start()
-            debugLog("wireless Bonjour services started mode=interface iface=${hotspotInfo.interfaceName ?: "unknown"}")
+            try {
+                bonjourClient.start()
+                debugLog(
+                    "wireless Bonjour services started mode=interface " +
+                        "iface=${hotspotInfo.interfaceName ?: "unknown"}",
+                )
+            } catch (error: Throwable) {
+                // 自研 mDNS 落地前的临时策略（10-02）：4.1 上 JmDNS joinGroup 报 ENODEV，
+                // 但 mDNS 广播与蓝牙 iAP2 握手相互独立。此处降级为非致命、放行蓝牙段，
+                // 以便先探测 Apple 端鉴权与 iPhone 入网行为；换自研 mDNS 后恢复为致命。
+                bonjour = null
+                runCatching { bonjourClient.close() }
+                debugLog(
+                    "wireless Bonjour 广播失败（非致命，继续蓝牙段）: ${error.message}",
+                )
+            }
             if (isStaleWirelessRun(generation)) {
                 closeWirelessStack()
                 return
