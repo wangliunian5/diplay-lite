@@ -147,7 +147,8 @@ class LiteSessionService : Service() {
             videoHeight = size.second,
             onAudioDiagnostic = { LiteLog.log("media", it) },
         )
-        val engine = CarPlayMediaEngine(sink = sink)
+        // 麦克风上行：RECORD_AUDIO 在 targetSdk19 下安装即授予，原生分支同样按“可用”声明。
+        val engine = CarPlayMediaEngine(sink = sink, microphoneEnabled = true)
         mediaSink = sink
         mediaEngine = engine
         LiteVideoBridge.bindSink(sink)
@@ -185,6 +186,12 @@ class LiteSessionService : Service() {
                     ),
                     manufacturer = "DiPlay",
                     model = "DiPlay",
+                    // /info 必须声明 audioInputFormats，否则 iPhone 不建立 CarPlay 音频流
+                    // （原先走默认 microphone=false，会话里连基础 type=100 都没有）。
+                    microphone = true,
+                    // API16 无 OPUS 编码器（OMX.google.opus.* 为 API21+），声明 OPUS 会被
+                    // iPhone 协商成无法编码的上行；与原生分支 hasOpusEncoder() 的判定一致。
+                    opusEncoderAvailable = false,
                 ),
                 identity = identity,
                 pairings = createPairingStore(),

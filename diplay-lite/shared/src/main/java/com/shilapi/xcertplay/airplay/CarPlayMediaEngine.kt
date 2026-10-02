@@ -118,12 +118,12 @@ class CarPlayMediaEngine(
             type,
             audioType,
         )
-        Log.i(
-            TAG,
+        val audioLog =
             "airplay audio format type=$type audioType=$audioType codec=${format.codec} " +
                 "rate=${format.sampleRate} channels=${format.channels} " +
-                "micPort=${(stream["dataPort"] as? Number)?.toInt() ?: 0}",
-        )
+                "micPort=${(stream["dataPort"] as? Number)?.toInt() ?: 0}"
+        Log.i(TAG, audioLog)
+        session.logDebug(audioLog)
         val connectionId = stream["streamConnectionID"]
         val latencyMs = (stream["audioLatencyMs"] as? Number)?.toInt() ?: 0
         val meta = AudioMeta(type, format, connectionId, latencyMs)
