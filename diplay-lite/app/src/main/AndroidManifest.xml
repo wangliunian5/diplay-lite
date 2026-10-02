@@ -15,8 +15,11 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <!-- 麦克风上行（CarPlay 语音）；targetSdk 19 下安装即授予 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 无 adb 实测：文件日志写 /sdcard/DiPlayLite（普通权限，4.1 安装即授予） -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
     <application
+        android:name=".LiteApp"
         android:label="DiPlay Lite"
         android:allowBackup="false"
         android:hardwareAccelerated="true">

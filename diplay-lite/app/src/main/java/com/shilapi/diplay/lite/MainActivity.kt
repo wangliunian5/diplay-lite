@@ -16,6 +16,7 @@ import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import java.io.File
 
 /**
  * DiPlay Lite 主界面：单屏程序化 UI（零 XML 资源、零 AndroidX、无图片）。
@@ -248,6 +249,9 @@ class MainActivity : Activity() {
         )
         statusLine.text = LiteState.statusText
         val sb = StringBuilder()
+        LiteLog.directory()?.let {
+            sb.append("日志文件: ").append(File(it, "diplay-log.txt").absolutePath).append("\n\n")
+        }
         for (line in LiteLog.snapshot()) sb.append(line).append('\n')
         logView.text = sb
     }
