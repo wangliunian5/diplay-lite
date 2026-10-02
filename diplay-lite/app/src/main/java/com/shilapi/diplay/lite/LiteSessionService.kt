@@ -200,6 +200,11 @@ class LiteSessionService : Service() {
                     microphone = true,
                     // API16 无 OPUS 编码器（OMX.google.opus.* 为 API21+），声明 OPUS 会被
                     // iPhone 协商成无法编码的上行；与原生分支 hasOpusEncoder() 的判定一致。
+                    // ⚠️ 2026-10-03 T23 实测发现反向副作用（此处暂不改行为，待修）：
+                    //   清 OPUS 位会让 iPhone **完全不下发音频流**——K60（带 OPUS 位）有 type=100、
+                    //   nova3e/C8815（无 OPUS 位）一条流都没有，原生与 Lite 表现一致。
+                    //   正解方向：拆开声明（audioOutputFormats 带 OPUS、audioInputFormats 保持 PCM）。
+                    //   详见 超低版本实机测试记录.md T23 / logs/20261003/DiPlay-native-K60-*.txt。
                     opusEncoderAvailable = false,
                 ),
                 identity = identity,
