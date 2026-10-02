@@ -36,6 +36,9 @@ android {
 
     lint {
         abortOnError = false
+        // M1（A4）：app lint 全量扫描 shared 依赖源码，NewApi 兜底。
+        // 此前未开启时 shared 里的 API 21+ 调用（如 AudioAttributes）完全不在扫描范围。
+        checkDependencies = true
     }
 }
 

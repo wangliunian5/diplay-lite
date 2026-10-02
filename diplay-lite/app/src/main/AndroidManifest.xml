@@ -10,6 +10,11 @@
     <uses-permission android:name="android.permission.BLUETOOTH" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- B3 信道读取：4.1 的 WifiManager.getScanResults 需要定位权限 -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- 麦克风上行（CarPlay 语音）；targetSdk 19 下安装即授予 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
         android:label="DiPlay Lite"
