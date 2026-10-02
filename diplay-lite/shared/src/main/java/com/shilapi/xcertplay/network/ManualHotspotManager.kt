@@ -296,8 +296,11 @@ class ManualHotspotManager(
 
     private fun frequencyFromScanResult(localInterface: LocalHotspotInterface): Int? {
         val localBssid = localInterface.hardwareAddress ?: return null
+        // API16 适配（B3 实测坑）：车机热点开启后 STA 停止扫描，部分 4.x ROM 的
+        // getScanResults() 返回 null 而非空列表（平台类型直接使用会 NPE）。
+        // null 按拿不到信道处理，交由 channel=0（auto）兜底。
         val scanResults = try {
-            wifiManager.scanResults
+            wifiManager.scanResults ?: return null
         } catch (_: SecurityException) {
             return null
         }

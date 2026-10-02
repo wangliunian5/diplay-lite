@@ -271,8 +271,9 @@ class ManualHotspotManager(
 
     private fun frequencyFromScanResult(localInterface: LocalHotspotInterface): Int? {
         val localBssid = localInterface.hardwareAddress ?: return null
+        // 平台类型防护：个别 ROM 在热点开启（STA 停扫）时 getScanResults() 返回 null。
         val scanResults = try {
-            wifiManager.scanResults
+            wifiManager.scanResults ?: return null
         } catch (_: SecurityException) {
             return null
         }

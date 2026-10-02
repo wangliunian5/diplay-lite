@@ -804,6 +804,8 @@ class CarPlayController(
             hotspotMode.isManualHotspot &&
             CarHotspotStatus.isEnabled(appContext) == false
         ) {
+            // OEM 可能魔改 AP 状态值；把原始值打进日志便于诊断 4.1 定制 ROM。
+            debugLog("car hotspot AP state=${CarHotspotStatus.rawState(appContext)} (AOSP 13=enabled)")
             throw IOException("The car hotspot is off. Turn it on in the car settings and connect again.")
         }
         val manager: WirelessHotspotManager = ManualHotspotManager(

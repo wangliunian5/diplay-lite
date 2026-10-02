@@ -25,4 +25,12 @@ object CarHotspotStatus {
             WifiManager::class.java.getMethod("isWifiApEnabled").invoke(wifi) as Boolean
         }.getOrNull()
     }
+
+    /** 原始 Wi-Fi AP 状态值（反射）；AOSP 取值 10..14（13=已启用），供 OEM 魔改诊断。 */
+    fun rawState(context: Context): Int? {
+        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return null
+        return runCatching {
+            WifiManager::class.java.getMethod("getWifiApState").invoke(wifi) as Int
+        }.getOrNull()
+    }
 }
