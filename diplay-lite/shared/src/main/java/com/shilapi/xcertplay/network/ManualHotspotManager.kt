@@ -94,12 +94,16 @@ class ManualHotspotManager(
             if (localInterface != null) {
                 val connectionFrequency = frequencyFromConnectionInfo()
                 val scanFrequency = frequencyFromScanResult(localInterface)
-                val channel = observedManualHotspotChannel(
+                val observedChannel = observedManualHotspotChannel(
                     apChannel = apConfiguration?.channel ?: 0,
                     connectionFrequencyMHz = connectionFrequency,
                     scanFrequencyMHz = scanFrequency,
                     apFrequencyMHz = apConfiguration?.frequencyMHz,
                 )
+                // 实测读不到信道时（C8815/nova3e 的 4.x / 9 ROM 在 AP 模式下既拿不到
+                // scanResults、也读不到 apChannel）退回用户手填的信道——UI 的信道栏本就为
+                // 此准备（“留空自动实测，失败请手填”）；否则会永远下发 channel=0。
+                val channel = if (observedChannel > 0) observedChannel else expectedChannel
                 val frequencyMHz = when {
                     apConfiguration?.frequencyMHz != null -> apConfiguration.frequencyMHz
                     connectionFrequency != null -> connectionFrequency
@@ -108,7 +112,7 @@ class ManualHotspotManager(
                 }
                 val security = apConfiguration?.security ?: expectedSecurity
                 onDiagnostic("Manual hotspot configReadable=${apConfiguration != null} " +
-                    "security=$security channelKnown=${channel > 0} " +
+                    "security=$security channelKnown=${observedChannel > 0} channel=$channel " +
                     "hardwareAddressKnown=${localInterface.hardwareAddress != null} iface=${localInterface.name} " +
                     "ipv4Preferred=$preferIpv4 " +
                     "family=${if (localInterface.hostAddress is Inet6Address) "IPv6" else "IPv4"}")
@@ -116,12 +120,12 @@ class ManualHotspotManager(
                     throw IOException("Manual hotspot is secured but no passphrase was provided")
                 }
 
-                if (channel == 0) {
+                if (observedChannel == 0) {
                     Log.w(
                         TAG,
                         "Could not read the active hotspot channel from Android public APIs; " +
-                            "reporting iAP2 channel 0 (auto) instead of configured channel " +
-                            "$expectedChannel",
+                            "advertising $channel" +
+                            if (channel > 0) " (user-supplied)" else " (auto)",
                     )
                 }
                 val observedBandLabel = wifiBandLabel(apConfiguration?.band)

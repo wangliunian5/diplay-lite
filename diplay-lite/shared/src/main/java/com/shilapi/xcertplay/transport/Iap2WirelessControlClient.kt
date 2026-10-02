@@ -282,6 +282,7 @@ class Iap2WirelessControlClient(
                 passphrase = endpoint.passphrase,
                 channel = endpoint.channel,
                 securityType = endpoint.security.wireValue,
+                bssid = endpoint.bssid?.let(::macAddressToBytes),
             )
 
         /** Wireless 0x4301 reply carrying the receiver address, port and pairing identity. */
@@ -346,6 +347,7 @@ class Iap2WirelessCarPlayEndpoint(
     val deviceIdentifier: String,
     val publicKey: String,
     val sourceVersion: String,
+    val bssid: String? = null,
 ) {
     val ipAddresses: List<String> = ipAddresses.toList()
 
@@ -369,6 +371,19 @@ class Iap2WirelessCarPlayEndpoint(
         require(sourceVersion.isNotEmpty()) { "sourceVersion is required and must not be empty" }
         require('\u0000' !in sourceVersion) { "sourceVersion must not contain U+0000" }
     }
+}
+
+/** "78:6a:89:2a:db:8e" -> 6 bytes; null when the value is not a plain MAC address. */
+private fun macAddressToBytes(value: String): ByteArray? {
+    val parts = value.split(':')
+    if (parts.size != 6) return null
+    val bytes = ByteArray(6)
+    for ((index, part) in parts.withIndex()) {
+        val octet = part.toIntOrNull(16) ?: return null
+        if (octet !in 0..0xff) return null
+        bytes[index] = octet.toByte()
+    }
+    return bytes
 }
 
 enum class Iap2WirelessControlStage {
