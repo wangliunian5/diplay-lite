@@ -377,6 +377,16 @@ class AirPlaySession(
                         "audioLatencies=${(info["audioLatencies"] as? List<*>)?.size ?: 0}",
                 )
                 debugLog("airplay /info displays=${info["displays"]}")
+                // M4h 对照：把 audioFormats 逐条写进导出日志，直接核对下行有没有带 OPUS 位（0x70000000）。
+                val audioFormatDump = (info["audioFormats"] as? List<*>)?.joinToString(separator = " ") { raw ->
+                    val entry = raw as? Map<*, *> ?: return@joinToString "?"
+                    val out = (entry["audioOutputFormats"] as? Int)?.toUInt()?.toString(16) ?: "?"
+                    val input = (entry["audioInputFormats"] as? Int)?.toUInt()?.toString(16)
+                    val audioType = entry["audioType"]
+                    "type=${entry["type"]}" + (if (audioType != null) "/$audioType" else "") +
+                        " out=0x$out" + (if (input != null) " in=0x$input" else "")
+                }
+                debugLog("airplay /info audioFormats=$audioFormatDump")
                 RtspMessage.Response(
                     headers = mapOf("Content-Type" to PLIST_CONTENT_TYPE),
                     body = BplistCodec.encode(info),

@@ -133,21 +133,21 @@ object AirPlayInfoPlist {
         val opus = 0x70000000
         val aacLc = if (is48) 0x800000 else 0x400000
         val pcmInput = if (microphone) pcmMono else null
-        // Devices without an OPUS encoder (Android < 10) must not advertise the OPUS input
-        // bit: the phone would negotiate an OPUS microphone uplink that can never encode.
-        val opusBits = if (opusEncoderAvailable) opus else 0
-        val wirelessInput = if (microphone) pcmMono or opusBits else null
+        // M4i（T26 + M4h 结论）：iPhone 对"带无线输入的流"要求**上下行 OPUS 位一致**——
+        //   K60 基线(out/in 都带) → 建流；T26(out/in 都不带) → 零流；M4h(out 带 / in 不带) → 仍零流。
+        // 所以上行也声明 OPUS，让双向一致以换取 iPhone 建流。
+        // 代价：上行会协商 OPUS 而本机（API<29）编不出来 —— 只影响电话/Siri 的麦克风，不阻塞播放。
+        val wirelessInput = if (microphone) pcmMono or opus else null
 
         return listOf(
             format(100, "compatibility", pcm, pcmInput),
             format(101, "compatibility", pcm),
-            // Streams that carry the wireless microphone input negotiate one codec for both
-            // directions, so their OPUS output bit must go away together with the input bit.
-            format(100, "default", pcm or opusBits, wirelessInput),
+            // 带无线输入的三条流：上下行都带 OPUS（双向一致 = iPhone 建流的条件）。
+            format(100, "default", pcm or opus, wirelessInput),
             format(100, "alert", pcm or opus),
             format(100, "media", pcm),
-            format(100, "telephony", pcmMono or opusBits, wirelessInput),
-            format(100, "speechRecognition", pcmMono or opusBits, wirelessInput),
+            format(100, "telephony", pcmMono or opus, wirelessInput),
+            format(100, "speechRecognition", pcmMono or opus, wirelessInput),
             format(101, "default", pcm or opus),
             format(102, "media", aacLc),
         )

@@ -198,13 +198,10 @@ class LiteSessionService : Service() {
                     // /info 必须声明 audioInputFormats，否则 iPhone 不建立 CarPlay 音频流
                     // （原先走默认 microphone=false，会话里连基础 type=100 都没有）。
                     microphone = true,
-                    // API16 无 OPUS 编码器（OMX.google.opus.* 为 API21+），声明 OPUS 会被
-                    // iPhone 协商成无法编码的上行；与原生分支 hasOpusEncoder() 的判定一致。
-                    // ⚠️ 2026-10-03 T23 实测发现反向副作用（此处暂不改行为，待修）：
-                    //   清 OPUS 位会让 iPhone **完全不下发音频流**——K60（带 OPUS 位）有 type=100、
-                    //   nova3e/C8815（无 OPUS 位）一条流都没有，原生与 Lite 表现一致。
-                    //   正解方向：拆开声明（audioOutputFormats 带 OPUS、audioInputFormats 保持 PCM）。
-                    //   详见 超低版本实机测试记录.md T23 / logs/20261003/DiPlay-native-K60-*.txt。
+                    // ⚠️ M4i（2026-10-03）：本字段当前**不再影响 audioFormats**——iPhone 要求带无线
+                    // 输入的流"上下行 OPUS 位一致"（K60 都带→建流；T26 都不带→零流；M4h out 带/in 不带
+                    // →仍零流），故 M4i 让上下行都声明 OPUS。此字段保留备用（将来若要"仅对播放分级"）。
+                    // 详见 AirPlayInfoPlist.audioFormats / 超低版本实机测试记录.md T23/T26/T27。
                     opusEncoderAvailable = false,
                 ),
                 identity = identity,
