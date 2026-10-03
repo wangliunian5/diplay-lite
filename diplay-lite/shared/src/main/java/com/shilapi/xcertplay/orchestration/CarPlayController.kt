@@ -1136,7 +1136,10 @@ class CarPlayController(
         CarPlayStatus.RunningWireless ->
             "STEP iap2/wireless: Bluetooth control loop running"
         CarPlayStatus.WirelessActive ->
-            "STEP handoff/complete: tunnel iAP2 ready; Bluetooth bootstrap released"
+            // 该状态同时被“真交接完成”和“handoff degraded（无 type-130，蓝牙保持）”两条路径使用。
+            // 原文案宣称 tunnel ready / 蓝牙已释放，在 degraded 路径上与事实不符（T25 实测：
+            // 之后仍有 credential resend 走蓝牙），会误导排查，故改为中性描述。
+            "STEP wireless/active: wireless CarPlay session active"
         CarPlayStatus.AttachingNetwork ->
             "STEP network/attach: starting the AirPlay TCP listener"
         CarPlayStatus.ControlEnded ->
