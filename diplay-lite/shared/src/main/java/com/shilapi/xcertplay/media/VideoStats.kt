@@ -17,6 +17,8 @@ internal class VideoStats(
     private var touchSamples = 0
     private var touchLatencySumNs = 0L
     private var maxTouchLatencyNs = 0L
+    // M6a：弱机优化的量化依据（CPU 占用 / 线程数）。每个 stats 各持一个实例，窗口独立。
+    private val processLoad = ProcessLoadSampler()
 
     @Synchronized fun onReceived(size: Int) {
         val now = nanoTime()
@@ -61,7 +63,7 @@ internal class VideoStats(
             (bytes * 8 / 1000 / seconds).toLong(), recoveries,
             heapUsedMb, heapMaxMb,
             touchAvgMs, maxTouchLatencyNs / 1_000_000, touchSamples, TouchLatencyProbe.maxSendNs / 1_000_000,
-        )
+        ) + " " + (processLoad.sample(now) ?: "cpu=? threads=?")
         TouchLatencyProbe.maxSendNs = 0
         Log.i(TAG, line)
         windowStartNs = now

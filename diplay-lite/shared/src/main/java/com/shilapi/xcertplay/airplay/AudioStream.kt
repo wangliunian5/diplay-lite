@@ -1,5 +1,6 @@
 package com.shilapi.xcertplay.airplay
 
+import android.os.Process
 import java.io.Closeable
 import java.io.IOException
 import java.net.DatagramPacket
@@ -62,7 +63,17 @@ class AudioStream(
         val control = bindAnyPort()
         dataSocket = data
         controlSocket = control
-        dataThread = Thread({ runData(data, listener) }, "airplay-audio-rx").apply {
+        // 收包/解密/入队单独一条线程，**刻意不与后面的解码/写轨线程合并**（M6b 决策）：
+        // 合并后若解码（libopus 或 AudioTrack 写）偶发耗时，socket.receive 就被顶住，
+        // 内核 UDP 接收缓冲溢出 = 真丢包（比"多一次线程切换"严重得多）。现在解码线程再慢，
+        // 收包最多进 queue，最多触发背压丢弃，而不会让内核丢包。
+        // 因此弱机省 CPU 的方向是"抬优先级 + 减少唤醒"，不是合并线程。
+        dataThread = Thread({
+            // 弱机（C8815 双核 A5）上实测收包线程单包处理峰值被抢占到 93~163ms（而这段只做解密+入队）
+            // ⇒ 抬到 URGENT_AUDIO，与视频解码/渲染抢 CPU 时音频优先，压掉调度延迟尖峰。
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            runData(data, listener)
+        }, "airplay-audio-rx").apply {
             isDaemon = true
             start()
         }

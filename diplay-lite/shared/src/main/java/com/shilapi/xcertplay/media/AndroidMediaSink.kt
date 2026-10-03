@@ -9,6 +9,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Process
 import android.util.Log
 import android.view.Surface
 import com.shilapi.xcertplay.airplay.AudioCodecKind
@@ -42,6 +43,17 @@ class AndroidMediaSink(
     onScreenStreamActiveChanged: ((Int, Boolean) -> Unit)? = null,
     private val mediaBufferMillis: Int = MediaAudioBuffer.DEFAULT_MILLIS,
     private val onAudioDiagnostic: (String) -> Unit = {},
+    /**
+     * M6c：CarPlay 电话流（[AudioChannel.PHONE]）出现/消失时回调 true/false。
+     * 只用来通知"通话音频正在播/已停"，具体走听筒还是扬声器由 App 侧（AudioManager）决定——
+     * sink 不持 Context，也不该知道设备路由策略。
+     */
+    private val onPhoneChannelActive: ((Boolean) -> Unit)? = null,
+    /**
+     * M6d：导航播报时把音乐压低到的百分比（30~70；>=100 视为不压低）。
+     * 用取值函数而不是常量，这样 App 改设置后下一次播报就能生效，无需重建 sink。
+     */
+    private val navigationDuckPercent: () -> Int = { 100 },
 ) : MediaSink {
     private val screenStateLock = Any()
     private val activeScreenTypes = mutableSetOf<Int>()
@@ -185,7 +197,46 @@ class AndroidMediaSink(
         val existing = audioRenderers[type]
         if (existing?.format == format) return existing
         existing?.close()
-        return AudioRenderer(format, advancedAudioChannelMapping, mediaBufferMillis, onAudioDiagnostic).also { audioRenderers[type] = it }
+        return AudioRenderer(format, advancedAudioChannelMapping, mediaBufferMillis, onAudioDiagnostic, ::onRendererChannelState).also { audioRenderers[type] = it }
+    }
+
+    // ---------- M6d：导航压低音乐 ----------
+
+    private val duckLock = Any()
+    @Volatile private var navigationActive = false
+
+    /**
+     * 某条音频流的"通道活跃/结束"通知（由 AudioRenderer 在建/销毁输出轨时回调）。
+     * PHONE 交给 App 决定听筒/扬声器；NAVIGATION 与 MEDIA 用来做 duck。
+     */
+    private fun onRendererChannelState(channel: AudioChannel?, active: Boolean) {
+        when (channel) {
+            AudioChannel.PHONE -> onPhoneChannelActive?.invoke(active)
+            AudioChannel.NAVIGATION -> {
+                onAudioDiagnostic(
+                    "Audio: navigation ${if (active) "start" else "end"} → " +
+                        "音乐音量 ${if (active) "${navigationDuckPercent().coerceIn(0, 100)}%" else "100%"}",
+                )
+                synchronized(duckLock) {
+                    navigationActive = active
+                    applyDuckLocked()
+                }
+            }
+            AudioChannel.MEDIA -> if (active) synchronized(duckLock) { applyDuckLocked() }
+            else -> Unit
+        }
+    }
+
+    /** 只在导航活跃时压低 MEDIA 轨（导航自身不受影响）。 */
+    private fun applyDuckLocked() {
+        val factor = if (navigationActive) {
+            (navigationDuckPercent().coerceIn(0, 100)) / 100f
+        } else {
+            1f
+        }
+        audioRenderers.values.forEach { renderer ->
+            if (renderer.channel == AudioChannel.MEDIA) renderer.setPlaybackVolume(factor)
+        }
     }
 }
 
@@ -207,6 +258,8 @@ private class VideoDecoder(
     private var renderedFrameLogged = false
     private var submittedFrameLogged = false
     private var duplicateConfigLogged = false
+    // M6e：解码器清单只打一次（确认本机有哪些解码器、软解开关到底有没有生效）。
+    private var decoderInventoryLogged = false
     private val referenceChain = VideoReferenceChain()
     private var lastKeyFrameRequestNs = 0L
     // The main screen keeps the historical log format; other screens are labelled.
@@ -241,12 +294,18 @@ private class VideoDecoder(
                         is VideoJob.Config -> configureDecoder(job)
                         is VideoJob.Frame -> {
                             if (System.nanoTime() - job.receivedNs > MAX_FRAME_AGE_NS) {
+                                // M6f：积压只是"我们落后了"，解码器没坏 —— 丢过时帧 + 要关键帧即可，
+                                // 不再重降解码器（重配要走厂商 OMX，还得再等关键帧，纯属白花时间）。
                                 queue.discardFrames()
-                                recover("video backlog exceeded 250 ms")
+                                recover(
+                                    "video backlog exceeded ${MAX_FRAME_AGE_NS / 1_000_000} ms",
+                                    rebuildDecoder = false,
+                                )
                             } else feed(job.nalus)
                         }
                         is VideoJob.SurfaceChanged -> changeSurface(job.surface)
-                        is VideoJob.Resync -> recover("video queue overflow")
+                        // 队列溢出同样是"落后"，不是解码器故障。
+                        is VideoJob.Resync -> recover("video queue overflow", rebuildDecoder = false)
                         null -> Unit
                     }
                     decoder?.let(::drainOutput)
@@ -298,6 +357,14 @@ private class VideoDecoder(
         val codecData = config.codecData
         val mime = if (codec == VideoCodec.H265) MediaFormat.MIMETYPE_VIDEO_HEVC
         else MediaFormat.MIMETYPE_VIDEO_AVC
+        if (!decoderInventoryLogged) {
+            decoderInventoryLogged = true
+            report(
+                "Video: $mime decoders=${decoderNamesFor(mime)} " +
+                    "software=${softwareDecoderNameFor(mime) ?: "none"} " +
+                    "preferSoftware=$preferSoftwareHevcDecoder",
+            )
+        }
         val csd = if (codec == VideoCodec.H265) {
             MediaCodecSupport.hevcCodecSpecificData(codecData).takeIf { it.isNotEmpty() }
                 ?.let { listOf(it) } ?: emptyList()
@@ -395,6 +462,17 @@ private class VideoDecoder(
                         Log.w(TAG, "software decoder unavailable name=${software.name} mime=$mime", error)
                     }
                 }
+            } else {
+                // M6e：API16 也要能挑软解（低版本分支就是靠软解绕开厂商硬解异常）。
+                // 老 MediaCodecList 只能反射；找不到软解组件就照旧用 createDecoderByType。
+                val name = softwareDecoderNameFor(mime)
+                if (name != null) {
+                    try {
+                        return MediaCodec.createByCodecName(name)
+                    } catch (error: Exception) {
+                        Log.w(TAG, "software decoder unavailable name=$name mime=$mime", error)
+                    }
+                }
             }
         }
         return MediaCodec.createDecoderByType(mime)
@@ -470,12 +548,14 @@ private class VideoDecoder(
         drainOutput(codec)
     }
 
-    private fun recover(reason: String) {
+    private fun recover(reason: String, rebuildDecoder: Boolean = true) {
         Log.w(TAG, "Video recovery: $reason; waiting for keyframe")
         stats.onRecovery()
-        report("recovery: $reason; waiting for keyframe")
-        // Recreate with codec-specific data: flush can discard CSD before the first output.
-        releaseDecoder()
+        report("recovery: $reason; waiting for keyframe" + if (rebuildDecoder) "" else " (keep decoder)")
+        if (rebuildDecoder) {
+            // Recreate with codec-specific data: flush can discard CSD before the first output.
+            releaseDecoder()
+        }
         referenceChain.reset()
         requestKeyFrameIfDue()
     }
@@ -552,7 +632,11 @@ private class VideoDecoder(
         const val TAG = "xcertplay-usb"
         const val MAX_INPUT_SIZE = 8 * 1024 * 1024
         const val INPUT_TIMEOUT_US = 10_000L
-        const val MAX_FRAME_AGE_NS = 250_000_000L
+        // 可容忍的最大排队延迟：帧从到达到被解码超过它，就判为"积压"——丢队列 + 等关键帧。
+        // M6b：250ms → 350ms。C8815 上解码偶发被抢占（processMaxUs 峰值 111ms/包），250ms 会被
+        // 误判成积压而频繁 forceKeyFrame（每次触发画面冻结到关键帧到达，主观上更卡）；
+        // 350ms 留出余量，只在真积压（网络/渲染真的跟不上）时才丢帧。
+        const val MAX_FRAME_AGE_NS = 350_000_000L
         val START_CODE = byteArrayOf(0x00, 0x00, 0x00, 0x01)
     }
 }
@@ -574,6 +658,8 @@ private class AudioRenderer(
     private val advancedAudioChannelMapping: Boolean,
     private val mediaBufferMillis: Int,
     private val report: (String) -> Unit,
+    /** M6c/M6d：通道活跃状态变化（PHONE=听筒/扬声器、NAVIGATION/MEDIA=duck）。 */
+    private val onChannelState: ((AudioChannel?, Boolean) -> Unit)? = null,
 ) : Closeable {
     private data class AudioPacket(val rtp: ByteArray, val sample: Int)
 
@@ -591,6 +677,10 @@ private class AudioRenderer(
     private var prebufferBytes = 0
     private var startThresholdBytes = 0
     private var fadeApplied = false
+    // M6f：丢包补偿（填静音）之后，下一段真实音频要淡入，消除"静音→有声"的爆音；
+    // lastSampleValue 用来在填静音前做一小段淡出（硬切静音同样会"啪"一下）。
+    private var fadeInAfterGap = false
+    private var lastSampleValue = 0
     private var droppedPacketsLogged = false
     private var firstAacPayloadLogged = false
     private var firstOpusShortPacketLogged = false
@@ -609,6 +699,8 @@ private class AudioRenderer(
     private var statsWindowStartNs = 0L
     private var statsLastUnderruns = 0
     private var bytesPerSecond = 0
+    // M6a：弱机优化的量化依据（CPU 占用 / 线程数）。与视频 stats 各自独立窗口。
+    private val processLoad = ProcessLoadSampler()
     private val bufferProgress = AudioBufferProgress(if (format.channels >= 2) 4 else 2)
     private var underrunsAtPlaybackStart = 0
     private var lastPcmWriteNs = 0L
@@ -620,7 +712,24 @@ private class AudioRenderer(
     private var silenceScratch = ByteArray(0)
     private var packetsCompensated = 0L
     private var gapUsCompensated = 0L
-    private val thread = Thread(::run, "carplay-audio").apply { isDaemon = true }
+    // M6c/M6d：本条流落在哪个 CarPlay 音频通道（audioRoute() 里写），以及是否已把"通道活跃"通知出去。
+    @Volatile private var routeChannel: AudioChannel? = null
+    private var channelActiveNotified = false
+
+    /** 供 sink 侧判断是否需要 duck（MEDIA）/路由（PHONE）。 */
+    val channel: AudioChannel? get() = routeChannel
+
+    /** M6d：调本轨的播放音量（1.0 = 原音量）。导航播报时把音乐压到 duck 值。 */
+    fun setPlaybackVolume(factor: Float) {
+        val current = track ?: return
+        runCatching { current.setVolume(factor.coerceIn(0f, 1f)) }
+    }
+    private val thread = Thread({
+        // 音频解码 + 写轨：抬到 AUDIO —— 低于收包（URGENT_AUDIO），但高于视频/系统默认，
+        // 避免它和视频解码抢 CPU 时被拖出 underrun。
+        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+        run()
+    }, "carplay-audio").apply { isDaemon = true }
 
     fun start() {
         if (started) return
@@ -833,6 +942,11 @@ private class AudioRenderer(
                 "rate=${format.sampleRate} channels=${format.channels} " +
                 "buffer=${capacityBytes * 1000L / bytesPerSecond}ms start=${startThresholdBytes * 1000L / bytesPerSecond}ms",
         )
+        // M6c/M6d：输出轨一建好就通知"通道活跃"（PHONE→App 切听筒/扬声器；NAVIGATION→压低音乐）。
+        if (routeChannel != null && !channelActiveNotified) {
+            channelActiveNotified = true
+            onChannelState?.invoke(routeChannel, true)
+        }
     }
 
     private fun aacAudioSpecificConfig(): ByteArray {
@@ -860,6 +974,7 @@ private class AudioRenderer(
         )
         val usage = usageFor(selection.channel)
         val contentType = contentTypeFor(selection.contentType)
+        routeChannel = selection.channel
         Log.i(
             TAG,
             "audio route type=${format.payloadType} audioType=${format.audioType} " +
@@ -1031,7 +1146,16 @@ private class AudioRenderer(
         if (bytes <= 0 || bytesPerSecond <= 0) return
         if (silenceScratch.size < bytes) silenceScratch = ByteArray(bytes)
         java.util.Arrays.fill(silenceScratch, 0, bytes, 0)
+        // M6f：不再"硬切静音"——先花约 5ms 从上一个采样线性落到 0，减少爆音。
+        val fadeSamples = minOf((bytes - bytes % 2) / 2, maxOf(1, format.sampleRate / 200))
+        val last = lastSampleValue
+        for (index in 0 until fadeSamples) {
+            writeS16(silenceScratch, index * 2, last.toLong() * (fadeSamples - index) / fadeSamples)
+        }
+        fadeInAfterGap = false
         writePcm(silenceScratch, 0, bytes)
+        // 静音之后再回来的真实音频要淡入（开标志，由 writePcm 消费）。
+        fadeInAfterGap = true
     }
 
     private fun feedCodec(payload: ByteArray, presentationTimeUs: Long) {
@@ -1118,9 +1242,11 @@ private class AudioRenderer(
                     "head=${data.copyOfRange(offset, end).toHexString()}",
             )
         }
-        if (!fadeApplied) {
-            applyFadeIn(data, offset, length)
+        // M6f：起播淡入一次；此后每段"丢包补偿静音"之后也淡入一次，避免爆音。
+        if (!fadeApplied || fadeInAfterGap) {
+            fadeInAfterGap = false
             fadeApplied = true
+            applyFadeIn(data, offset, length)
         }
         var written = 0
         while (written < length && running) {
@@ -1149,6 +1275,8 @@ private class AudioRenderer(
                 }
             }
         }
+        // M6f：记住最后一个采样值，丢包填静音前用它做一小段淡出（避免硬切静音的爆音）。
+        if (length >= 2) lastSampleValue = readS16(data, offset + length - 2)
     }
 
     private fun startPlayback(track: AudioTrack) {
@@ -1193,7 +1321,8 @@ private class AudioRenderer(
             "gapCompMs=${gapUsCompensated / 1000} gapFrames=$packetsCompensated " +
             "sinceRxMs=${if (lastRx == 0L) -1 else (now - lastRx) / 1_000_000L} maxWriteMs=$maxWriteMs " +
             "maxDecodeMs=$maxDecodeMs " +
-            "decoderDroppedTotal=$inputDropped outputBuffersTotal=$outputBuffers rebuffers=$rebufferCount ended=$force"
+            "decoderDroppedTotal=$inputDropped outputBuffersTotal=$outputBuffers rebuffers=$rebufferCount ended=$force " +
+            (processLoad.sample(now) ?: "cpu=? threads=?")
         Log.i(STATS_TAG, line)
         report(line)
         statsLastUnderruns = underruns
@@ -1204,15 +1333,24 @@ private class AudioRenderer(
         statsWindowStartNs = now
     }
 
+    /** 16-bit little-endian 采样读写（带符号）。淡入/淡出必须按有符号数算，否则负采样会被放大成正数（爆音）。 */
+    private fun readS16(data: ByteArray, position: Int): Int {
+        val raw = (data[position].toInt() and 0xff) or (data[position + 1].toInt() shl 8)
+        return if (raw >= 0x8000) raw - 0x10000 else raw
+    }
+
+    private fun writeS16(data: ByteArray, position: Int, value: Long) {
+        val clamped = value.coerceIn(-32768L, 32767L).toInt()
+        data[position] = clamped.toByte()
+        data[position + 1] = (clamped shr 8).toByte()
+    }
+
     private fun applyFadeIn(data: ByteArray, offset: Int, length: Int) {
         val samples = (length - length % 2) / 2
         val fadeSamples = minOf(samples, maxOf(1, format.sampleRate / 100))
         for (index in 0 until fadeSamples) {
             val position = offset + index * 2
-            val sample = (data[position].toInt() and 0xff) or (data[position + 1].toInt() shl 8)
-            val scaled = (sample.toLong() * (index + 1) / fadeSamples).toInt()
-            data[position] = scaled.toByte()
-            data[position + 1] = (scaled shr 8).toByte()
+            writeS16(data, position, readS16(data, position).toLong() * (index + 1) / fadeSamples)
         }
     }
 
@@ -1227,6 +1365,11 @@ private class AudioRenderer(
 
     @Synchronized
     private fun release() {
+        // M6c/M6d：流结束就撤掉"通道活跃"（PHONE→App 恢复默认路由；NAVIGATION→音乐恢复原音量）。
+        if (channelActiveNotified) {
+            channelActiveNotified = false
+            onChannelState?.invoke(routeChannel, false)
+        }
         // M5a：软件 OPUS 解码器与 MediaCodec 互斥，两者都要在流结束时释放。
         val currentNativeDecoder = nativeOpusDecoder
         nativeOpusDecoder = null
@@ -1360,3 +1503,35 @@ internal fun codecComponentExists(mime: String, encoder: Boolean): Boolean = try
     Log.w("xcertplay-usb", "codec component query failed mime=$mime encoder=$encoder", error)
     !(Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP && mime == MediaFormat.MIMETYPE_AUDIO_OPUS)
 }
+
+/** M6e：列出本机所有支持 mime 的解码器名字（诊断用，确认这台机器到底有没有软解可用）。 */
+internal fun decoderNamesFor(mime: String): List<String> = try {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+            .filter { !it.isEncoder && mime in it.supportedTypes }
+            .map { it.name }
+    } else {
+        // API16 适配：MediaCodecList()/getCodecCount()/getCodecInfoAt() 已从 compileSdk 34 移除，只能反射。
+        val clazz = Class.forName("android.media.MediaCodecList")
+        val list = clazz.getDeclaredConstructor().newInstance()
+        val codecCount = clazz.getMethod("getCodecCount").invoke(list) as Int
+        val getCodecInfoAt = clazz.getMethod("getCodecInfoAt", java.lang.Integer.TYPE)
+        (0 until codecCount).mapNotNull { index ->
+            val info = getCodecInfoAt.invoke(list, index) as MediaCodecInfo
+            if (!info.isEncoder && mime in info.supportedTypes) info.name else null
+        }
+    }
+} catch (error: Throwable) {
+    Log.w("xcertplay-usb", "codec list query failed mime=$mime", error)
+    emptyList()
+}
+
+/**
+ * M6e：挑一个软件解码器（API<29 没有 isSoftwareOnly，按厂商前缀判断）。
+ * 8815/C8815 这类老机型的厂商硬解偶发异常时，用它做兜底/二分定位。
+ */
+internal fun softwareDecoderNameFor(mime: String): String? =
+    decoderNamesFor(mime).firstOrNull { name ->
+        name.startsWith("OMX.google.") || name.startsWith("c2.android.") ||
+            name.startsWith("c2.soft.") || name.contains("sw.decoder", ignoreCase = true)
+    }

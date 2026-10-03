@@ -1,6 +1,9 @@
 package com.shilapi.diplay.lite
 
 import android.app.Activity
+import android.app.AlarmManager
+import android.app.AlertDialog
+import android.app.PendingIntent
 import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
@@ -14,6 +17,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -44,6 +48,11 @@ class MainActivity : Activity() {
     private lateinit var channelInput: EditText
     private lateinit var securityInput: Spinner
     private lateinit var bluetoothInput: EditText
+    private lateinit var fps30Check: CheckBox
+    private lateinit var scaleInput: EditText
+    private lateinit var speakerCallsCheck: CheckBox
+    private lateinit var duckInput: EditText
+    private lateinit var softDecodeCheck: CheckBox
     private lateinit var connectButton: Button
     private lateinit var disconnectButton: Button
     private lateinit var video: SurfaceView
@@ -222,6 +231,51 @@ class MainActivity : Activity() {
         }
         root.addView(fieldRow("iPhone 蓝牙地址（可选）", bluetoothInput))
 
+        // M6b 性能项：C8815 硬解 960x540 撑不到 60fps，这里允许把 /info 的 maxFPS 降到 30。
+        fps30Check = CheckBox(this).apply {
+            text = "限制视频帧率 30fps（省 CPU，动态画面略顿）"
+            setTextColor(Color.LTGRAY)
+            textSize = 13f
+        }
+        root.addView(fps30Check)
+
+        // M6b 性能项：按百分比缩小 /info 声明的分辨率（长宽等比，各自取偶）。
+        // 像素少 33~44% 是弱机最直接的省算力手段；渲染仍铺满物理屏，故画面无黑边。
+        scaleInput = EditText(this).apply {
+            hint = "50-100，100 = 原生分辨率"
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        root.addView(fieldRow("分辨率百分比（50-100）", scaleInput))
+
+        // M6c：CarPlay 通话声音路由。默认听筒（本机 telephony 流走 STREAM_VOICE_CALL）；
+        // 勾上则通话期间切扬声器（MODE_IN_COMMUNICATION + setSpeakerphoneOn）。开关即时生效，无需重连。
+        speakerCallsCheck = CheckBox(this).apply {
+            text = "通话声音走扬声器（默认听筒）"
+            setTextColor(Color.LTGRAY)
+            textSize = 13f
+            // 即时持久化：服务侧每次通话流开始时现读 LiteConfig，所以勾完直接打电话即可生效，无需重新连接。
+            setOnCheckedChangeListener { _, _ -> saveFromForm() }
+        }
+        root.addView(speakerCallsCheck)
+
+        // M6d：导航播报时把音乐压低（type=101 与音乐同走 STREAM_MUSIC，只能我们自己做 duck）。
+        duckInput = EditText(this).apply {
+            hint = "30-70，导航播报时音乐的音量百分比"
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        root.addView(fieldRow("导航压低音乐到（30-70%）", duckInput))
+
+        // M6e：强制软件解码视频。默认关（现状=厂商硬解）；给硬解异常的机型兜底，也用于二分定位。
+        // 注意：8815（Cortex-A5、无 NEON）上软解会比硬解慢很多，帧率可能掉到个位数。
+        softDecodeCheck = CheckBox(this).apply {
+            text = "强制软件解码视频（默认关；弱机可能掉帧）"
+            setTextColor(Color.LTGRAY)
+            textSize = 13f
+        }
+        root.addView(softDecodeCheck)
+
         // 操作行：连接 / 断开
         val actions = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -310,16 +364,34 @@ class MainActivity : Activity() {
         val securities = listOf("WPA2", "WPA2-WPA3", "WPA3", "OPEN")
         securityInput.setSelection(securities.indexOf(config.security).coerceAtLeast(0))
         bluetoothInput.setText(config.bluetoothAddress)
+        fps30Check.isChecked = config.limit30Fps
+        scaleInput.setText(config.videoScalePercent.toString())
+        speakerCallsCheck.isChecked = config.speakerForCalls
+        duckInput.setText(config.navDuckPercent.toString())
+        softDecodeCheck.isChecked = config.softwareVideoDecoder
     }
 
     private fun saveFromForm(): LiteConfig {
         val channelText = channelInput.text.toString().trim()
+        // 百分比非法（空/非数字/越界）一律钳到 50~100，避免把 0 或 999 写进 /info。
+        val scale = scaleInput.text.toString().trim().toIntOrNull()
+            ?.coerceIn(LiteConfig.MIN_SCALE_PERCENT, LiteConfig.MAX_SCALE_PERCENT)
+            ?: LiteConfig.MAX_SCALE_PERCENT
+        // 压低值同样钳到 30~70，避免把 0（静音）或 100（等于没压）写进去。
+        val duck = duckInput.text.toString().trim().toIntOrNull()
+            ?.coerceIn(LiteConfig.MIN_DUCK_PERCENT, LiteConfig.MAX_DUCK_PERCENT)
+            ?: 50
         val config = LiteConfig(
             ssid = ssidInput.text.toString().trim(),
             password = passwordInput.text.toString(),
             channel = channelText.toIntOrNull() ?: 0,
             security = securityInput.selectedItem as? String ?: "WPA2",
             bluetoothAddress = bluetoothInput.text.toString().trim(),
+            limit30Fps = fps30Check.isChecked,
+            videoScalePercent = scale,
+            speakerForCalls = speakerCallsCheck.isChecked,
+            navDuckPercent = duck,
+            softwareVideoDecoder = softDecodeCheck.isChecked,
         )
         LiteConfig.save(this, config)
         return config
@@ -333,9 +405,57 @@ class MainActivity : Activity() {
             return
         }
         val config = saveFromForm()
-        LiteLog.log("ui", "发起连接：ssid=${config.ssid} channel=${config.channel} security=${config.security}")
+        val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps)
+        // M6d：实测改分辨率后不重启+重连会出现渲染异常，所以这里拦一道二次确认。
+        if (config.appliedVideoKey.isNotEmpty() && config.appliedVideoKey != key) {
+            confirmVideoChange(key)
+            return
+        }
+        startSession(config, key)
+    }
+
+    private fun startSession(config: LiteConfig, videoKey: String) {
+        LiteConfig.saveAppliedVideoKey(this, videoKey)
+        LiteLog.log(
+            "ui",
+            "发起连接：ssid=${config.ssid} channel=${config.channel} security=${config.security} " +
+                "videoKey=$videoKey duck=${config.navDuckPercent}%",
+        )
         startService(Intent(this, LiteSessionService::class.java))
         toast("已启动会话服务")
+    }
+
+    /**
+     * M6d：分辨率/帧率变更的二次确认。确认后立刻断开当前连接并重启软件 ——
+     * 用户实测：改了视频参数不重启会渲染异常（解码器尺寸与 Surface 对不上）。
+     */
+    private fun confirmVideoChange(videoKey: String) {
+        AlertDialog.Builder(this)
+            .setTitle("已修改分辨率/帧率")
+            .setMessage(
+                "视频参数改动必须断开当前连接并重启软件才能生效，否则画面会渲染异常。\n\n" +
+                    "现在断开并重启吗？",
+            )
+            .setNegativeButton("取消", null)
+            .setPositiveButton("断开并重启") { _, _ ->
+                LiteConfig.saveAppliedVideoKey(this, videoKey)
+                disconnect()
+                restartApp()
+            }
+            .show()
+    }
+
+    /** 4.1 上最稳的自重启：先用 AlarmManager 预约拉起自己，再杀掉当前进程。 */
+    private fun restartApp() {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        }
+        val pending = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_CANCEL_CURRENT)
+        (getSystemService(ALARM_SERVICE) as? AlarmManager)
+            ?.set(AlarmManager.RTC, System.currentTimeMillis() + 400, pending)
+        LiteLog.log("ui", "视频参数已改：断开连接并重启软件")
+        finish()
+        android.os.Process.killProcess(android.os.Process.myPid())
     }
 
     private fun disconnect() {

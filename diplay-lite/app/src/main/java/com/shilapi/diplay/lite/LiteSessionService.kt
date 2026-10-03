@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
 import android.content.Intent
+import android.media.AudioManager
 import android.os.IBinder
 import android.util.Base64
 import android.view.WindowManager
@@ -11,6 +12,7 @@ import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayContact
 import com.shilapi.xcertplay.airplay.AirPlayDeviceInfo
 import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
+import com.shilapi.xcertplay.airplay.AirPlayDisplaySettings
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
 import com.shilapi.xcertplay.airplay.AirPlaySession
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
@@ -149,18 +151,29 @@ class LiteSessionService : Service() {
         val identity = loadOrCreateIdentity()
         val deviceId = deviceIdOf(identity)
         val btMac = localBluetoothAddress() ?: deviceId
-        val size = screenMetrics()
+        // M6b：/info 的 maxFPS 与分辨率都由 LiteConfig 控制（弱机省算力）。
+        // fps 30/60 二选一；分辨率 = 车机屏 × 百分比（长宽等比、各自取偶）。
+        val full = screenMetrics()
+        val fps = if (config.limit30Fps) AirPlayDisplaySettings.MIN_FPS else AirPlayDisplaySettings.DEFAULT_FPS
+        val size = scaleDisplay(full, config.videoScalePercent)
         LiteLog.log(
             "service",
             "构造 CarPlayController deviceId=$deviceId btMac=$btMac " +
-                "screen=${size.first}x${size.second} ssid=${config.ssid} " +
-                "channel=${config.channel} security=${config.security}",
+                "screen=${size.first}x${size.second} full=${full.first}x${full.second} " +
+                "fps=$fps scale=${config.videoScalePercent}% speakerForCalls=${config.speakerForCalls} " +
+                "softDecode=${config.softwareVideoDecoder} " +
+                "ssid=${config.ssid} channel=${config.channel} security=${config.security}",
         )
         // M3：MediaCodec 解码到 SurfaceView；SurfaceView 的 Surface 由 LiteVideoBridge 补齐。
         val sink = AndroidMediaSink(
             videoWidth = size.first,
             videoHeight = size.second,
+            // M6e：强制软件解码视频（默认关）。重连即生效（解码器每次建流都会重建）。
+            preferSoftwareHevcDecoder = config.softwareVideoDecoder,
             onAudioDiagnostic = { LiteLog.log("media", it) },
+            onPhoneChannelActive = ::onPhoneChannelActive,
+            // M6d：导航播报时压低音乐。取值函数——改设置后下一次播报即生效，无需重连。
+            navigationDuckPercent = { LiteConfig.load(this).navDuckPercent },
         )
         // 麦克风上行：RECORD_AUDIO 在 targetSdk19 下安装即授予，原生分支同样按“可用”声明。
         val engine = CarPlayMediaEngine(sink = sink, microphoneEnabled = true)
@@ -202,6 +215,7 @@ class LiteSessionService : Service() {
                     main = AirPlayDisplayConfig(
                         widthPixels = size.first,
                         heightPixels = size.second,
+                        fps = fps,
                     ),
                     manufacturer = "DiPlay",
                     model = "DiPlay",
@@ -350,6 +364,36 @@ class LiteSessionService : Service() {
         else -> ManualHotspotSecurity.WPA2
     }
 
+    /**
+     * M6c：CarPlay 通话流（telephony）出现/消失时的路由切换。
+     *
+     * 背景：telephony 流走 STREAM_VOICE_CALL，在手机上默认路由到听筒。开关打开时，在这条流存在
+     * 期间强制扬声器 —— 光调 setSpeakerphoneOn(true) 在 Android 4.1 上不会把 voice-call 策略切到
+     * 扬声器，必须同时把模式切到 MODE_IN_COMMUNICATION。
+     *
+     * 开关每次现读 LiteConfig，所以勾完直接打电话即生效，不需要重新连接。流结束恢复默认（听筒 + MODE_NORMAL）。
+     */
+    private fun onPhoneChannelActive(active: Boolean) {
+        val audio = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return
+        val speaker = active && LiteConfig.load(this).speakerForCalls
+        try {
+            if (speaker) {
+                audio.mode = AudioManager.MODE_IN_COMMUNICATION
+                audio.setSpeakerphoneOn(true)
+            } else {
+                audio.setSpeakerphoneOn(false)
+                audio.mode = AudioManager.MODE_NORMAL
+            }
+            LiteLog.log(
+                "media",
+                "通话声音路由 active=$active speaker=$speaker " +
+                    "mode=${audio.mode} speakerphone=${audio.isSpeakerphoneOn}",
+            )
+        } catch (error: Exception) {
+            LiteLog.log("media", "通话声音路由设置失败 active=$active speaker=$speaker ${error.message}")
+        }
+    }
+
     @Suppress("DEPRECATION")
     private fun screenMetrics(): Pair<Int, Int> {
         val manager = getSystemService(WINDOW_SERVICE) as? WindowManager
@@ -362,6 +406,22 @@ class LiteSessionService : Service() {
         // 的自动重连），此时 Display 还是竖屏，会把竖屏尺寸写进 /info 与 HID 描述符。
         // 统一按"长边为宽"归一成横屏；真·横屏车机上 width>height，不受影响。
         return if (width > height) width to height else height to width
+    }
+
+    /**
+     * M6b：把 /info 声明的显示分辨率按百分比缩小（50~100，100 = 原样返回）。
+     * 长宽同比例缩小、各自取偶（H.264 要求偶数）；渲染仍铺满物理屏，故不会出现黑边。
+     */
+    private fun scaleDisplay(full: Pair<Int, Int>, percent: Int): Pair<Int, Int> {
+        val value = percent.coerceIn(LiteConfig.MIN_SCALE_PERCENT, LiteConfig.MAX_SCALE_PERCENT)
+        if (value >= LiteConfig.MAX_SCALE_PERCENT) return full
+        return scaleEven(full.first, value) to scaleEven(full.second, value)
+    }
+
+    private fun scaleEven(pixels: Int, percent: Int): Int {
+        val scaled = (pixels.toLong() * percent + 50L) / 100L
+        val value = scaled.toInt().coerceAtLeast(2)
+        return if (value % 2 == 0) value else value - 1
     }
 
     /** build.gradle.kts 的 versionName（每轮出包带阶段后缀），用于日志区分构建。 */

@@ -4,6 +4,7 @@ import android.media.AudioFormat as AndroidAudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.Process
 import android.util.Log
 import com.shilapi.xcertplay.airplay.AudioCodecKind
 import com.shilapi.xcertplay.airplay.MicrophoneConfig
@@ -139,7 +140,11 @@ internal class MicrophoneUplink(
         opusEncoder = nextEncoder
         return try {
             nextRecorder.startRecording()
-            thread = Thread({ capture(nextRecorder, nextSocket) }, "carplay-mic").apply {
+            thread = Thread({
+                // 麦克风采集 + libopus 编码：上行是通话体验的一等公民，同样抬到 URGENT_AUDIO。
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                capture(nextRecorder, nextSocket)
+            }, "carplay-mic").apply {
                 isDaemon = true
                 start()
             }

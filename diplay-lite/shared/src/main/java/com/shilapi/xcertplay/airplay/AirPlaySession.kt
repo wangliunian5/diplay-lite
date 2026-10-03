@@ -75,6 +75,10 @@ class AirPlaySession(
     private var eventSocket: Socket? = null
     private var eventCipher: ControlCipher? = null
     private var eventCseq = 0
+    // M6d：断开前要能主动给 iPhone 发一条 TEARDOWN —— 需要控制通道的输出流与自增 CSeq。
+    @Volatile private var controlOutput: BufferedOutputStream? = null
+    private var controlCseq = 0
+    @Volatile private var presentationUri: String? = null
     private var pendingNightMode: Boolean? = null
     private val firstTouchSendLogged = AtomicBoolean(false)
     private val touchSendFailureLogged = AtomicBoolean(false)
@@ -111,6 +115,9 @@ class AirPlaySession(
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        // M6d：先礼貌地通知 iPhone 结束会话，再关连接。否则对端只看到 TCP 被砸掉
+        // （日志里就是 "control I/O failed: Socket closed"），CarPlay 界面不退出、Wi-Fi 也不放开。
+        sendTeardownBestEffort()
         safeClose(socket)
         try {
             media.onSessionClosed(this)
@@ -254,6 +261,8 @@ class AirPlaySession(
         com.shilapi.xcertplay.network.TcpLiveness.configure(socket) { debugLog(it) }
         val input = BufferedInputStream(socket.getInputStream())
         val output = BufferedOutputStream(socket.getOutputStream())
+        // M6d：留给 close() 用 —— 断开前要在这条加密通道上补发 TEARDOWN。
+        controlOutput = output
         var accumulated = ByteArray(0)
         val buffer = ByteArray(READ_CHUNK_BYTES)
         var closeReason = "session closed"
@@ -337,7 +346,11 @@ class AirPlaySession(
 
     private fun handle(request: RtspMessage.Request): RtspMessage.Response {
         when (request.method) {
-            "SETUP" -> return handleSetup(request)
+            "SETUP" -> {
+                // M6d：记住播放会话 URI，断开时补发的 TEARDOWN 用它做请求目标。
+                if (presentationUri == null) presentationUri = request.path
+                return handleSetup(request)
+            }
             "RECORD" -> {
                 listener.onSessionActive(this)
                 return RtspMessage.Response(status = 200)
@@ -632,6 +645,28 @@ class AirPlaySession(
         eventServer = server
         spawnEvent("airplay-event-accept") { acceptEvent(server) }
         return server.localPort
+    }
+
+    /**
+     * M6d：best-effort 会话级 TEARDOWN。iOS 收到后才会把"车机主动结束了会话"当真，
+     * 从而退出 CarPlay 界面（并更倾向于放开热点）。发不出去/对方不理会都不影响拆除流程。
+     */
+    private fun sendTeardownBestEffort() {
+        val output = controlOutput ?: return
+        try {
+            controlCseq++
+            val uri = presentationUri ?: "rtsp://$host/"
+            val head = "TEARDOWN $uri RTSP/1.0\r\n" +
+                "Content-Type: $PLIST_CONTENT_TYPE\r\n" +
+                "Content-Length: 0\r\n" +
+                "CSeq: $controlCseq\r\n\r\n"
+            val wire = head.toByteArray(Charsets.US_ASCII)
+            output.write(cipher?.encrypt(wire) ?: wire)
+            output.flush()
+            debugLog("airplay control sent TEARDOWN to phone (best effort) cseq=$controlCseq uri=$uri")
+        } catch (error: Exception) {
+            debugLog("airplay control TEARDOWN send failed: ${error.message}")
+        }
     }
 
     private fun teardown() {
