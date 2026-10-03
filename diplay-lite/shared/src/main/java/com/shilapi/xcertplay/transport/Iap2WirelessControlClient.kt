@@ -66,6 +66,10 @@ class Iap2WirelessControlClient(
         var wirelessCarPlayAvailableSeen = false
         var locationActive = false
         var locationSentLogged = false
+        // T18 日志：0x4301 只发两次就停，iPhone 直到 55s 后才入网——期间没有第二次机会，
+        // 用户只能手动断链重连来"再发一次"。这里在 iPhone 接入前周期性重发凭据 + 启动会话。
+        var nextCredentialResendNanos: Long? = null
+        var credentialResendsSent = 0
         while (true) {
                 val remaining = remainingMillis(deadlineNanos)
                 if (remaining == 0L) {
@@ -84,10 +88,11 @@ class Iap2WirelessControlClient(
                     locationSentLogged = true
                     onProgress("iap2 tx=0xfffb location-information")
                 }
-                val pollTimeout = if (locationActive) {
-                    min(remaining, LOCATION_POLL_INTERVAL_MILLIS)
-                } else {
-                    remaining
+                val pollTimeout = when {
+                    locationActive -> min(remaining, LOCATION_POLL_INTERVAL_MILLIS)
+                    nextCredentialResendNanos != null ->
+                        min(remaining, CREDENTIAL_RESEND_POLL_MILLIS)
+                    else -> remaining
                 }
                 val incoming = session.recv(pollTimeout)
                 if (incoming == null) {
@@ -113,6 +118,28 @@ class Iap2WirelessControlClient(
                             transportNotificationSeen,
                             postTransportWiFiConfigurationsSent,
                             wirelessCarPlayAvailableSeen,
+                        )
+                    }
+                    val resendAt = nextCredentialResendNanos
+                    if (
+                        resendAt != null &&
+                        credentialResendsSent < MAX_CREDENTIAL_RESENDS &&
+                        System.nanoTime() >= resendAt
+                    ) {
+                        send(accessoryWiFiConfiguration(endpoint), deadlineNanos)
+                        send(carPlayStartSession(endpoint), deadlineNanos)
+                        wifiConfigurationsSent++
+                        carPlayStartSessionsSent++
+                        credentialResendsSent++
+                        nextCredentialResendNanos =
+                            if (credentialResendsSent >= MAX_CREDENTIAL_RESENDS) {
+                                null
+                            } else {
+                                System.nanoTime() + CREDENTIAL_RESEND_INTERVAL_NANOS
+                            }
+                        onProgress(
+                            "iap2 tx=0x5703/0x4301 credential resend #$credentialResendsSent " +
+                                "(iPhone not on Wi-Fi yet)",
                         )
                     }
                     continue
@@ -162,6 +189,11 @@ class Iap2WirelessControlClient(
                         stage = later(stage, Iap2WirelessControlStage.CARPLAY_START_SENT)
                         carPlayStartSessionsSent++
                         onProgress("iap2 tx=0x4301 carplay-start-session")
+                        // iPhone 晚入网（T18：55s）时需要再给机会，见上方 credentialResendsSent。
+                        if (nextCredentialResendNanos == null) {
+                            nextCredentialResendNanos =
+                                System.nanoTime() + CREDENTIAL_RESEND_INTERVAL_NANOS
+                        }
                     }
 
                     WIRELESS_CARPLAY_UPDATE -> {
@@ -267,6 +299,11 @@ class Iap2WirelessControlClient(
         private const val WIRELESS_CARPLAY_UPDATE = 0x4e0d
         private const val DEVICE_TRANSPORT_IDENTIFIER_NOTIFICATION = 0x4e0e
         private const val LOCATION_POLL_INTERVAL_MILLIS = 1_000L
+        /** iPhone 未入网时重发凭据的间隔与上限（12 × 5s ≈ 1 分钟）。 */
+        private const val CREDENTIAL_RESEND_INTERVAL_MILLIS = 5_000L
+        private const val CREDENTIAL_RESEND_INTERVAL_NANOS = 5_000L * 1_000_000L
+        private const val CREDENTIAL_RESEND_POLL_MILLIS = 1_000L
+        private const val MAX_CREDENTIAL_RESENDS = 12
         const val NO_TIMEOUT_MILLIS = Long.MAX_VALUE
         private const val DEFAULT_TIMEOUT_MILLIS = 60_000L
         private const val MAX_TIMEOUT_MILLIS = 24 * 60 * 60 * 1_000L
