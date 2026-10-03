@@ -7,24 +7,29 @@ import android.os.Bundle
 import android.os.Handler
 import android.text.InputType
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.view.WindowManager
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
-import java.io.File
+import com.shilapi.xcertplay.media.CarPlayTouchMapper
 
 /**
  * DiPlay Lite 主界面：单屏程序化 UI（零 XML 资源、零 AndroidX、无图片）。
  *
  * M0 骨架阶段：热点表单 + 服务启停 + 状态/日志显示；
  * 连接编排（shared 模块 CarPlayController）在 M2 接入 LiteSessionService。
+ * M4k：车机形态——默认全屏横屏，SurfaceView 铺满整屏做触摸目标；
+ * 配置/日志面板作为浮层（连接成功后自动收起，左上角小按钮可随时唤回）。
  *
  * 状态刷新用 500ms 轮询（Handler），代替广播与生命周期库，保持零依赖。
  */
@@ -41,6 +46,11 @@ class MainActivity : Activity() {
     private lateinit var bluetoothInput: EditText
     private lateinit var connectButton: Button
     private lateinit var disconnectButton: Button
+    private lateinit var video: SurfaceView
+    private lateinit var panel: ScrollView
+    private lateinit var panelToggle: Button
+    private var panelVisible = true
+    private var lastActive = false
 
     private val refreshTask = object : Runnable {
         override fun run() {
@@ -51,32 +61,52 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 车机形态：状态栏也收掉，投屏画面占满整块屏。
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_FULLSCREEN,
+            WindowManager.LayoutParams.FLAG_FULLSCREEN,
+        )
+        // M4l：车机屏绝不能休眠。屏幕一黑一亮，SurfaceView 的 Surface 就会销毁重建，
+        // 而 API16 不支持 setOutputSurface（API23+），只能重建解码器 + 等下一个关键帧，
+        // 期间收到的帧全部丢弃（实测 M4k 日志里 shown 从 17fps 掉到 2.8fps 就是这种窗口）。
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(buildUi())
         loadIntoForm()
+        setPanelVisible(true)
         renderState()
         LiteLog.log("ui", "DiPlay Lite M0 骨架就绪（minSdk 16）")
     }
 
     override fun onResume() {
         super.onResume()
+        LiteLog.log("ui", "onResume")
         handler.post(refreshTask)
     }
 
     override fun onPause() {
         super.onPause()
+        LiteLog.log("ui", "onPause")
         handler.removeCallbacks(refreshTask)
+    }
+
+    /**
+     * M4l 诊断：Activity 重建本身会让 SurfaceView 的 Surface 销毁重建（见 onCreate 注释）。
+     * 这条日志用来区分"只是 Surface 重建"（无 onDestroy）与"Activity 真的被销毁"（有 onDestroy）。
+     */
+    override fun onDestroy() {
+        LiteLog.log("ui", "onDestroy（Activity 被销毁，下一次进入会重建 Surface 与解码器）")
+        super.onDestroy()
     }
 
     // ---------- UI 构造（纯代码，无 XML） ----------
 
     private fun buildUi(): View {
         val pad = dip(12)
-        val outer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(BG)
-        }
+        // 根容器用 FrameLayout：SurfaceView 铺满整屏（车机画面），配置/日志面板浮在上面。
+        val outer = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         // M3：CarPlay 画面镜像到该 SurfaceView；Surface 经 LiteVideoBridge 交给后台 MediaCodec。
-        val video = SurfaceView(this)
+        // M4k：铺满屏幕 + 接手势 —— CarPlay 的触摸全靠这个 View 转成 HID 报告发回 iPhone。
+        video = SurfaceView(this)
         video.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 LiteVideoBridge.updateSurface(holder.surface)
@@ -90,18 +120,43 @@ class MainActivity : Activity() {
                 LiteLog.log("ui", "视频 Surface 销毁")
             }
         })
+        video.setOnTouchListener { _, event -> forwardTouch(event) }
         outer.addView(
             video,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dip(300)),
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
         )
-        val scroll = ScrollView(this)
+        panel = ScrollView(this)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
             setBackgroundColor(BG)
         }
-        scroll.addView(root)
-        outer.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        panel.addView(root)
+        outer.addView(
+            panel,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        // 面板开关：无条件浮在最上层，面板收起后它是唯一能唤回配置/日志的入口。
+        // 靠右上角，避开面板标题行的左上角。
+        panelToggle = Button(this).apply {
+            text = "面板"
+            textSize = 12f
+            alpha = 0.65f
+            setOnClickListener { setPanelVisible(!panelVisible) }
+        }
+        val toggleParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.END,
+        )
+        toggleParams.setMargins(0, dip(6), dip(6), 0)
+        outer.addView(panelToggle, toggleParams)
 
         // 标题行：状态圆点 + 标题
         val title = LinearLayout(this).apply {
@@ -184,6 +239,13 @@ class MainActivity : Activity() {
         actions.addView(disconnectButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(actions)
 
+        // 导出日志：把当前日志复制到同目录下的新文件（带时间戳），避免同名文件"看不到更新"。
+        val exportButton = Button(this).apply {
+            text = "导出日志"
+            setOnClickListener { exportLog() }
+        }
+        root.addView(exportButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
         // 日志区（长按清空）
         logView = TextView(this).apply {
             typeface = android.graphics.Typeface.MONOSPACE
@@ -218,6 +280,25 @@ class MainActivity : Activity() {
     }
 
     private fun dip(value: Int): Int = (value * resources.displayMetrics.density + 0.5f).toInt()
+
+    /** 配置/日志面板的显隐：收起后整屏都是 CarPlay 画面与触摸区。 */
+    private fun setPanelVisible(visible: Boolean) {
+        panelVisible = visible
+        panel.visibility = if (visible) View.VISIBLE else View.GONE
+        panelToggle.text = if (visible) "隐藏" else "面板"
+    }
+
+    /**
+     * 触摸转发：把屏幕坐标归一化成 0..1 的 [AirPlayContact]，交给当前会话发 HID 报告。
+     * 未连接时返回 false（不消费事件）；尺寸未布局完时用屏幕尺寸兜底。
+     */
+    private fun forwardTouch(event: MotionEvent): Boolean {
+        val service = LiteSessionService.current ?: return false
+        val width = video.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+        val height = video.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+        if (width <= 0 || height <= 0) return false
+        return service.sendTouch(CarPlayTouchMapper.contacts(event, width, height))
+    }
 
     // ---------- 表单读写 ----------
 
@@ -262,6 +343,21 @@ class MainActivity : Activity() {
         LiteLog.log("ui", "用户断开")
     }
 
+    /** 导出当前日志到同目录下的新文件（带时间戳）；避免 MTP/文件管理器对同名文件的缓存。 */
+    private fun exportLog() {
+        if (LiteLog.directory() == null) {
+            toast("导出失败：日志未挂载")
+            return
+        }
+        val exported = LiteLog.exportSnapshot()
+        if (exported == null) {
+            toast("导出失败：日志为空")
+            return
+        }
+        LiteLog.log("ui", "日志已导出：${exported.name}")
+        toast("已导出：${exported.name}")
+    }
+
     // ---------- 状态渲染 ----------
 
     private fun renderState() {
@@ -274,9 +370,16 @@ class MainActivity : Activity() {
             },
         )
         statusLine.text = LiteState.statusText
+        // 连接成功即自动收起面板 —— 此时用户要看的是 CarPlay 画面，而不是配置表单。
+        // 断开后（或用户点"面板"）再自动展开，方便改配置重连。
+        val active = LiteState.phase == LiteState.Phase.ACTIVE
+        if (active != lastActive) {
+            lastActive = active
+            setPanelVisible(!active)
+        }
         val sb = StringBuilder()
-        LiteLog.directory()?.let {
-            sb.append("日志文件: ").append(File(it, "diplay-log.txt").absolutePath).append("\n\n")
+        LiteLog.currentFile()?.let {
+            sb.append("日志文件: ").append(it.absolutePath).append("\n\n")
         }
         for (line in LiteLog.snapshot()) sb.append(line).append('\n')
         logView.text = sb

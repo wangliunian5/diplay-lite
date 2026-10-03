@@ -144,10 +144,18 @@ object AirPlayInfoPlist {
             format(101, "compatibility", pcm),
             // 带无线输入的三条流：上下行都带 OPUS（双向一致 = iPhone 建流的条件）。
             format(100, "default", pcm or opus, wirelessInput),
+            // ⚠️ 已回退 M4n 的"不带无线输入的槽位一律只声明 PCM"实验（实测失败，勿重做）：
+            //   M4n 把 100/alert、101/default 的 OPUS 位清成 `pcm`，期望逼 iPhone 发 LPCM 让 C8815
+            //   的导航出声。实测（M4o 日志 logs/20261003）：/info 变成 out=0xc3fc 后，iPhone
+            //   **整场一条音频流都不建**（连 type=102 音乐流都没有）⇒ 8815 彻底无声，与 T26 现象一致。
+            //   对照 M4k：同样的会话里 100/alert、101/default 带 OPUS（0x7000c3fc）时音乐正常出声。
+            //   结论：**OPUS 位是 iPhone 开启整个音频面的前提**，不能为"换 PCM"而清掉任何一条槽的 OPUS。
+            //   代价保留：本机无 OPUS 解码器 ⇒ 导航/Siri 走 OPUS 时静音（但不崩，见 codecComponentExists 守卫）。
             format(100, "alert", pcm or opus),
             format(100, "media", pcm),
             format(100, "telephony", pcmMono or opus, wirelessInput),
             format(100, "speechRecognition", pcmMono or opus, wirelessInput),
+            // T30 实测：导航/提示音落在这个槽（`type=101 audioType=default codec=OPUS`）。
             format(101, "default", pcm or opus),
             format(102, "media", aacLc),
         )

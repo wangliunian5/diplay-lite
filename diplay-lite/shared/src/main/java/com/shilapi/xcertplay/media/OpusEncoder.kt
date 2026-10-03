@@ -9,44 +9,67 @@ import java.io.Closeable
 import java.nio.ByteBuffer
 
 /**
+ * 麦克风上行帧编码器的公共接口。
+ *
+ * 两个实现同接口、可互换：
+ *  · [OpusEncoder]（MediaCodec，API 29+ 才有 OPUS 编码器）
+ *  · [NativeOpusEncoder]（内置 libopus 软件编码，本分支 API16 的兜底）
+ * [MicrophoneUplink] 按"MediaCodec 优先、libopus 兜底"选择。
+ */
+internal interface OpusFrameEncoder : Closeable {
+    val available: Boolean
+
+    /** 编码一帧 PCM（20ms），返回若干 Opus access unit；失败返回空列表。 */
+    fun encode(pcm: ByteArray): List<ByteArray>
+}
+
+/**
  * Encodes 20 ms chunks of 48 kHz mono PCM into raw Opus access units for the CarPlay
  * microphone uplink.
  */
-internal class OpusEncoder(bitrate: Int) : Closeable {
-    private val codec: MediaCodec? = try {
-        val format = MediaFormat.createAudioFormat(
-            MediaFormat.MIMETYPE_AUDIO_OPUS,
-            SAMPLE_RATE,
-            CHANNELS,
-        ).apply {
-            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_BYTES)
-        }
-        MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS).also {
-            it.configure(
-                format,
-                null,
-                null,
-                MediaCodec.CONFIGURE_FLAG_ENCODE,
-            )
-            it.start()
-            Log.i(TAG, "Opus microphone encoder started bitrate=$bitrate")
-        }
-    } catch (error: Exception) {
-        Log.w(TAG, "Opus microphone encoder unavailable", error)
+internal class OpusEncoder(bitrate: Int) : OpusFrameEncoder {
+    // M4m：本机没有 OPUS 编码器时**绝不**去 createEncoderByType —— C8815（API16）上厂商 OMX 层会
+    // 直接原生崩进程（同 codecComponentExists 的注释；T32 的闪退就是解码侧同一机制）。
+    // 代价只是麦克风上行不可用（Siri 没上行数据），不影响下行播放（那是解码路径）。
+    private val codec: MediaCodec? = if (!codecComponentExists(MediaFormat.MIMETYPE_AUDIO_OPUS, encoder = true)) {
+        Log.w(TAG, "Opus microphone encoder absent on this device; uplink disabled")
         null
+    } else {
+        try {
+            val format = MediaFormat.createAudioFormat(
+                MediaFormat.MIMETYPE_AUDIO_OPUS,
+                SAMPLE_RATE,
+                CHANNELS,
+            ).apply {
+                setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_BYTES)
+            }
+            MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS).also {
+                it.configure(
+                    format,
+                    null,
+                    null,
+                    MediaCodec.CONFIGURE_FLAG_ENCODE,
+                )
+                it.start()
+                Log.i(TAG, "Opus microphone encoder started bitrate=$bitrate")
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "Opus microphone encoder unavailable", error)
+            null
+        }
     }
     private val bufferInfo = MediaCodec.BufferInfo()
     private var presentationTimeUs = 0L
     private var closed = false
     private var outputPackets = 0
 
-    val available: Boolean get() = codec != null && !closed
+    override val available: Boolean get() = codec != null && !closed
 
     /**
      * Queues one 20 ms PCM frame and returns all Opus access units made available by the codec.
      */
-    fun encode(pcm: ByteArray): List<ByteArray> {
+    override fun encode(pcm: ByteArray): List<ByteArray> {
         val codec = codec ?: return emptyList()
         if (closed) return emptyList()
         val inputIndex = try {

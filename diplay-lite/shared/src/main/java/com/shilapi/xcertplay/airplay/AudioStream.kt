@@ -219,7 +219,13 @@ object AudioStreamCodec {
     fun fromFormatBits(bits: Long, payloadType: Int, audioType: String = "media"): AudioFormat {
         val isAacLc = (bits and (AAC_LC_44K_STEREO or AAC_LC_48K_STEREO)) != 0L
         val isOpus = (bits and OPUS_MONO) != 0L
-        val pcm = PCM_FORMAT[bits]
+        // M4n：**按单个 PCM 位匹配**，不再要求整掩码精确命中。
+        // 起因：M4n 让 iPhone 在不带无线输入的槽位上改发 LPCM（导航出声实验）。若它回的是
+        // 多位置合的掩码（如 0xc000 = 48k mono|stereo），旧写法 `PCM_FORMAT[bits]` 会落空，
+        // 兜底到 `LPCM 44.1k 立体声` —— 采样率错 8%，听感是变调/沙哑而不是"没声音"，会白费一轮实测。
+        // 取"位数最高"（= 采样率/声道最优）的那个命中位。
+        val pcm = PCM_FORMAT.entries.sortedByDescending { it.key }
+            .firstOrNull { (it.key and bits) != 0L }?.value
         return when {
             isOpus -> AudioFormat(AudioCodecKind.OPUS, 48_000, 1, payloadType, audioType)
             isAacLc -> AudioFormat(

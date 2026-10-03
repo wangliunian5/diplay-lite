@@ -8,6 +8,7 @@ import android.os.IBinder
 import android.util.Base64
 import android.view.WindowManager
 import com.shilapi.xcertplay.airplay.AirPlayConfig
+import com.shilapi.xcertplay.airplay.AirPlayContact
 import com.shilapi.xcertplay.airplay.AirPlayDeviceInfo
 import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
@@ -81,7 +82,15 @@ class LiteSessionService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * M4k 触摸入口：MainActivity 的 SurfaceView 把 MotionEvent 归一化成 [AirPlayContact]
+     * （x/y 为 0..1），由此转发到 shared 的 CarPlayController.sendTouch。
+     * 未连接（controller 为空）时返回 false，调用方据此不消费事件。
+     */
+    fun sendTouch(contacts: List<AirPlayContact>): Boolean = controller?.sendTouch(contacts) == true
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        current = this
         startForeground(NOTIFICATION_ID, buildNotification())
         LiteState.running = true
         LiteState.phase = LiteState.Phase.CONNECTING
@@ -108,6 +117,7 @@ class LiteSessionService : Service() {
         LiteState.statusText = "未连接"
         stopForeground(true)
         LiteLog.log("service", "会话服务已停止")
+        current = null
         super.onDestroy()
     }
 
@@ -346,7 +356,12 @@ class LiteSessionService : Service() {
         val display = manager?.defaultDisplay ?: return DEFAULT_SCREEN
         val width = display.width
         val height = display.height
-        return if (width > 0 && height > 0) width to height else DEFAULT_SCREEN
+        if (width <= 0 || height <= 0) return DEFAULT_SCREEN
+        // M4m：本工程固定横屏（manifest screenOrientation=landscape），但服务可能在没有 Activity 的
+        // 情况下被系统 START_STICKY 拉起来（实测 2026-10-03 14:47 那次 `screen=540x960`，即崩溃重启后
+        // 的自动重连），此时 Display 还是竖屏，会把竖屏尺寸写进 /info 与 HID 描述符。
+        // 统一按"长边为宽"归一成横屏；真·横屏车机上 width>height，不受影响。
+        return if (width > height) width to height else height to width
     }
 
     /** build.gradle.kts 的 versionName（每轮出包带阶段后缀），用于日志区分构建。 */
@@ -376,6 +391,14 @@ class LiteSessionService : Service() {
 
     companion object {
         private const val NOTIFICATION_ID = 1
+
+        /**
+         * 进程内当前服务实例：MainActivity（触摸/视频）需要拿到同进程的 Session 转触点。
+         * 无绑定、无 AIDL —— 与 LiteVideoBridge 相同的进程内单例约定。
+         */
+        @Volatile
+        var current: LiteSessionService? = null
+
         private const val IDENTITY_PREFS = "diplay_lite_identity"
         private const val PAIRING_PREFS = "diplay_lite_pairings"
         private const val KEY_PRIVATE_KEY = "private_key"

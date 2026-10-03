@@ -49,10 +49,17 @@ internal class VideoStats(
         val shown = rendered / seconds
         val maxGapMs = (maxArrivalGapNs / 1_000_000).toInt()
         BandwidthMonitor.setVideoMetrics(rx.toFloat(), shown.toFloat(), maxGapMs, recoveries)
+        // M4k：带上堆占用。用户反馈"视频流突然变大后闪退"，而闪退零日志——
+        // 若是 OutOfMemoryError（catch(Exception) 兜不住 → 线程死 → 进程被杀），
+        // 这行数字会在崩溃前一路爬升，下一次测试即可确认或排除。
+        val runtime = Runtime.getRuntime()
+        val heapUsedMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
+        val heapMaxMb = runtime.maxMemory() / (1024 * 1024)
         val line = ("video stats$label rx=%.1ffps shown=%.1ffps maxGap=%dms kbps=%d recoveries=%d " +
-            "touch2frame avg=%dms max=%dms n=%d touchSendMax=%dms").format(
+            "heap=%d/%dMB touch2frame avg=%dms max=%dms n=%d touchSendMax=%dms").format(
             rx, shown, maxGapMs,
             (bytes * 8 / 1000 / seconds).toLong(), recoveries,
+            heapUsedMb, heapMaxMb,
             touchAvgMs, maxTouchLatencyNs / 1_000_000, touchSamples, TouchLatencyProbe.maxSendNs / 1_000_000,
         )
         TouchLatencyProbe.maxSendNs = 0

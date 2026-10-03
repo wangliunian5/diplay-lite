@@ -31,7 +31,7 @@ internal class MicrophoneUplink(
     private val firstPacketLogged = AtomicBoolean(false)
     @Volatile private var recorder: AudioRecord? = null
     @Volatile private var socket: DatagramSocket? = null
-    @Volatile private var opusEncoder: OpusEncoder? = null
+    @Volatile private var opusEncoder: OpusFrameEncoder? = null
     private var thread: Thread? = null
 
     /** Reports a start failure into the diagnostic log so field reports show why calls went silent. */
@@ -59,20 +59,31 @@ internal class MicrophoneUplink(
             return fail("microphone unavailable rate=${config.sampleRate} channels=${config.channels}")
         }
 
-        val source = when (config.audioType) {
-            "telephony" -> MediaRecorder.AudioSource.VOICE_COMMUNICATION
-            "speechrecognition" -> MediaRecorder.AudioSource.VOICE_RECOGNITION
-            else -> MediaRecorder.AudioSource.MIC
-        }
+        // 上行编码器选择：**MediaCodec 优先、libopus 兜底**（API 29+ 行为零变化）。
+        // 本分支（API16）没有 MediaCodec OPUS 编码器，改由内置 libopus 软件编码 ——
+        // 否则带无线输入的流协商了 OPUS 上行却编不出来，通话/微信语音对方就听不到。
+        var encoderBackend = "pcm"
         val nextEncoder = if (config.codec == AudioCodecKind.OPUS) {
-            OpusEncoder(config.bitrate ?: 48_000).takeIf { it.available }
+            val mediaCodec = OpusEncoder(config.bitrate ?: 48_000).takeIf { it.available }
+            val native = if (mediaCodec != null) {
+                null
+            } else {
+                NativeOpusEncoder.create(config.bitrate ?: 48_000)
+            }
+            encoderBackend = when {
+                mediaCodec != null -> "MediaCodec"
+                native != null -> "libopus"
+                else -> "none"
+            }
+            mediaCodec ?: native
         } else {
             null
         }
         if (config.codec == AudioCodecKind.OPUS && nextEncoder == null) {
             return fail(
                 "Opus encoder is unavailable on this device; the phone negotiated " +
-                    "an OPUS microphone uplink this build cannot encode",
+                    "an OPUS microphone uplink this build cannot encode " +
+                    "(MediaCodec absent, libopus probe failed)",
             )
         }
         val bufferSize = maxOf(minBuffer * 2, config.frameBytes * 4)
@@ -80,31 +91,42 @@ internal class MicrophoneUplink(
         // NoSuchMethodError (an Error the catch below cannot intercept) and crash the app.
         // The plain constructor works from API 21: bad parameters only throw from API 23,
         // earlier builds land in the state check below as STATE_UNINITIALIZED.
-        val nextRecorder = try {
-            AudioRecord(
-                source,
-                config.sampleRate,
-                channelMask,
-                AndroidAudioFormat.ENCODING_PCM_16BIT,
-                bufferSize,
-            )
-        } catch (error: Exception) {
-            Log.e(TAG, "microphone recorder creation failed", error)
-            nextEncoder?.close()
-            return fail("recorder creation failed: ${error.message}")
+        //
+        // API16 适配（T36 实测）：`AudioSource.VOICE_COMMUNICATION`(7) 在 Android 4.1 上
+        // AudioRecord 直接 `STATE_UNINITIALIZED`（该源要求音频模式为 MODE_IN_COMMUNICATION，
+        // 4.x 的 HAL 在 MODE_NORMAL 下不给）—— 现象就是编码器已就绪却仍报
+        // `recorder failed to initialize`、收音全无。改为**按优先级逐个源尝试**，
+        // 取第一个能初始化的，并把胜出的源号写进文件日志。
+        val attemptedSources = sourcesFor(config.audioType)
+        var selection: Pair<AudioRecord, Int>? = null
+        for (source in attemptedSources) {
+            val candidate = try {
+                AudioRecord(
+                    source,
+                    config.sampleRate,
+                    channelMask,
+                    AndroidAudioFormat.ENCODING_PCM_16BIT,
+                    bufferSize,
+                )
+            } catch (error: Exception) {
+                Log.w(TAG, "microphone recorder creation failed source=$source", error)
+                null
+            }
+            if (candidate != null && candidate.state == AudioRecord.STATE_INITIALIZED) {
+                selection = candidate to source
+                break
+            }
+            candidate?.release()
         }
-        if (nextRecorder.state != AudioRecord.STATE_INITIALIZED) {
-            Log.w(TAG, "microphone recorder failed to initialize")
-            nextRecorder.release()
+        val nextRecorder = selection?.first
+        if (nextRecorder == null) {
             nextEncoder?.close()
-            return fail("recorder failed to initialize")
+            return fail("recorder failed to initialize (tried sources=$attemptedSources)")
         }
+        val chosenSource = selection?.second ?: -1
 
         val nextSocket = try {
-            DatagramSocket(null).apply {
-                reuseAddress = true
-                bind(InetSocketAddress(InetAddress.getByName("::"), 0))
-            }
+            bindAnyPort()
         } catch (error: Exception) {
             Log.e(TAG, "microphone socket creation failed", error)
             nextRecorder.release()
@@ -123,9 +145,15 @@ internal class MicrophoneUplink(
             }
             Log.i(
                 TAG,
-                "microphone uplink started type=${config.audioType} " +
-                    "rate=${config.sampleRate} channels=${config.channels} " +
-                    "frameMs=${config.frameMillis} port=${config.port}",
+                "microphone uplink started type=${config.audioType} codec=${config.codec} " +
+                    "encoder=$encoderBackend source=$chosenSource rate=${config.sampleRate} " +
+                    "channels=${config.channels} frameMs=${config.frameMillis} port=${config.port}",
+            )
+            // 成功路径也落文件日志（此前只写 logcat，实测报告里"查无此话"，见 #30）。
+            diagnostics?.invoke(
+                "Microphone uplink started type=${config.audioType} codec=${config.codec} " +
+                    "encoder=$encoderBackend source=$chosenSource rate=${config.sampleRate} " +
+                    "channels=${config.channels} frameMs=${config.frameMillis}",
             )
             true
         } catch (error: Exception) {
@@ -133,6 +161,41 @@ internal class MicrophoneUplink(
             fail("recording failed to start: ${error.message}")
             release()
             false
+        }
+    }
+
+    // API16 适配：按优先级给出可尝试的录音源。4.1 上 VOICE_COMMUNICATION 常常初始化不了
+    // （要求 MODE_IN_COMMUNICATION），所以让 7 → 6 → 1 逐级退；语音识别走 6 → 1。
+    // 代价：退到 MIC 时没有平台回声消除，远端可能听到回声（后续可跟 #33 的 AEC/NS）。
+    private fun sourcesFor(audioType: String): List<Int> = when (audioType) {
+        "telephony" -> listOf(
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.MIC,
+        )
+        "speechrecognition" -> listOf(
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.MIC,
+        )
+        else -> listOf(MediaRecorder.AudioSource.MIC)
+    }
+
+    // API16 适配：绑 IPv6 通配 [::] 在本机 ROM 上会抛 “Can't bind to a link-local address
+    // without a scope id”，回退 IPv4 通配（与 AudioStream/ScreenStream 的处理一致）。
+    // 少了这个回退，libopus 补上之后麦克风仍会停在 "socket creation failed"。
+    private fun bindAnyPort(): DatagramSocket {
+        val socket = DatagramSocket(null)
+        socket.reuseAddress = true
+        return try {
+            socket.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+            socket
+        } catch (error: Exception) {
+            diagnostics?.invoke("microphone 端口 IPv6 通配绑定失败，回退 IPv4: ${error.message}")
+            runCatching { socket.close() }
+            DatagramSocket(null).apply {
+                reuseAddress = true
+                bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
+            }
         }
     }
 

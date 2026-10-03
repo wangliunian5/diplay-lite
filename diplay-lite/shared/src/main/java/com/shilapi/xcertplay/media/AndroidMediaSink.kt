@@ -258,6 +258,15 @@ private class VideoDecoder(
                     releaseDecoder()
                     referenceChain.reset()
                     requestKeyFrameIfDue()
+                } catch (error: Throwable) {
+                    // 码率/帧长突变时可能抛 Error（OutOfMemoryError 等），catch(Exception) 兜不住，
+                    // 逃出 run() 即线程死亡 → 进程被杀（用户反馈"视频流突然变大就闪退"）。
+                    // 这里按普通解码失败处理：释放解码器、等下一个关键帧，保住进程。
+                    if (running) Log.e(TAG, "video decoder job crashed: ${job?.javaClass?.simpleName}", error)
+                    if (running) report("decoder crashed ${error.javaClass.name}; waiting for keyframe")
+                    releaseDecoder()
+                    referenceChain.reset()
+                    requestKeyFrameIfDue()
                 }
             }
         } catch (_: InterruptedException) {
@@ -572,6 +581,10 @@ private class AudioRenderer(
     @Volatile private var running = true
     @Volatile private var started = false
     private var codec: MediaCodec? = null
+    // M5a：本机没有 OPUS 解码器（API16）时改用内置 libopus 软件解码。两者互斥：
+    // codec != null 走 MediaCodec，否则走它；都为 null 才是"这条流注定静音"。
+    private var nativeOpusDecoder: NativeOpusDecoder? = null
+    private var firstSoftwareOpusLogged = false
     private var track: AudioTrack? = null
     private var pcm = ByteArray(64 * 1024)
     private var playbackStarted = false
@@ -591,6 +604,8 @@ private class AudioRenderer(
     private val lastArrivalNs = AtomicLong()
     private val maxArrivalGapMs = AtomicLong()
     private var maxWriteMs = 0L
+    // M5a：软件 OPUS 解码耗时（弱机性能验收用，随 stats 一起清零）。
+    private var maxDecodeMs = 0L
     private var statsWindowStartNs = 0L
     private var statsLastUnderruns = 0
     private var bytesPerSecond = 0
@@ -641,7 +656,21 @@ private class AudioRenderer(
         try {
             when (format.codec) {
                 AudioCodecKind.AAC_LC -> configureCodec(MediaFormat.MIMETYPE_AUDIO_AAC)
-                AudioCodecKind.OPUS -> configureCodec(MediaFormat.MIMETYPE_AUDIO_OPUS)
+                AudioCodecKind.OPUS -> {
+                    configureCodec(MediaFormat.MIMETYPE_AUDIO_OPUS)
+                    // M5a：API16 本机没有 OMX.google.opus.decoder（API21+ 才有），而 /info **必须**
+                    // 声明 OPUS（T26/T33/T34 三次证伪"清 OPUS 换 PCM"）⇒ 导航/通话/Siri 的 OPUS
+                    // 下行只能靠内置 libopus 解出来，否则一直静音（T35：rx 有包、outputBuffersTotal=0）。
+                    if (codec == null) {
+                        nativeOpusDecoder = NativeOpusDecoder.create(format.sampleRate, format.channels)
+                        report(
+                            "Audio: opus software decoder " +
+                                (if (nativeOpusDecoder != null) "ready" else "unavailable") +
+                                " type=${format.payloadType} rate=${format.sampleRate} " +
+                                "channels=${format.channels}（libopus）",
+                        )
+                    }
+                }
                 AudioCodecKind.LPCM -> Unit
             }
             createTrack()
@@ -659,6 +688,14 @@ private class AudioRenderer(
             if (running) {
                 Log.e(TAG, "audio renderer worker failed", error)
                 report("Audio: renderer failed audioType=${format.audioType} error=${error.javaClass.simpleName}")
+            }
+        } catch (error: Throwable) {
+            // Error（NoClassDefFoundError / UnsatisfiedLinkError / OutOfMemoryError …）不会进上面的
+            // catch(Exception)；逃出去就是线程死亡 → 进程被系统杀掉（实测 C8815 无声闪退、零日志）。
+            // 这里兜住并写进文件日志，让"哪条流、什么类型"可判读。
+            if (running) {
+                Log.e(TAG, "audio renderer worker crashed", error)
+                report("Audio: renderer crashed audioType=${format.audioType} error=${error.javaClass.name}")
             }
         } finally {
             runCatching { logStatsIfDue(force = true) }
@@ -689,24 +726,43 @@ private class AudioRenderer(
             )
         }
         codec = try {
-            MediaCodec.createDecoderByType(mime).also {
-                it.configure(mediaFormat, null, null, 0)
-                it.start()
-                Log.i(TAG, "audio decoder configured mime=$mime name=${codecName(it)}")
+            // 面包屑（2026-10-03 闪退排查）：创建解码器是唯一会进入厂商 OMX/HAL 的操作，
+            // 先落地"即将创建"，进程若死在这里，日志最后一行就是它。
+            //
+            // M4m 修复：**本机没有这个 mime 的解码器时绝不调用 createDecoderByType**。
+            // T32 实证（C8815/API16，一开导航就闪退）：日志最后一条是
+            // `Audio: creating decoder mime=audio/opus codec=OPUS type=100`，之后进程消失、无 `[crash]`
+            // ⇒ 厂商 OMX 层原生崩溃，Java 侧 catch 拦不住。先查组件列表（不实例化）再决定创建。
+            if (!codecComponentExists(mime, encoder = false)) {
+                report("Audio: decoder absent，跳过创建 mime=$mime codec=${format.codec} type=${format.payloadType}（本机无该组件，创建会原生崩进程）")
+                null
+            } else {
+                report("Audio: creating decoder mime=$mime codec=${format.codec} type=${format.payloadType}")
+                MediaCodec.createDecoderByType(mime).also {
+                    it.configure(mediaFormat, null, null, 0)
+                    it.start()
+                    Log.i(TAG, "audio decoder configured mime=$mime name=${codecName(it)}")
+                    report("Audio: decoder ready mime=$mime name=${codecName(it)} type=${format.payloadType}")
+                }
             }
         } catch (error: Exception) {
             Log.e(TAG, "audio decoder configuration failed mime=$mime", error)
+            report("Audio: decoder unavailable mime=$mime codec=${format.codec} type=${format.payloadType}")
             null
         }
     }
 
     private fun createTrack() {
+        // 面包屑：AudioTrack 构造会进入 AudioFlinger/HAL，是第二个可能原生崩溃的点。
+        report("Audio: creating track type=${format.payloadType} codec=${format.codec} " +
+            "rate=${format.sampleRate} channels=${format.channels} audioType=${format.audioType}")
         val encoding = AndroidAudioFormat.ENCODING_PCM_16BIT
         val channelMask = if (format.channels >= 2) AndroidAudioFormat.CHANNEL_OUT_STEREO
         else AndroidAudioFormat.CHANNEL_OUT_MONO
         val minBuffer = AudioTrack.getMinBufferSize(format.sampleRate, channelMask, encoding)
         if (minBuffer <= 0) {
             Log.e(TAG, "AudioTrack buffer size unavailable rate=${format.sampleRate} channels=${format.channels}")
+            report("Audio: track unavailable (minBufferSize=$minBuffer) rate=${format.sampleRate}")
             return
         }
         val plan = MediaAudioBuffer.plan(format.audioType, format.sampleRate, format.channels, minBuffer, mediaBufferMillis)
@@ -745,6 +801,11 @@ private class AudioRenderer(
             } else {
                 AudioManager.STREAM_MUSIC
             }
+            // 反推结果落进文件日志：这是"导航走媒体音量还是语音音量"的最终判据。
+            report(
+                "Audio: legacy track streamType=$streamType usage=${route.usage} " +
+                    "(3=STREAM_MUSIC 媒体音量, 0=STREAM_VOICE_CALL 语音/通话音量)",
+            )
             @Suppress("DEPRECATION")
             AudioTrack(
                 streamType,
@@ -802,6 +863,12 @@ private class AudioRenderer(
         Log.i(
             TAG,
             "audio route type=${format.payloadType} audioType=${format.audioType} " +
+                "mode=$mode channel=${selection.channel} " +
+                "usage=$usage contentType=$contentType",
+        )
+        // 路由结论同时写入文件日志：此前只进 logcat，无 adb 时"这条流算哪种音量"无从取证。
+        report(
+            "Audio: route type=${format.payloadType} audioType=${format.audioType} " +
                 "mode=$mode channel=${selection.channel} " +
                 "usage=$usage contentType=$contentType",
         )
@@ -880,6 +947,28 @@ private class AudioRenderer(
                             "audio Opus skipping short packet bytes=${accessUnit.size} " +
                                 "head=${accessUnit.toHexString()}",
                         )
+                    }
+                    return
+                }
+                // M5a：本机无 OPUS 解码器时走内置 libopus；解出的 PCM 是 16-bit 小端，
+                // 与 AudioTrack 的 ENCODING_PCM_16BIT 一致，**不需要** LPCM 那样的 byteSwap。
+                val decoder = nativeOpusDecoder
+                if (decoder != null) {
+                    val startedNs = System.nanoTime()
+                    // 上限给到 40ms（20ms 帧的 2 倍）：opus_decode 会按包内实际帧数解码并返回真实采样数。
+                    val decodedPcm = decoder.decode(accessUnit, format.sampleRate / 25)
+                    val decodeMs = (System.nanoTime() - startedNs) / 1_000_000L
+                    if (decodeMs > maxDecodeMs) maxDecodeMs = decodeMs
+                    if (decodedPcm != null) {
+                        outputBuffers++
+                        if (!firstSoftwareOpusLogged) {
+                            firstSoftwareOpusLogged = true
+                            report(
+                                "Audio: opus software decoded bytes=${decodedPcm.size} " +
+                                    "type=${format.payloadType} decodeMs=$decodeMs（libopus）",
+                            )
+                        }
+                        writePcm(decodedPcm)
                     }
                     return
                 }
@@ -1103,11 +1192,13 @@ private class AudioRenderer(
             "playing=$playbackStarted maxGapMs=${maxArrivalGapMs.getAndSet(0)} " +
             "gapCompMs=${gapUsCompensated / 1000} gapFrames=$packetsCompensated " +
             "sinceRxMs=${if (lastRx == 0L) -1 else (now - lastRx) / 1_000_000L} maxWriteMs=$maxWriteMs " +
+            "maxDecodeMs=$maxDecodeMs " +
             "decoderDroppedTotal=$inputDropped outputBuffersTotal=$outputBuffers rebuffers=$rebufferCount ended=$force"
         Log.i(STATS_TAG, line)
         report(line)
         statsLastUnderruns = underruns
         maxWriteMs = 0L
+        maxDecodeMs = 0L
         gapUsCompensated = 0L
         packetsCompensated = 0L
         statsWindowStartNs = now
@@ -1136,6 +1227,12 @@ private class AudioRenderer(
 
     @Synchronized
     private fun release() {
+        // M5a：软件 OPUS 解码器与 MediaCodec 互斥，两者都要在流结束时释放。
+        val currentNativeDecoder = nativeOpusDecoder
+        nativeOpusDecoder = null
+        if (currentNativeDecoder != null) {
+            runCatching { currentNativeDecoder.close() }
+        }
         val codec = codec
         this.codec = null
         if (codec != null) {
@@ -1227,3 +1324,39 @@ private fun codecOutputBuffer(codec: MediaCodec, index: Int): ByteBuffer? =
 /** AudioTrack.getUnderrunCount 是 API 24+，低版本无此指标，返回 0。 */
 private fun trackUnderruns(track: AudioTrack): Int =
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) track.underrunCount else 0
+
+/**
+ * 本机是否存在该 mime 的编/解码器组件（M4m，2026-10-03 实证）。
+ *
+ * **为什么必须"先查字典再创建"**：C8815（API16）上对**本机不存在的 OPUS** 调
+ * `MediaCodec.createDecoderByType("audio/opus")`，会在厂商 OMX/stagefright 层**原生崩溃**：
+ * 日志最后一行就是 `Audio: creating decoder mime=audio/opus …`，之后进程直接消失、没有 `[crash]`
+ * （`catch (Exception)` 与 `catch (Throwable)` 都拦不住，因为进程不是被 Java 异常杀掉的）。
+ * 查组件列表只是读 media_codecs.xml，**不实例化组件**，所以安全。
+ *
+ * API16 的 MediaCodecList 只有无参构造 + getCodecCount/getCodecInfoAt，而这三者在 API21 起被
+ * `MediaCodecList(int kind)` + `getCodecInfos()` 取代、**已从 compileSdk 34 的 android.jar 里移除**，
+ * 编译期无法直接调用 —— 低版本只能反射调用设备上真实存在的这些方法。
+ *
+ * 查询本身失败时的兜底：只禁掉"API<21 上的 OPUS"这个已知会崩的组合，其余放行——
+ * 免得探针异常反而把能用的 AAC 也一起禁掉、连音乐都没声音了。
+ */
+internal fun codecComponentExists(mime: String, encoder: Boolean): Boolean = try {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any {
+            it.isEncoder == encoder && mime in it.supportedTypes
+        }
+    } else {
+        val clazz = Class.forName("android.media.MediaCodecList")
+        val list = clazz.getDeclaredConstructor().newInstance()
+        val codecCount = clazz.getMethod("getCodecCount").invoke(list) as Int
+        val getCodecInfoAt = clazz.getMethod("getCodecInfoAt", java.lang.Integer.TYPE)
+        (0 until codecCount).any { index ->
+            val info = getCodecInfoAt.invoke(list, index) as MediaCodecInfo
+            info.isEncoder == encoder && mime in info.supportedTypes
+        }
+    }
+} catch (error: Throwable) {
+    Log.w("xcertplay-usb", "codec component query failed mime=$mime encoder=$encoder", error)
+    !(Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP && mime == MediaFormat.MIMETYPE_AUDIO_OPUS)
+}

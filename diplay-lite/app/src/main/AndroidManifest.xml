@@ -24,10 +24,16 @@
         android:allowBackup="false"
         android:hardwareAccelerated="true">
 
+        <!-- M4k：车机场景默认横屏（/info 的车机屏尺寸、视频编码尺寸、触摸坐标都随之变成 960x540 这种横向值）。
+             M4l：configChanges 补齐所有可能触发重建的配置项——本工程零 XML 资源（无布局/无字符串），
+             重建什么都不会变好，只会白销毁一次 SurfaceView 的 Surface（解码器要重配+等关键帧，画面冻 1~5s）。
+             实测 M4k 一次会话里 Activity 被重建 3 次（`M0 骨架就绪` 4 条），每次都对应一段 shown 掉到 2.8fps 的卡顿。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|fontScale|density|layoutDirection|locale"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
