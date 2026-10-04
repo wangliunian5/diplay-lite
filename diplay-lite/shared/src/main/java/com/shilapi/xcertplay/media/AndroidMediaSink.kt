@@ -62,6 +62,13 @@ class AndroidMediaSink(
     private val surfaces = ConcurrentHashMap<Int, Surface>()
     private val videoDecoders = ConcurrentHashMap<Int, VideoDecoder>()
     private val audioRenderers = ConcurrentHashMap<Int, AudioRenderer>()
+    /**
+     * M6i：本会话"建过流的 `<type>/<audioType>`"汇总。
+     * 起因：T43/T44 都没等到 `通话声音路由 …`，无法判断是"没打电话"还是"压根没建 telephony 流"——
+     * 有这行汇总就能一眼看出本机到底建了哪些 audioType（如 `110/video` 不算，音频形如 `102/media`）。
+     */
+    private val audioStreamTypes =
+        java.util.Collections.synchronizedSet(java.util.LinkedHashSet<String>())
     private val microphoneUplinks = ConcurrentHashMap<Int, MicrophoneUplink>()
     private val pendingVideoCodec = ConcurrentHashMap<Int, VideoCodec>()
     private val videoRecoveryHandlers = ConcurrentHashMap<Int, () -> Unit>()
@@ -133,7 +140,15 @@ class AndroidMediaSink(
     }
 
     override fun onAudioStarted(type: Int, format: AudioFormat, firstSample: Int) {
+        noteAudioStreamType(type, format.audioType)
         audioRenderer(type, format).start()
+    }
+
+    /** 新出现的 audioType 才打一行汇总，避免刷屏。 */
+    private fun noteAudioStreamType(type: Int, audioType: String) {
+        if (!audioStreamTypes.add("$type/$audioType")) return
+        val summary = synchronized(audioStreamTypes) { audioStreamTypes.joinToString(",") }
+        onAudioDiagnostic("Audio: stream types so far=$summary")
     }
 
     override fun onAudioRtp(type: Int, format: AudioFormat, rtp: ByteArray, sample: Int) {
@@ -260,6 +275,16 @@ private class VideoDecoder(
     private var duplicateConfigLogged = false
     // M6e：解码器清单只打一次（确认本机有哪些解码器、软解开关到底有没有生效）。
     private var decoderInventoryLogged = false
+    // M6j：解码失败的**首个**异常要带 message + 堆栈落盘（T44 只打了类名，等于没有证据）。
+    private val decoderErrorDetailLogged = AtomicBoolean(false)
+    /**
+     * M6j：软解在本机试过并失败了。T44 实测：C8815 上 `OMX.google.h264.decoder` 能创建、
+     * 能 configure/start，但**每一帧都抛异常**（`decoder error IllegalStateException`、`shown=0.0fps`）
+     * ⇒ 勾了"强制软解"反而永久无画面。这里记住失败，之后自动回落默认硬解，并明确提示。
+     */
+    @Volatile private var softwareDecoderDisabled = false
+    // M6j：软解探测日志只打一次（T44 里它每帧刷一次，45 条把日志淹了）。
+    private var softwareProbeLogged = false
     private val referenceChain = VideoReferenceChain()
     private var lastKeyFrameRequestNs = 0L
     // The main screen keeps the historical log format; other screens are labelled.
@@ -313,7 +338,8 @@ private class VideoDecoder(
                     if (referenceChain.needsKeyFrame && lastConfig != null && outputSurface != null) requestKeyFrameIfDue()
                 } catch (error: Exception) {
                     if (running) Log.e(TAG, "video decoder job failed: ${job?.javaClass?.simpleName}", error)
-                    if (running) report("decoder error ${error.javaClass.simpleName}; waiting for keyframe")
+                    if (running) report(errorReport("decoder error", error))
+                    fallBackFromSoftwareDecoder(error)
                     releaseDecoder()
                     referenceChain.reset()
                     requestKeyFrameIfDue()
@@ -322,7 +348,8 @@ private class VideoDecoder(
                     // 逃出 run() 即线程死亡 → 进程被杀（用户反馈"视频流突然变大就闪退"）。
                     // 这里按普通解码失败处理：释放解码器、等下一个关键帧，保住进程。
                     if (running) Log.e(TAG, "video decoder job crashed: ${job?.javaClass?.simpleName}", error)
-                    if (running) report("decoder crashed ${error.javaClass.name}; waiting for keyframe")
+                    if (running) report(errorReport("decoder crashed", error))
+                    fallBackFromSoftwareDecoder(error)
                     releaseDecoder()
                     referenceChain.reset()
                     requestKeyFrameIfDue()
@@ -362,7 +389,8 @@ private class VideoDecoder(
             report(
                 "Video: $mime decoders=${decoderNamesFor(mime)} " +
                     "software=${softwareDecoderNameFor(mime) ?: "none"} " +
-                    "preferSoftware=$preferSoftwareHevcDecoder",
+                    "preferSoftware=$preferSoftwareHevcDecoder " +
+                    "probe=${codecProbeNote()}",
             )
         }
         val csd = if (codec == VideoCodec.H265) {
@@ -447,7 +475,7 @@ private class VideoDecoder(
         // ~300 ms/frame stalls and endless keyframe recovery. Prefer a stock software
         // decoder for both AVC and HEVC when the user opts in. API < 29 has no
         // MediaCodecInfo.isSoftwareOnly(), so fall back to name prefixes there.
-        if (preferSoftwareHevcDecoder) {
+        if (preferSoftwareHevcDecoder && !softwareDecoderDisabled) {
             // API16 适配：MediaCodecList(REGULAR_CODECS).codecInfos 是 API 21+；
             // 低版本既无该常量也无 isEncoder/supportedTypes，无法按 mime 筛软解，
             // 直接跳过优化分支，交由 createDecoderByType 兜底。
@@ -464,8 +492,16 @@ private class VideoDecoder(
                 }
             } else {
                 // M6e：API16 也要能挑软解（低版本分支就是靠软解绕开厂商硬解异常）。
-                // 老 MediaCodecList 只能反射；找不到软解组件就照旧用 createDecoderByType。
-                val name = softwareDecoderNameFor(mime)
+                // M6i：T43 曾误判"清单枚举恒为空"；T44 已证实 `MediaCodecList.static` 能拿到 38 个
+                // 组件（`MediaCodec.static` 才是 NoSuchMethodException）。这里仍走 probe 兜底。
+                val name = probeSoftwareDecoderName(mime)
+                if (!softwareProbeLogged) {
+                    softwareProbeLogged = true
+                    report(
+                        "Video: software decoder probe mime=$mime name=${name ?: "none"} " +
+                            "probe=${codecProbeNote()}",
+                    )
+                }
                 if (name != null) {
                     try {
                         return MediaCodec.createByCodecName(name)
@@ -535,7 +571,21 @@ private class VideoDecoder(
             dequeue = { codec.dequeueInputBuffer(INPUT_TIMEOUT_US) },
         )
         if (index < 0) { recover("video decoder input stalled"); return }
-        val input = checkNotNull(codecInputBuffer(codec, index)) { "Decoder input buffer unavailable" }
+        val input = codecInputBuffer(codec, index)
+        if (input == null) {
+            // M6j：`checkNotNull` 抛的就是 IllegalStateException —— 很可能正是 T44 里每帧
+            // `decoder error IllegalStateException` 的来源（API<21 走 getInputBuffers()[index]）。
+            // 现在把它显式报出来（含数组长度），而不是被泛化成"某处 IllegalStateException"。
+            report(
+                "Video: input buffer unavailable index=$index " +
+                    "inputBuffers=${runCatching { codec.inputBuffers?.size }.getOrNull()} " +
+                    "api=${Build.VERSION.SDK_INT}",
+            )
+            releaseDecoder()
+            referenceChain.reset()
+            requestKeyFrameIfDue()
+            return
+        }
         input.clear()
         if (annexB.size <= input.remaining()) {
             input.put(annexB)
@@ -546,6 +596,33 @@ private class VideoDecoder(
             return
         }
         drainOutput(codec)
+    }
+
+    /**
+     * M6j：`decoder error ${简单类名}` 这种日志在 T44 把原因完全丢掉了（只有 logcat 有堆栈）。
+     * 这里把 **message** 一定带上，并把**第一条**的堆栈前几帧写进文件日志。
+     */
+    private fun errorReport(prefix: String, error: Throwable): String {
+        val detail = error.message?.let { ": $it" } ?: ""
+        if (!decoderErrorDetailLogged.compareAndSet(false, true)) {
+            return "$prefix ${error.javaClass.simpleName}$detail; waiting for keyframe"
+        }
+        val frames = error.stackTrace.take(ERROR_STACK_FRAMES)
+            .joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}" }
+        return "$prefix ${error.javaClass.simpleName}$detail; waiting for keyframe stack=$frames"
+    }
+
+    /**
+     * M6j：软解一旦在真机上失败，就**永久回落到默认解码器**，并明确告诉用户原因。
+     * 否则"勾了强制软解"= 永久无画面（T44：`shown=0.0fps`、每帧 `IllegalStateException`）。
+     */
+    private fun fallBackFromSoftwareDecoder(error: Throwable) {
+        if (!preferSoftwareHevcDecoder || softwareDecoderDisabled) return
+        softwareDecoderDisabled = true
+        report(
+            "Video: 软解在本机不可用（${error.javaClass.simpleName}" +
+                (error.message?.let { ": $it" } ?: "") + "），已自动回落默认解码器",
+        )
     }
 
     private fun recover(reason: String, rebuildDecoder: Boolean = true) {
@@ -632,6 +709,8 @@ private class VideoDecoder(
         const val TAG = "xcertplay-usb"
         const val MAX_INPUT_SIZE = 8 * 1024 * 1024
         const val INPUT_TIMEOUT_US = 10_000L
+        // M6j：解码失败首次落盘时附带的堆栈帧数（够定位"是哪一步抛的"即可）。
+        const val ERROR_STACK_FRAMES = 4
         // 可容忍的最大排队延迟：帧从到达到被解码超过它，就判为"积压"——丢队列 + 等关键帧。
         // M6b：250ms → 350ms。C8815 上解码偶发被抢占（processMaxUs 峰值 111ms/包），250ms 会被
         // 误判成积压而频繁 forceKeyFrame（每次触发画面冻结到关键帧到达，主观上更卡）；
@@ -1477,61 +1556,178 @@ private fun trackUnderruns(track: AudioTrack): Int =
  * （`catch (Exception)` 与 `catch (Throwable)` 都拦不住，因为进程不是被 Java 异常杀掉的）。
  * 查组件列表只是读 media_codecs.xml，**不实例化组件**，所以安全。
  *
- * API16 的 MediaCodecList 只有无参构造 + getCodecCount/getCodecInfoAt，而这三者在 API21 起被
- * `MediaCodecList(int kind)` + `getCodecInfos()` 取代、**已从 compileSdk 34 的 android.jar 里移除**，
- * 编译期无法直接调用 —— 低版本只能反射调用设备上真实存在的这些方法。
+ * ⚠️ **M6h 修正（T43 实证，勿回退）**：低版本**不能**走 `MediaCodecList` —— 那个类是
+ * **API 21 才引入**的，在 C8815（API16）上 `Class.forName("android.media.MediaCodecList")`
+ * 直接抛异常，于是清单恒为空：日志里是 `video/avc decoders=[] software=none`，
+ * `softwareDecoderNameFor` 恒返 null ⇒ **「强制软解」在 API16 上等于没开**（勾了也回落厂商硬解）。
+ * API16–20 的正确入口是 **`MediaCodec.getCodecCount()` / `getCodecInfoAt(int)`**（均为静态，
+ * 也已从 compileSdk 34 的 android.jar 移除，同样只能反射）。
  *
  * 查询本身失败时的兜底：只禁掉"API<21 上的 OPUS"这个已知会崩的组合，其余放行——
  * 免得探针异常反而把能用的 AAC 也一起禁掉、连音乐都没声音了。
  */
-internal fun codecComponentExists(mime: String, encoder: Boolean): Boolean = try {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any {
-            it.isEncoder == encoder && mime in it.supportedTypes
-        }
-    } else {
-        val clazz = Class.forName("android.media.MediaCodecList")
-        val list = clazz.getDeclaredConstructor().newInstance()
-        val codecCount = clazz.getMethod("getCodecCount").invoke(list) as Int
-        val getCodecInfoAt = clazz.getMethod("getCodecInfoAt", java.lang.Integer.TYPE)
-        (0 until codecCount).any { index ->
-            val info = getCodecInfoAt.invoke(list, index) as MediaCodecInfo
-            info.isEncoder == encoder && mime in info.supportedTypes
-        }
+internal fun codecComponentExists(mime: String, encoder: Boolean): Boolean {
+    val infos = codecProbe.infos
+    if (infos.isNotEmpty()) {
+        return infos.any { it.isEncoder == encoder && mime in it.supportedTypes }
     }
-} catch (error: Throwable) {
-    Log.w("xcertplay-usb", "codec component query failed mime=$mime encoder=$encoder", error)
-    !(Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP && mime == MediaFormat.MIMETYPE_AUDIO_OPUS)
+    return !(Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP &&
+        mime == MediaFormat.MIMETYPE_AUDIO_OPUS)
 }
 
 /** M6e：列出本机所有支持 mime 的解码器名字（诊断用，确认这台机器到底有没有软解可用）。 */
-internal fun decoderNamesFor(mime: String): List<String> = try {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
-            .filter { !it.isEncoder && mime in it.supportedTypes }
-            .map { it.name }
-    } else {
-        // API16 适配：MediaCodecList()/getCodecCount()/getCodecInfoAt() 已从 compileSdk 34 移除，只能反射。
-        val clazz = Class.forName("android.media.MediaCodecList")
-        val list = clazz.getDeclaredConstructor().newInstance()
-        val codecCount = clazz.getMethod("getCodecCount").invoke(list) as Int
+internal fun decoderNamesFor(mime: String): List<String> =
+    codecProbe.infos
+        .filter { !it.isEncoder && mime in it.supportedTypes }
+        .map { it.name }
+
+/** M6i：探测结果的一句话摘要（进文件日志，用于判断"空表"到底是哪一步挂了）。 */
+internal fun codecProbeNote(): String = codecProbe.note
+
+/**
+ * M6i：本机编解码器清单的探测结果。
+ *
+ * T43/T44 两次实测在 C8815 上都得到 `decoders=[]`，但当时失败原因只写了 logcat、
+ * **没有进文件日志**，等于没有证据。这里改成：逐策略尝试，并把**每个策略的异常类型与消息**
+ * 记进 [note]，随视频清单行一起落盘，下一次就能直接看到是哪一步、为什么挂。
+ */
+private class CodecProbe(val infos: List<MediaCodecInfo>, val note: String)
+
+private val codecProbe: CodecProbe by lazy { probeCodecList() }
+
+private class LegacyCodecProbe(val name: String, val load: () -> List<MediaCodecInfo>)
+
+/**
+ * API16–20 的候选探测策略。官方入口是 [MediaCodec] 的静态方法（[MediaCodecList] 是 API21 才有的类），
+ * 但厂商 ROM 可能把它放在别处，故逐个试；顺序即优先级。
+ */
+private val LEGACY_CODEC_PROBES = listOf(
+    LegacyCodecProbe("MediaCodec.static") {
+        val clazz = Class.forName("android.media.MediaCodec")
+        val count = clazz.getMethod("getCodecCount").invoke(null) as Int
         val getCodecInfoAt = clazz.getMethod("getCodecInfoAt", java.lang.Integer.TYPE)
-        (0 until codecCount).mapNotNull { index ->
-            val info = getCodecInfoAt.invoke(list, index) as MediaCodecInfo
-            if (!info.isEncoder && mime in info.supportedTypes) info.name else null
+        (0 until count).mapNotNull { index ->
+            getCodecInfoAt.invoke(null, index) as? MediaCodecInfo
+        }
+    },
+    LegacyCodecProbe("MediaCodecList.static") {
+        val clazz = Class.forName("android.media.MediaCodecList")
+        val count = clazz.getMethod("getCodecCount").invoke(null) as Int
+        val getCodecInfoAt = clazz.getMethod("getCodecInfoAt", java.lang.Integer.TYPE)
+        (0 until count).mapNotNull { index ->
+            getCodecInfoAt.invoke(null, index) as? MediaCodecInfo
+        }
+    },
+    LegacyCodecProbe("MediaCodecList.instance") {
+        val clazz = Class.forName("android.media.MediaCodecList")
+        val instance = clazz.getConstructor(java.lang.Integer.TYPE).newInstance(0)
+        val count = clazz.getMethod("getCodecCount").invoke(instance) as Int
+        val getCodecInfoAt = clazz.getMethod("getCodecInfoAt", java.lang.Integer.TYPE)
+        (0 until count).mapNotNull { index ->
+            getCodecInfoAt.invoke(instance, index) as? MediaCodecInfo
+        }
+    },
+)
+
+private fun probeCodecList(): CodecProbe {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+        return try {
+            val infos = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.toList()
+            CodecProbe(infos, "MediaCodecList=${infos.size}")
+        } catch (error: Throwable) {
+            CodecProbe(emptyList(), "MediaCodecList=" + describe(error))
         }
     }
-} catch (error: Throwable) {
-    Log.w("xcertplay-usb", "codec list query failed mime=$mime", error)
-    emptyList()
+    val reasons = StringBuilder()
+    for (strategy in LEGACY_CODEC_PROBES) {
+        try {
+            val infos = strategy.load()
+            if (infos.isNotEmpty()) {
+                reasons.append(strategy.name).append("=ok(").append(infos.size).append(')')
+                return CodecProbe(infos, reasons.toString())
+            }
+            reasons.append(strategy.name).append("=empty;")
+        } catch (error: Throwable) {
+            reasons.append(strategy.name).append('=').append(describe(error)).append(';')
+        }
+    }
+    return CodecProbe(emptyList(), reasons.toString())
 }
+
+private fun describe(error: Throwable): String =
+    error.javaClass.simpleName + (error.message?.let { "($it)" } ?: "")
+
+/**
+ * M6i：给 `createDecoder` 用的软解选择 —— **清单优先，拿不到清单就按"已知软解组件名"逐个试**。
+ *
+ * T44 实测：C8815 上清单恒为空，于是"强制软解"等于没开（勾了仍回落厂商硬解）。兜底分两级：
+ * ① 只读 ROM 的 `media_codecs.xml` 判断组件名是否声明（零风险，能读到时不给 ROM 任何机会崩）；
+ * ② 读不到 XML 才真去 `createByCodecName` 试一把，并逐个 try/catch。
+ *
+ * ⚠️ 只在用户**显式打开"强制软解"**时才调用（风险受控）。T32 的教训是"按 mime 查找不存在的
+ * 组件"会在厂商 OMX 层原生崩进程，所以这里只按**具体组件名**试、并优先走只读判断。
+ */
+internal fun probeSoftwareDecoderName(mime: String): String? {
+    decoderNamesFor(mime).firstOrNull(::isSoftwareDecoderName)?.let { return it }
+    for (name in KNOWN_SOFTWARE_DECODERS[mime].orEmpty()) {
+        when (codecNameDeclaredInRom(name)) {
+            true -> return name
+            false -> continue
+            null -> if (canCreateCodec(name)) return name
+        }
+    }
+    return null
+}
+
+private fun isSoftwareDecoderName(name: String): Boolean =
+    name.startsWith("OMX.google.") || name.startsWith("c2.android.") ||
+        name.startsWith("c2.soft.") || name.contains("sw.decoder", ignoreCase = true)
+
+/** 读 ROM 的 media_codecs.xml 判断组件名是否存在（只读文件，零风险）。null = 哪个都读不到。 */
+private fun codecNameDeclaredInRom(name: String): Boolean? {
+    for (path in MEDIA_CODECS_XML_PATHS) {
+        val file = java.io.File(path)
+        if (!file.canRead()) continue
+        val declared = try {
+            file.readText().contains(name)
+        } catch (_: Throwable) {
+            null
+        }
+        if (declared != null) return declared
+    }
+    return null
+}
+
+private fun canCreateCodec(name: String): Boolean = try {
+    MediaCodec.createByCodecName(name).release()
+    true
+} catch (error: Throwable) {
+    Log.w("xcertplay-usb", "software decoder probe failed name=$name", error)
+    false
+}
+
+/** 已知的通用软解组件名（按 AOSP 惯例命名；老机器上通常存在）。 */
+private val KNOWN_SOFTWARE_DECODERS = mapOf(
+    MediaFormat.MIMETYPE_VIDEO_AVC to listOf(
+        "OMX.google.h264.decoder",
+        "c2.android.avc.decoder",
+    ),
+    MediaFormat.MIMETYPE_VIDEO_HEVC to listOf(
+        "OMX.google.hevc.decoder",
+        "c2.android.hevc.decoder",
+    ),
+)
+
+private val MEDIA_CODECS_XML_PATHS = listOf(
+    "/system/etc/media_codecs.xml",
+    "/etc/media_codecs.xml",
+    "/vendor/etc/media_codecs.xml",
+    "/system/vendor/etc/media_codecs.xml",
+)
 
 /**
  * M6e：挑一个软件解码器（API<29 没有 isSoftwareOnly，按厂商前缀判断）。
  * 8815/C8815 这类老机型的厂商硬解偶发异常时，用它做兜底/二分定位。
  */
 internal fun softwareDecoderNameFor(mime: String): String? =
-    decoderNamesFor(mime).firstOrNull { name ->
-        name.startsWith("OMX.google.") || name.startsWith("c2.android.") ||
-            name.startsWith("c2.soft.") || name.contains("sw.decoder", ignoreCase = true)
-    }
+    decoderNamesFor(mime).firstOrNull(::isSoftwareDecoderName)

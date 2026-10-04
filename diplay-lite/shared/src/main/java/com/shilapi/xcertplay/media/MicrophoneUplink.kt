@@ -3,6 +3,9 @@ package com.shilapi.xcertplay.media
 import android.media.AudioFormat as AndroidAudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AudioEffect
+import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.Process
 import android.util.Log
@@ -33,6 +36,8 @@ internal class MicrophoneUplink(
     @Volatile private var recorder: AudioRecord? = null
     @Volatile private var socket: DatagramSocket? = null
     @Volatile private var opusEncoder: OpusFrameEncoder? = null
+    private var echoCanceler: AcousticEchoCanceler? = null
+    private var noiseSuppressor: NoiseSuppressor? = null
     private var thread: Thread? = null
 
     /** Reports a start failure into the diagnostic log so field reports show why calls went silent. */
@@ -139,6 +144,7 @@ internal class MicrophoneUplink(
         socket = nextSocket
         opusEncoder = nextEncoder
         return try {
+            val effects = attachAudioEffects(nextRecorder)
             nextRecorder.startRecording()
             thread = Thread({
                 // 麦克风采集 + libopus 编码：上行是通话体验的一等公民，同样抬到 URGENT_AUDIO。
@@ -152,13 +158,14 @@ internal class MicrophoneUplink(
                 TAG,
                 "microphone uplink started type=${config.audioType} codec=${config.codec} " +
                     "encoder=$encoderBackend source=$chosenSource rate=${config.sampleRate} " +
-                    "channels=${config.channels} frameMs=${config.frameMillis} port=${config.port}",
+                    "channels=${config.channels} frameMs=${config.frameMillis} " +
+                    "port=${config.port} $effects",
             )
             // 成功路径也落文件日志（此前只写 logcat，实测报告里"查无此话"，见 #30）。
             diagnostics?.invoke(
                 "Microphone uplink started type=${config.audioType} codec=${config.codec} " +
                     "encoder=$encoderBackend source=$chosenSource rate=${config.sampleRate} " +
-                    "channels=${config.channels} frameMs=${config.frameMillis}",
+                    "channels=${config.channels} frameMs=${config.frameMillis} $effects",
             )
             true
         } catch (error: Exception) {
@@ -183,6 +190,48 @@ internal class MicrophoneUplink(
             MediaRecorder.AudioSource.MIC,
         )
         else -> listOf(MediaRecorder.AudioSource.MIC)
+    }
+
+    /**
+     * M6h 回声消除：4.1 上 `VOICE_COMMUNICATION`(7) 起不来，实际跑的是 `VOICE_RECOGNITION`(6)
+     * —— 该源**不带平台 AEC**，所以对方能听到回声（T37 用户反馈）。这里把平台 AEC/NS
+     * 显式挂到录音会话上；某台机器不支持就只记日志，**绝不阻断收音**。
+     */
+    private fun attachAudioEffects(recorder: AudioRecord): String {
+        val session = recorder.audioSessionId
+        if (session <= 0) return "audioEffect=session-unavailable"
+        val aec = enableEffect("AEC", AcousticEchoCanceler.isAvailable()) {
+            AcousticEchoCanceler.create(session)
+        }
+        val ns = enableEffect("NS", NoiseSuppressor.isAvailable()) {
+            NoiseSuppressor.create(session)
+        }
+        echoCanceler = aec
+        noiseSuppressor = ns
+        return "audioEffect=aec:${if (aec != null) "on" else "off"} " +
+            "ns:${if (ns != null) "on" else "off"} sessionId=$session"
+    }
+
+    private fun <T : AudioEffect> enableEffect(
+        name: String,
+        available: Boolean,
+        create: () -> T?,
+    ): T? {
+        if (!available) {
+            diagnostics?.invoke("Microphone $name unavailable on this device")
+            return null
+        }
+        return try {
+            create()?.also { effect ->
+                effect.enabled = true
+                if (!effect.enabled) {
+                    diagnostics?.invoke("Microphone $name created but refused to enable")
+                }
+            }
+        } catch (error: Throwable) {
+            Log.w(TAG, "microphone $name attach failed", error)
+            null
+        }
     }
 
     // API16 适配：绑 IPv6 通配 [::] 在本机 ROM 上会抛 “Can't bind to a link-local address
@@ -334,6 +383,20 @@ internal class MicrophoneUplink(
         val currentEncoder = opusEncoder
         opusEncoder = null
         currentEncoder?.close()
+        val currentEcho = echoCanceler
+        echoCanceler = null
+        try {
+            currentEcho?.release()
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        val currentNoise = noiseSuppressor
+        noiseSuppressor = null
+        try {
+            currentNoise?.release()
+        } catch (_: Exception) {
+            // Best effort.
+        }
     }
 
     private companion object {

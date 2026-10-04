@@ -60,9 +60,15 @@ class AudioStream(
         if (data.receiveBufferSize < AUDIO_RECEIVE_BUFFER_BYTES) {
             runCatching { data.receiveBufferSize = AUDIO_RECEIVE_BUFFER_BYTES }
         }
-        val control = bindAnyPort()
+        val control = bindControlPort()
         dataSocket = data
         controlSocket = control
+        // M6i：把两端端口的**绑定族**落盘。T43/T44 两份日志里控制口零入站（连 PT=84 都没有），
+        // 而数据口正常 —— 有这一行才能分清"对方没发"还是"我们绑错了族收不到"。
+        onDiagnostic(
+            "Audio: ports type=$streamType dataPort=${data.localPort}(${familyOf(data)}) " +
+                "controlPort=${control.localPort}(${familyOf(control)})",
+        )
         // 收包/解密/入队单独一条线程，**刻意不与后面的解码/写轨线程合并**（M6b 决策）：
         // 合并后若解码（libopus 或 AudioTrack 写）偶发耗时，socket.receive 就被顶住，
         // 内核 UDP 接收缓冲溢出 = 真丢包（比"多一次线程切换"严重得多）。现在解码线程再慢，
@@ -175,16 +181,111 @@ class AudioStream(
         } finally { stats.flush(ended = true) }
     }
 
+    /**
+     * M6h 取证：**controlPort 不是"没用的口"**。
+     *
+     * 依 AirPlay 的 RTCP 约定（openairplay: RTP Streams），这条 UDP 上跑的是：
+     *   `PT=84` time sync（8B 头 + 8B NTP + 4B 下一个 RTP 时间戳，每秒一次）
+     *   `PT=85` 重传请求（8B 头 + 首个丢包 SN(2B) + 丢包个数(2B)，Marker=1）
+     *   `PT=86` 重传应答（8B 头 + 一条完整音频 RTP 包）
+     * 而 `96` 才是音频数据。我们此前只 receive 后丢弃 —— 于是丢包永远补不回来（T43 结论）。
+     *
+     * 这里先把流量如实打出来取证：谁在发、发什么、86 补的是哪些 SN。**零行为改动**——
+     * 不改字节、不回包、不重排；等看清了再决定要不要实现「重排 + 补包」。
+     */
     private fun runControl(socket: DatagramSocket) {
         val buffer = ByteArray(DATAGRAM_BYTES)
+        val counts = HashMap<Int, Int>()
+        val detailsLogged = HashMap<Int, Int>()
+        var total = 0
+        var lastSummarisedTotal = -1
+        var nextSummaryNanos = System.nanoTime() + CONTROL_SUMMARY_INTERVAL_NANOS
         while (!closed.get()) {
+            val packet = DatagramPacket(buffer, buffer.size)
             try {
-                socket.receive(DatagramPacket(buffer, buffer.size))
+                socket.receive(packet)
             } catch (_: Exception) {
                 if (closed.get()) return
+                continue
+            }
+            val length = packet.length
+            if (length < CONTROL_HEADER_LEN) {
+                onDiagnostic("Audio: control rx type=$streamType short packet bytes=$length")
+                continue
+            }
+            val headerByte = buffer[1].toInt() and 0xff
+            val payloadType = headerByte and 0x7f
+            val marker = (headerByte and 0x80) != 0
+            val sequence = readU16Be(buffer, 2)
+            total++
+            if (total == 1) {
+                onDiagnostic(
+                    "Audio: control peer type=$streamType from=" +
+                        "${packet.address?.hostAddress}:${packet.port}",
+                )
+            }
+            // API16 适配：HashMap.merge 是 Java 8 API，低版本别用（同 computeIfAbsent 的坑）。
+            val seen = (counts[payloadType] ?: 0) + 1
+            counts[payloadType] = seen
+            val detailed = detailsLogged[payloadType] ?: 0
+            if (detailed < CONTROL_DETAIL_PACKETS) {
+                detailsLogged[payloadType] = detailed + 1
+                onDiagnostic(
+                    "Audio: control rx type=$streamType pt=$payloadType marker=$marker " +
+                        "len=$length seq=$sequence ${controlDetail(buffer, length, payloadType)}",
+                )
+            } else if (seen % CONTROL_LOG_INTERVAL == 0) {
+                onDiagnostic(
+                    "Audio: control rx type=$streamType pt=$payloadType n=$seen " +
+                        "len=$length seq=$sequence ${controlDetail(buffer, length, payloadType)}",
+                )
+            }
+            val now = System.nanoTime()
+            if (now >= nextSummaryNanos) {
+                nextSummaryNanos = now + CONTROL_SUMMARY_INTERVAL_NANOS
+                if (total != lastSummarisedTotal) {
+                    lastSummarisedTotal = total
+                    onDiagnostic(
+                        "Audio: control summary type=$streamType total=$total " +
+                            counts.entries.sortedBy { it.key }
+                                .joinToString(" ") { "pt${it.key}=${it.value}" },
+                    )
+                }
             }
         }
     }
+
+    /** 逐 PT 解析取证字段；只读 buffer，不做任何修改。 */
+    private fun controlDetail(buffer: ByteArray, length: Int, payloadType: Int): String =
+        when (payloadType) {
+            CONTROL_PT_RETRANSMIT_REQUEST -> {
+                if (length >= CONTROL_HEADER_LEN + 4) {
+                    val firstLost = readU16Be(buffer, CONTROL_HEADER_LEN)
+                    val lostCount = readU16Be(buffer, CONTROL_HEADER_LEN + 2)
+                    "firstLostSn=$firstLost lostCount=$lostCount"
+                } else {
+                    "truncated"
+                }
+            }
+            CONTROL_PT_RETRANSMIT_REPLY -> {
+                if (length >= CONTROL_HEADER_LEN + 4) {
+                    // 应答体是一条完整音频 RTP 包，其序号在 8B 控制头之后又偏移 2 字节。
+                    val resentSn = readU16Be(buffer, CONTROL_HEADER_LEN + 2)
+                    val resentPt = buffer[CONTROL_HEADER_LEN + 1].toInt() and 0x7f
+                    "resentSn=$resentSn resentPt=$resentPt"
+                } else {
+                    "truncated"
+                }
+            }
+            CONTROL_PT_TIME_SYNC -> {
+                if (length >= CONTROL_HEADER_LEN + 12) {
+                    "nextRtpTimestamp=" + readU32Be(buffer, CONTROL_HEADER_LEN + 8)
+                } else {
+                    "truncated"
+                }
+            }
+            else -> "head=" + buffer.copyOf(minOf(length, 16)).toHexString()
+        }
 
     // API16 车机实测：绑 IPv6 通配 [::] 抛异常会让该流被拒，回退 IPv4 通配（本热点对端为 IPv4）。
     private fun bindAnyPort(): DatagramSocket {
@@ -203,11 +304,41 @@ class AudioStream(
         }
     }
 
+    /**
+     * M6i：控制口**优先绑 IPv4**（本环境车机链路是 IPv4，见 `family=IPv4`）。
+     *
+     * 起因：T43/T44 两份日志里 controlPort **一个包都没收到**（连每秒一次的 PT=84 time sync 都没有），
+     * 而音频数据口收得好好的；两端本来都走 `bindAnyPort()`（先试 `[::]`）。
+     * 先把控制口钉到 IPv4，用来切开"iPhone 不发"与"我们收不到"这两种可能；
+     * 若之后开始出现 `pt=84/85/86`，就证明是绑定族问题。
+     */
+    private fun bindControlPort(): DatagramSocket {
+        val socket = DatagramSocket(null)
+        socket.reuseAddress = true
+        return try {
+            socket.bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
+            socket
+        } catch (error: Exception) {
+            onDiagnostic("audio 控制口 IPv4 绑定失败，回退 IPv6 通配: ${error.message}")
+            runCatching { socket.close() }
+            DatagramSocket(null).apply {
+                reuseAddress = true
+                bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+            }
+        }
+    }
+
+    private fun familyOf(socket: DatagramSocket): String =
+        if (socket.localAddress is java.net.Inet6Address) "IPv6" else "IPv4"
+
     private fun readU32Be(source: ByteArray, offset: Int): Int =
         ((source[offset].toInt() and 0xff) shl 24) or
             ((source[offset + 1].toInt() and 0xff) shl 16) or
             ((source[offset + 2].toInt() and 0xff) shl 8) or
             (source[offset + 3].toInt() and 0xff)
+
+    private fun readU16Be(source: ByteArray, offset: Int): Int =
+        ((source[offset].toInt() and 0xff) shl 8) or (source[offset + 1].toInt() and 0xff)
 
     private fun ByteArray.toHexString(): String =
         joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
@@ -222,6 +353,15 @@ class AudioStream(
         const val TAIL_LEN = TAG_LEN + NONCE_LEN
         const val FIRST_PACKET_LOG_COUNT = 3
         const val PACKET_LOG_INTERVAL = 100
+
+        // M6h 控制口取证（见 runControl）：PT 语义与日志节流参数。
+        const val CONTROL_HEADER_LEN = 8
+        const val CONTROL_PT_TIME_SYNC = 84
+        const val CONTROL_PT_RETRANSMIT_REQUEST = 85
+        const val CONTROL_PT_RETRANSMIT_REPLY = 86
+        const val CONTROL_DETAIL_PACKETS = 3
+        const val CONTROL_LOG_INTERVAL = 100
+        const val CONTROL_SUMMARY_INTERVAL_NANOS = 10_000_000_000L
     }
 }
 

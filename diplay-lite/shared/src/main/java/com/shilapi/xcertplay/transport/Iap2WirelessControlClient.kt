@@ -37,7 +37,9 @@ class Iap2WirelessControlClient(
             "timeoutMillis must be in 1..$MAX_TIMEOUT_MILLIS or NO_TIMEOUT_MILLIS"
         }
 
-        val deadlineNanos = if (timeoutMillis == NO_TIMEOUT_MILLIS) {
+        // 这个截止时间只约束「建链窗口」：识别/鉴权/订阅必须在此窗口内完成，卡住就 TIMED_OUT。
+        // 一旦 onReady()（订阅已发出，iAP2 进入稳态）就放开为无超时 —— 见下方 onReady() 之后。
+        var deadlineNanos = if (timeoutMillis == NO_TIMEOUT_MILLIS) {
             Long.MAX_VALUE
         } else {
             deadlineAfter(timeoutMillis)
@@ -56,6 +58,12 @@ class Iap2WirelessControlClient(
         stage = Iap2WirelessControlStage.SUBSCRIBED
         onProgress("iap2 subscriptions sent")
         onReady()
+        // M6g：进入稳态后不再设总超时。iAP2 是会话控制面（Now Playing / 导航 / 电话 / Siri）
+        // 的唯一入口；控制环一退，就没人再读 RFCOMM，控制面全哑而音视频照常
+        // （T43 实测：5 分钟到点后 `iap2 rx` 归零、`video/audio stats` 仍正常）。
+        // 真交接的隧道路径本来就传 NO_TIMEOUT_MILLIS，这里让「蓝牙承载 iAP2」的降级态行为一致。
+        // 退出仍由 socket 关闭（session.isClosed → CHANNEL_CLOSED）驱动，不会泄漏线程。
+        deadlineNanos = Long.MAX_VALUE
 
         var forwardedFrames = 0
         var wifiConfigurationsSent = 0

@@ -156,6 +156,19 @@ class CarPlayController(
     private val wirelessHandoffRequested = AtomicBoolean(false)
     private val wirelessTunnelReady = AtomicBoolean(false)
     private val wirelessActiveReported = AtomicBoolean(false)
+
+    /**
+     * M6g：已判定为「降级态」——iPhone 已建立 Wi-Fi A/V，但不请求 type-130 iAP2 隧道，
+     * 于是蓝牙 RFCOMM 继续承载 iAP2 控制面（见 armWirelessHandoffWatchdog）。
+     *
+     * 与 [wirelessActiveReported] 刻意分开：后者是「真交接完成（隧道就绪且已放开蓝牙）」，
+     * 还被 CHANNEL_CLOSED / catch 分支用来决定「保活」还是「拆栈失败」；若在降级态复用它，
+     * 蓝牙 RFCOMM 真断时就再也不会拆栈，会留下僵尸会话。
+     */
+    private val wirelessDegradedActive = AtomicBoolean(false)
+
+    /** M6h：蓝牙 iAP2 掉链后的自动重连计数；只在「会话真的建立」或「用户手动重连」时清零。 */
+    private val wirelessRetryCount = AtomicInteger(0)
     private val wirelessGeneration = AtomicInteger(0)
     private val wirelessConnectionProof = WirelessConnectionProof<AirPlaySession>()
     private var lastReportedStatus: CarPlayStatus? = null
@@ -251,6 +264,7 @@ class CarPlayController(
         synchronized(this) {
             if (closed) return
         }
+        wirelessRetryCount.set(0)
         startMfi()
     }
 
@@ -264,6 +278,8 @@ class CarPlayController(
     /** 重跑无线流水线（热点 -> 蓝牙 -> AirPlay）。保留原方法名便于上层复用。 */
     fun reconnectIphone() = synchronized(lifecycleLock) {
         if (closed) return
+        // M6h：用户手动重连 = 重新给满自动重试额度，否则上一轮用尽的计数会让这次秒失败。
+        wirelessRetryCount.set(0)
         if (mfiSession == null) {
             startMfi()
         } else {
@@ -365,6 +381,7 @@ class CarPlayController(
         wirelessHandoffRequested.set(false)
         wirelessTunnelReady.set(false)
         wirelessActiveReported.set(false)
+        wirelessDegradedActive.set(false)
         onStatus(CarPlayStatus.StartingHotspot)
         val generation = wirelessGeneration.incrementAndGet()
         executor.execute {
@@ -609,7 +626,10 @@ class CarPlayController(
                     }
                 }
                 Iap2WirelessControlTerminal.TIMED_OUT ->
-                    if (!wirelessActiveReported.get()) {
+                    // M6g：降级态下 iAP2 挂在蓝牙上、音视频照常，「控制窗口结束」不等于会话结束，
+                    // 不要报 ControlEnded 误导（T43 实测过这个误报）。真交接态由
+                    // wirelessActiveReported 抑制；两者都没发生（iAP2 建链就没起来）才如实上报。
+                    if (!wirelessActiveReported.get() && !wirelessDegradedActive.get()) {
                         onStatus(CarPlayStatus.ControlEnded)
                     }
             }
@@ -623,9 +643,52 @@ class CarPlayController(
                 debugLog("wireless bring-up failed", error)
                 closeWirelessStack()
                 if (error is Error) throw error
-                fail(error)
+                // M6h：链路掉线（abort/reset/RFCOMM 断）不再直接停在 Failed 要手点，
+                // 自动重试若干次；热点没开、配置不合法这类确定性失败仍如实报错。
+                if (isRetryableWirelessFailure(error)) {
+                    scheduleWirelessRetry(generation, error)
+                } else {
+                    fail(error)
+                }
             }
         }
+    }
+
+    /**
+     * M6h：判断是否值得自动重连。只认"链路掉了"这一族瞬时故障
+     * （T36 实测：微信电话期间 `IAP2 RX FAILED: Software caused connection abort`；
+     * RFCOMM 层也常见 `Connection refused` / `Service discovery failed`，T14 曾手点 7 次才连上）。
+     */
+    private fun isRetryableWirelessFailure(error: Throwable): Boolean {
+        val message = error.message.orEmpty().lowercase()
+        return RETRYABLE_WIRELESS_FAILURES.any { message.contains(it) }
+    }
+
+    /** M6h：延时后重跑无线流水线；额度用尽才把失败交给 UI。 */
+    private fun scheduleWirelessRetry(generation: Int, error: Throwable) {
+        val attempt = wirelessRetryCount.incrementAndGet()
+        if (attempt > MAX_WIRELESS_RETRIES) {
+            debugLog("wireless auto-retry exhausted after $MAX_WIRELESS_RETRIES attempts")
+            fail(error)
+            return
+        }
+        debugLog(
+            "wireless link dropped (${error.message ?: error.javaClass.simpleName}); " +
+                "auto-retry $attempt/$MAX_WIRELESS_RETRIES in $WIRELESS_RETRY_DELAY_MILLIS ms",
+        )
+        mainHandler.postDelayed(
+            {
+                if (
+                    closed ||
+                    phase != Phase.WIRELESS ||
+                    generation != wirelessGeneration.get()
+                ) {
+                    return@postDelayed
+                }
+                restartWireless()
+            },
+            WIRELESS_RETRY_DELAY_MILLIS,
+        )
     }
 
     private fun startWirelessTunnelControl(stream: BlockingDuplexByteStream): Boolean {
@@ -733,6 +796,7 @@ class CarPlayController(
     private fun maybeCompleteWirelessHandoff() {
         if (!wirelessHandoffRequested.get() || !wirelessTunnelReady.get()) return
         if (!wirelessActiveReported.compareAndSet(false, true)) return
+        wirelessRetryCount.set(0)
         val generation = wirelessGeneration.get()
         Thread(
             {
@@ -782,6 +846,10 @@ class CarPlayController(
                         //   不再拆栈/失败，保持「蓝牙 iAP2 控制 + Wi-Fi A/V」继续运行，避免可见重连循环。
                         // - 未渲染帧：会话并未真正建立，走作者逻辑拆栈并 fail。
                         if (wirelessConnectionProof.hasRenderedFrame(generation)) {
+                            // M6g：先置位再上报，避免与控制环超时分支竞态。
+                            wirelessDegradedActive.set(true)
+                            // M6h：会话已经可用（A/V 在跑），自动重试额度重新给满。
+                            wirelessRetryCount.set(0)
                             debugLog(
                                 "handoff degraded: keeping Bluetooth iAP2 + Wi-Fi A/V " +
                                     "(hasRenderedFrame, no type-130 iAP2 tunnel)",
@@ -972,6 +1040,7 @@ class CarPlayController(
         wirelessHandoffRequested.set(false)
         wirelessTunnelReady.set(false)
         wirelessActiveReported.set(false)
+        wirelessDegradedActive.set(false)
         debugLog("wireless teardown complete")
     }
 
@@ -1154,6 +1223,19 @@ class CarPlayController(
         private const val CONTROL_LOOP_TIMEOUT_MILLIS = 5 * 60_000L
         private const val LOCATION_CONTROL_LOOP_TIMEOUT_MILLIS = 24 * 60 * 60 * 1_000L
         private const val WIRELESS_HANDOFF_TIMEOUT_MILLIS = 45_000L
+        // M6h：链路掉线后的自动重连（次数 + 间隔）。
+        private const val MAX_WIRELESS_RETRIES = 3
+        private const val WIRELESS_RETRY_DELAY_MILLIS = 5_000L
+        private val RETRYABLE_WIRELESS_FAILURES = listOf(
+            "connection abort",
+            "iap2 link ended",
+            "connection reset",
+            "broken pipe",
+            "connection refused",
+            "service discovery failed",
+            "eof",
+            "closed before tunnel iap2 ready",
+        )
         private const val RFCOMM_CONNECT_TIMEOUT_MILLIS = 15_000L
         private const val EXECUTOR_CLOSE_TIMEOUT_MILLIS = 2_000L
         private const val ADAPTER_ADDRESS_PLACEHOLDER = "02:00:00:00:00:00"
