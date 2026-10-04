@@ -36,6 +36,12 @@ class Iap2LinkChannel private constructor(
     private var terminalFailure: Throwable? = null
     private var streamCloseStarted = false
 
+    // M6k6：链路生命周期环形记录。无线首握阶段 iPhone 静默掐线（EOF、零帧交换）时，
+    // awaitReady 路径原本不产生任何 trace（20:34 外测车机 8 轮全灭的日志即此形态），
+    // 这份记录让每次死亡都自带现场：发起了什么、收到了什么、死于哪个瞬间。
+    private val linkTraceNotes = ArrayDeque<String>()
+    private var workerStartNanos = 0L
+
     private val worker = Thread(::runPump, "xcertplay-iap2-link").apply {
         isDaemon = true
     }
@@ -55,6 +61,22 @@ class Iap2LinkChannel private constructor(
      * returns true.  It excludes the nine-byte iAP2 header and one-byte payload checksum.
      */
     fun peerMaxControlPayloadBytes(): Int? = synchronized(lock) { peerMaxControlPayloadBytes }
+
+    /** M6k6：链路事件环形记录快照，供上层在死亡路径导出现场。 */
+    fun recentLinkTrace(): List<String> = synchronized(lock) { linkTraceNotes.toList() }
+
+    private fun noteLink(event: String) = synchronized(lock) { noteLinkLocked(event) }
+
+    /** lock must already be held. */
+    private fun noteLinkLocked(event: String) {
+        if (linkTraceNotes.size >= LINK_TRACE_MAX) linkTraceNotes.removeFirst()
+        val elapsedMs = if (workerStartNanos == 0L) {
+            0L
+        } else {
+            (System.nanoTime() - workerStartNanos) / NANOS_PER_MILLISECOND
+        }
+        linkTraceNotes += "+${elapsedMs}ms $event"
+    }
 
     /**
      * Copies and queues one raw session-10 payload.  Returns false after close/termination or when
@@ -144,6 +166,8 @@ class Iap2LinkChannel private constructor(
     private fun runPump() {
         val engine = Iap2LinkEngine(linkConfig)
         try {
+            workerStartNanos = System.nanoTime()
+            noteLink("start initiator=$initiateNegotiation")
             engine.start(wiredInitiator = initiateNegotiation, nowMillis = nowMillis())
             while (!isClosing()) {
                 drainCommands(engine)
@@ -161,12 +185,19 @@ class Iap2LinkChannel private constructor(
                 if (isClosing()) return
                 when {
                     received == null -> Unit
-                    received.isEmpty() -> engine.feedEof()
-                    else -> engine.feed(received, nowMillis())
+                    received.isEmpty() -> {
+                        noteLink("rx EOF (peer closed stream)")
+                        engine.feedEof()
+                    }
+                    else -> {
+                        noteLink("rx ${received.size}B")
+                        engine.feed(received, nowMillis())
+                    }
                 }
             }
             finish(null)
         } catch (failure: Throwable) {
+            noteLink("worker failure: ${failure.message ?: failure.javaClass.simpleName}")
             if (failure is Error) {
                 finish(failure)
                 throw failure
@@ -194,7 +225,10 @@ class Iap2LinkChannel private constructor(
 
     private fun flush(engine: Iap2LinkEngine) {
         val bytes = engine.takeOutput()
-        if (bytes.isNotEmpty()) underlying.send(bytes)
+        if (bytes.isNotEmpty()) {
+            noteLink("tx ${bytes.size}B")
+            underlying.send(bytes)
+        }
     }
 
     /** Returns false when a link terminal event has been observed. */
@@ -207,6 +241,7 @@ class Iap2LinkChannel private constructor(
                         peerMaxControlPayloadBytes = engine.peerSynchronization().maxLength - 10
                     }
                     ready = event.value && !terminated
+                    noteLinkLocked("ready=${event.value} peerMax=$peerMaxControlPayloadBytes")
                     lock.notifyAll()
                 }
 
@@ -257,12 +292,14 @@ class Iap2LinkChannel private constructor(
     }
 
     private fun terminalLocked(failure: Throwable?) {
+        val first = !terminated
         terminated = true
         ready = false
         commands.clear()
         commandBytes = 0
         controls.clear()
         controlBytes = 0
+        if (first) noteLinkLocked("terminal: ${failure?.message ?: "closed"}")
         terminalFailure = combineFailures(terminalFailure, failure)
         lock.notifyAll()
     }
@@ -340,6 +377,7 @@ class Iap2LinkChannel private constructor(
         private const val MAX_PENDING_COMMAND_BYTES = 1_048_576
         private const val MAX_PENDING_CONTROLS = 64
         private const val MAX_PENDING_CONTROL_BYTES = 1_048_576
+        private const val LINK_TRACE_MAX = 48
 
         private val WIRED_LINK_CONFIG = Iap2LinkConfig(
             maxOutgoing = 4,

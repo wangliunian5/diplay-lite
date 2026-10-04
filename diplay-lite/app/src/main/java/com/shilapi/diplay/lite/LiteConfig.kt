@@ -28,7 +28,8 @@ data class LiteConfig(
 ) {
     companion object {
         private const val PREFS = "diplay_lite"
-        const val MIN_SCALE_PERCENT = 50
+        // M6k：分辨率下限由 50 放宽到 10 —— 高分辨率车机（如 1080p）可借此把码流压得更低。
+        const val MIN_SCALE_PERCENT = 10
         const val MAX_SCALE_PERCENT = 100
         const val MIN_DUCK_PERCENT = 30
         const val MAX_DUCK_PERCENT = 70
@@ -40,6 +41,21 @@ data class LiteConfig(
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit()
                 .putString("applied_video_key", key)
+                .apply()
+        }
+
+        /** M6k3：蓝牙点选缓存的设备名，只用于按钮展示（名字不参与连接）。 */
+        fun bluetoothDeviceName(context: Context): String =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString("bt_name", "")
+                .orEmpty()
+
+        /** M6k3：蓝牙点选落盘入口。bt_address 与 bt_name 成对写，避免半新半旧。 */
+        fun saveBluetoothPick(context: Context, address: String, name: String) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString("bt_address", address)
+                .putString("bt_name", name)
                 .apply()
         }
 

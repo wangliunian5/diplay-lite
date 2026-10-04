@@ -14,7 +14,7 @@ android {
         versionCode = 1
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
         // 每次出包改这里的阶段后缀，启动日志会打印它（见 LiteSessionService 构建标识行）。
-        versionName = "0.1-lite-m6j"
+        versionName = "0.1-lite-m6k8"
     }
 
     compileOptions {
@@ -25,6 +25,22 @@ android {
         jvmTarget = "1.8"
     }
 
+    // 外发测试签名：沿用 docs/BUILD.md 的环境变量约定。
+    // 只在显式提供 ANDROID_KEYSTORE_PATH 时才创建签名配置；未提供时 release 保持未签名
+    // （与主工程「源码/CI 构建无签名」语义一致，避免把密钥路径/口令写死进仓库）。
+    val releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
+
+    signingConfigs {
+        if (!releaseKeystorePath.isNullOrBlank()) {
+            create("release") {
+                storeFile = file(releaseKeystorePath)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -33,6 +49,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            if (!releaseKeystorePath.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

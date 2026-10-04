@@ -33,6 +33,9 @@ class Iap2CsmChannel private constructor(
             closed || terminalFailure != null
         }
 
+    /** M6k6：底层链路事件环形记录快照（死亡诊断用）。 */
+    fun recentLinkTrace(): List<String> = link.recentLinkTrace()
+
     /** Waits for the underlying link to negotiate a writable session 10. */
     fun awaitReady(timeoutMillis: Long): Boolean {
         requireTimeout(timeoutMillis)

@@ -4,10 +4,14 @@ import android.app.Activity
 import android.app.AlarmManager
 import android.app.AlertDialog
 import android.app.PendingIntent
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
+import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.MotionEvent
@@ -26,6 +30,7 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import com.shilapi.xcertplay.media.CarPlayTouchMapper
+import kotlin.math.abs
 
 /**
  * DiPlay Lite 主界面：单屏程序化 UI（零 XML 资源、零 AndroidX、无图片）。
@@ -33,7 +38,7 @@ import com.shilapi.xcertplay.media.CarPlayTouchMapper
  * M0 骨架阶段：热点表单 + 服务启停 + 状态/日志显示；
  * 连接编排（shared 模块 CarPlayController）在 M2 接入 LiteSessionService。
  * M4k：车机形态——默认全屏横屏，SurfaceView 铺满整屏做触摸目标；
- * 配置/日志面板作为浮层（连接成功后自动收起，左上角小按钮可随时唤回）。
+ * 配置/日志面板作为浮层（连接成功后自动收起，右上角可拖拽的圆形悬浮球可随时唤回）。
  *
  * 状态刷新用 500ms 轮询（Handler），代替广播与生命周期库，保持零依赖。
  */
@@ -47,7 +52,7 @@ class MainActivity : Activity() {
     private lateinit var passwordInput: EditText
     private lateinit var channelInput: EditText
     private lateinit var securityInput: Spinner
-    private lateinit var bluetoothInput: EditText
+    private lateinit var bluetoothPickButton: Button
     private lateinit var fps30Check: CheckBox
     private lateinit var scaleInput: EditText
     private lateinit var speakerCallsCheck: CheckBox
@@ -57,9 +62,16 @@ class MainActivity : Activity() {
     private lateinit var disconnectButton: Button
     private lateinit var video: SurfaceView
     private lateinit var panel: ScrollView
-    private lateinit var panelToggle: Button
+    private lateinit var panelToggle: TextView
     private var panelVisible = true
     private var lastActive = false
+    // M6k5：日志区渲染节流。renderState 500ms 一跳，原实现每次都全量 setText ——
+    // TextView 不做内容比较，200 行日志整块重排；连接期间日志持续增长，滚动正好每 500ms 被打断一次。
+    private var lastLogText: String? = null
+    private var lastPanelScrollY = 0
+    // M6k3：蓝牙点选的当前值。地址落盘 LiteConfig.bt_address（连接时用），名字只用于按钮展示。
+    private var bluetoothAddress = ""
+    private var bluetoothName = ""
 
     private val refreshTask = object : Runnable {
         override fun run() {
@@ -151,20 +163,25 @@ class MainActivity : Activity() {
                 FrameLayout.LayoutParams.MATCH_PARENT,
             ),
         )
-        // 面板开关：无条件浮在最上层，面板收起后它是唯一能唤回配置/日志的入口。
-        // 靠右上角，避开面板标题行的左上角。
-        panelToggle = Button(this).apply {
+        // M6k：面板开关改为可拖拽的圆形悬浮球（原来贴右上角的矩形按钮）。
+        // 无条件浮在最上层，面板收起后它是唯一能唤回配置/日志的入口；可拖到任意角落，避免挡住 CarPlay 内容。
+        val ballSize = dip(46)
+        panelToggle = TextView(this).apply {
             text = "面板"
             textSize = 12f
-            alpha = 0.65f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(150, 40, 44, 52))
+                setStroke(dip(1), Color.argb(190, 200, 210, 220))
+            }
+            alpha = 0.85f
             setOnClickListener { setPanelVisible(!panelVisible) }
         }
-        val toggleParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP or Gravity.END,
-        )
+        val toggleParams = FrameLayout.LayoutParams(ballSize, ballSize, Gravity.TOP or Gravity.END)
         toggleParams.setMargins(0, dip(6), dip(6), 0)
+        attachBallDrag(panelToggle, toggleParams)
         outer.addView(panelToggle, toggleParams)
 
         // 标题行：状态圆点 + 标题
@@ -200,6 +217,15 @@ class MainActivity : Activity() {
         }
         root.addView(fieldRow("热点 SSID", ssidInput))
 
+        // M6k3：热点开关直达 —— 车机热点开关常埋在设置深处，给测试一个一键入口。
+        root.addView(
+            Button(this).apply {
+                text = "打开系统热点设置"
+                setOnClickListener { openHotspotSettings() }
+            },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+        )
+
         passwordInput = EditText(this).apply {
             hint = "热点密码"
             setSingleLine()
@@ -225,11 +251,18 @@ class MainActivity : Activity() {
         }
         root.addView(fieldRow("加密方式", securityInput))
 
-        bluetoothInput = EditText(this).apply {
-            hint = "留空自动选择已配对 iPhone"
-            setSingleLine()
+        // M6k4：蓝牙地址由手输改为点选 —— 弹已配对设备列表（名字+地址对照，同名多台不混淆）；
+        // 长按按钮 = 清除恢复自动。
+        bluetoothPickButton = Button(this).apply {
+            text = bluetoothButtonText()
+            setOnClickListener { showBluetoothDeviceDialog() }
+            setOnLongClickListener {
+                applyBluetoothPick("", "")
+                toast("已清除蓝牙选择，恢复自动")
+                true
+            }
         }
-        root.addView(fieldRow("iPhone 蓝牙地址（可选）", bluetoothInput))
+        root.addView(fieldRow("iPhone 蓝牙设备（可选）", bluetoothPickButton))
 
         // M6b 性能项：C8815 硬解 960x540 撑不到 60fps，这里允许把 /info 的 maxFPS 降到 30。
         fps30Check = CheckBox(this).apply {
@@ -242,11 +275,11 @@ class MainActivity : Activity() {
         // M6b 性能项：按百分比缩小 /info 声明的分辨率（长宽等比，各自取偶）。
         // 像素少 33~44% 是弱机最直接的省算力手段；渲染仍铺满物理屏，故画面无黑边。
         scaleInput = EditText(this).apply {
-            hint = "50-100，100 = 原生分辨率"
+            hint = "10-100，100 = 原生分辨率"
             setSingleLine()
             inputType = InputType.TYPE_CLASS_NUMBER
         }
-        root.addView(fieldRow("分辨率百分比（50-100）", scaleInput))
+        root.addView(fieldRow("分辨率百分比（10-100）", scaleInput))
 
         // M6c：CarPlay 通话声音路由。默认听筒（本机 telephony 流走 STREAM_VOICE_CALL）；
         // 勾上则通话期间切扬声器（MODE_IN_COMMUNICATION + setSpeakerphoneOn）。开关即时生效，无需重连。
@@ -343,6 +376,52 @@ class MainActivity : Activity() {
     }
 
     /**
+     * M6k：让悬浮球可拖拽。按下记位、移动改 FrameLayout 的 right/top margin、抬起若几乎没移动
+     * 则当作点击（performClick → 切换面板显隐）。用 TOP|END 定位，所以向右拖 = rightMargin 减小。
+     * 拖动范围钳在父容器内，球不会被拖出屏幕。
+     */
+    private fun attachBallDrag(ball: View, params: FrameLayout.LayoutParams) {
+        val slop = dip(6)
+        var downRawX = 0f
+        var downRawY = 0f
+        var downRight = 0
+        var downTop = 0
+        var dragging = false
+        ball.setOnTouchListener { view, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downRawX = event.rawX
+                    downRawY = event.rawY
+                    downRight = params.rightMargin
+                    downTop = params.topMargin
+                    dragging = false
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (event.rawX - downRawX).toInt()
+                    val dy = (event.rawY - downRawY).toInt()
+                    if (!dragging && (abs(dx) > slop || abs(dy) > slop)) dragging = true
+                    if (dragging) {
+                        val parent = view.parent as? View
+                        val maxRight = ((parent?.width ?: 0) - view.width).coerceAtLeast(0)
+                        val maxTop = ((parent?.height ?: 0) - view.height).coerceAtLeast(0)
+                        params.rightMargin = (downRight - dx).coerceIn(0, maxRight)
+                        params.topMargin = (downTop + dy).coerceIn(0, maxTop)
+                        view.layoutParams = params
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!dragging) view.performClick()
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> true
+                else -> false
+            }
+        }
+    }
+
+    /**
      * 触摸转发：把屏幕坐标归一化成 0..1 的 [AirPlayContact]，交给当前会话发 HID 报告。
      * 未连接时返回 false（不消费事件）；尺寸未布局完时用屏幕尺寸兜底。
      */
@@ -351,7 +430,9 @@ class MainActivity : Activity() {
         val width = video.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
         val height = video.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
         if (width <= 0 || height <= 0) return false
-        return service.sendTouch(CarPlayTouchMapper.contacts(event, width, height))
+        // M6k：只有 ACTION_MOVE 是可合并的中间态；DOWN/UP/POINTER_*/CANCEL 都必须逐条送达。
+        val sticky = event.actionMasked != MotionEvent.ACTION_MOVE
+        return service.sendTouch(CarPlayTouchMapper.contacts(event, width, height), sticky)
     }
 
     // ---------- 表单读写 ----------
@@ -363,7 +444,9 @@ class MainActivity : Activity() {
         channelInput.setText(if (config.channel > 0) config.channel.toString() else "")
         val securities = listOf("WPA2", "WPA2-WPA3", "WPA3", "OPEN")
         securityInput.setSelection(securities.indexOf(config.security).coerceAtLeast(0))
-        bluetoothInput.setText(config.bluetoothAddress)
+        bluetoothAddress = config.bluetoothAddress
+        bluetoothName = LiteConfig.bluetoothDeviceName(this)
+        bluetoothPickButton.text = bluetoothButtonText()
         fps30Check.isChecked = config.limit30Fps
         scaleInput.setText(config.videoScalePercent.toString())
         speakerCallsCheck.isChecked = config.speakerForCalls
@@ -373,7 +456,7 @@ class MainActivity : Activity() {
 
     private fun saveFromForm(): LiteConfig {
         val channelText = channelInput.text.toString().trim()
-        // 百分比非法（空/非数字/越界）一律钳到 50~100，避免把 0 或 999 写进 /info。
+        // 百分比非法（空/非数字/越界）一律钳到 10~100，避免把 0 或 999 写进 /info。
         val scale = scaleInput.text.toString().trim().toIntOrNull()
             ?.coerceIn(LiteConfig.MIN_SCALE_PERCENT, LiteConfig.MAX_SCALE_PERCENT)
             ?: LiteConfig.MAX_SCALE_PERCENT
@@ -386,7 +469,7 @@ class MainActivity : Activity() {
             password = passwordInput.text.toString(),
             channel = channelText.toIntOrNull() ?: 0,
             security = securityInput.selectedItem as? String ?: "WPA2",
-            bluetoothAddress = bluetoothInput.text.toString().trim(),
+            bluetoothAddress = this@MainActivity.bluetoothAddress,
             limit30Fps = fps30Check.isChecked,
             videoScalePercent = scale,
             speakerForCalls = speakerCallsCheck.isChecked,
@@ -478,6 +561,94 @@ class MainActivity : Activity() {
         toast("已导出：${exported.name}")
     }
 
+    // ---------- M6k3：蓝牙设备点选 ----------
+
+    private fun bluetoothButtonText(): String = when {
+        bluetoothAddress.isBlank() -> "选择蓝牙设备（未选 = 自动）"
+        bluetoothName.isNotBlank() -> "已选：$bluetoothName（$bluetoothAddress）"
+        else -> "已选：$bluetoothAddress"
+    }
+
+    private fun applyBluetoothPick(address: String, name: String) {
+        bluetoothAddress = address
+        bluetoothName = name
+        bluetoothPickButton.text = bluetoothButtonText()
+        LiteConfig.saveBluetoothPick(this, address, name)
+    }
+
+    /** M6k4：已配对设备列表（名字+MAC 对照，同名机靠 MAC 区分）+ 手动输入 + 清除。 */
+    private fun showBluetoothDeviceDialog() {
+        val adapter: BluetoothAdapter? = try {
+            BluetoothAdapter.getDefaultAdapter()
+        } catch (_: Throwable) {
+            null
+        }
+        if (adapter == null) {
+            toast("本机没有蓝牙适配器，请长按按钮手动输入地址")
+            return
+        }
+        val devices = adapter.bondedDevices.orEmpty()
+            .sortedWith(compareBy({ it.name?.lowercase() ?: "" }, { it.address }))
+        if (devices.isEmpty()) {
+            LiteLog.log("ui", "蓝牙选择：无已配对设备")
+            toast("没有已配对的蓝牙设备，请先在车机系统设置里与 iPhone 配对")
+        }
+        val labels = ArrayList<String>(devices.size + 2)
+        devices.forEach { labels.add("${it.name ?: "未知设备"}\n${it.address}") }
+        labels.add("手动输入地址…")
+        labels.add("清除选择（恢复自动）")
+        AlertDialog.Builder(this)
+            .setTitle("选择 iPhone 蓝牙设备")
+            .setItems(labels.toTypedArray()) { _, which ->
+                when {
+                    which < devices.size -> {
+                        val device = devices[which]
+                        applyBluetoothPick(device.address, device.name ?: "")
+                    }
+                    which == devices.size -> promptManualBluetoothAddress()
+                    else -> applyBluetoothPick("", "")
+                }
+            }
+            .show()
+    }
+
+    private fun promptManualBluetoothAddress() {
+        val input = EditText(this).apply {
+            setSingleLine()
+            hint = "AA:BB:CC:DD:EE:FF"
+            setText(bluetoothAddress)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("手动输入蓝牙地址")
+            .setView(input)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("确定") { _, _ ->
+                applyBluetoothPick(input.text.toString().trim().uppercase(), "")
+            }
+            .show()
+    }
+
+    // ---------- M6k3：系统热点设置直达 ----------
+
+    /** 三级降级：TetherSettings 组件（AOSP 通用）→ 隐藏 TETHER_SETTINGS action（部分 OEM）→ 无线设置页（公开 action 兜底）。 */
+    private fun openHotspotSettings() {
+        val attempts = listOf(
+            "热点/网络共享页" to Intent().setClassName("com.android.settings", "com.android.settings.TetherSettings"),
+            "热点/网络共享页（隐式）" to Intent("android.settings.TETHER_SETTINGS"),
+            "无线和网络设置" to Intent(Settings.ACTION_WIRELESS_SETTINGS),
+        )
+        for ((label, intent) in attempts) {
+            try {
+                startActivity(intent)
+                LiteLog.log("ui", "热点设置：已打开$label")
+                return
+            } catch (error: Exception) {
+                LiteLog.log("ui", "热点设置：$label 不可用（${error.javaClass.simpleName}）")
+            }
+        }
+        toast("本机没有可直达的热点设置，请在系统设置里手动开启")
+    }
+
     // ---------- 状态渲染 ----------
 
     private fun renderState() {
@@ -502,7 +673,15 @@ class MainActivity : Activity() {
             sb.append("日志文件: ").append(it.absolutePath).append("\n\n")
         }
         for (line in LiteLog.snapshot()) sb.append(line).append('\n')
-        logView.text = sb
+        // M6k5：文本没变就不 setText（省整块重排）；scrollY 在变 = 惯性滚动中，也跳过，
+        // 停止后的下一轮会补渲染 —— 滚动不再被周期性重排打断。
+        val text = sb.toString()
+        val scrolling = panel.scrollY != lastPanelScrollY
+        lastPanelScrollY = panel.scrollY
+        if (text != lastLogText && !scrolling) {
+            lastLogText = text
+            logView.text = text
+        }
     }
 
     private fun toast(message: String) {

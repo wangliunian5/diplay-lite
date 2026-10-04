@@ -286,6 +286,8 @@ private class VideoDecoder(
     // M6j：软解探测日志只打一次（T44 里它每帧刷一次，45 条把日志淹了）。
     private var softwareProbeLogged = false
     private val referenceChain = VideoReferenceChain()
+    // M6k：最近一次喂入的帧是不是随机访问帧（IDR）。解码失败时落盘，用于判读"是否从 P 帧续解"。
+    @Volatile private var lastFrameKeyFrame = true
     private var lastKeyFrameRequestNs = 0L
     // The main screen keeps the historical log format; other screens are labelled.
     private val stats = VideoStats(if (streamType == 110) "" else " stream=$streamType")
@@ -321,6 +323,7 @@ private class VideoDecoder(
                             if (System.nanoTime() - job.receivedNs > MAX_FRAME_AGE_NS) {
                                 // M6f：积压只是"我们落后了"，解码器没坏 —— 丢过时帧 + 要关键帧即可，
                                 // 不再重降解码器（重配要走厂商 OMX，还得再等关键帧，纯属白花时间）。
+                                stats.onBacklog()
                                 queue.discardFrames()
                                 recover(
                                     "video backlog exceeded ${MAX_FRAME_AGE_NS / 1_000_000} ms",
@@ -552,7 +555,9 @@ private class VideoDecoder(
         val config = lastConfig ?: return
         if (outputSurface == null) return
         if (annexB.isEmpty()) { recover("invalid video access unit"); return }
-        if (!referenceChain.accepts(annexB, config.codec)) {
+        val keyFrame = MediaCodecSupport.isRandomAccess(annexB, config.codec)
+        lastFrameKeyFrame = keyFrame
+        if (!referenceChain.accepts(keyFrame)) {
             requestKeyFrameIfDue()
             return
         }
@@ -570,7 +575,7 @@ private class VideoDecoder(
             running = { running }, drain = { drainOutput(codec) },
             dequeue = { codec.dequeueInputBuffer(INPUT_TIMEOUT_US) },
         )
-        if (index < 0) { recover("video decoder input stalled"); return }
+        if (index < 0) { stats.onInputStalled(); recover("video decoder input stalled"); return }
         val input = codecInputBuffer(codec, index)
         if (input == null) {
             // M6j：`checkNotNull` 抛的就是 IllegalStateException —— 很可能正是 T44 里每帧
@@ -604,12 +609,14 @@ private class VideoDecoder(
      */
     private fun errorReport(prefix: String, error: Throwable): String {
         val detail = error.message?.let { ": $it" } ?: ""
+        // M6k：带上最近一帧的类型，区分"丢帧后从 P 帧续解"与"厂商解码器自身出错"。
+        val frameKind = if (lastFrameKeyFrame) "IDR" else "non-IDR"
         if (!decoderErrorDetailLogged.compareAndSet(false, true)) {
-            return "$prefix ${error.javaClass.simpleName}$detail; waiting for keyframe"
+            return "$prefix ${error.javaClass.simpleName}$detail lastFrame=$frameKind; waiting for keyframe"
         }
         val frames = error.stackTrace.take(ERROR_STACK_FRAMES)
             .joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}" }
-        return "$prefix ${error.javaClass.simpleName}$detail; waiting for keyframe stack=$frames"
+        return "$prefix ${error.javaClass.simpleName}$detail lastFrame=$frameKind; waiting for keyframe stack=$frames"
     }
 
     /**
@@ -628,13 +635,29 @@ private class VideoDecoder(
     private fun recover(reason: String, rebuildDecoder: Boolean = true) {
         Log.w(TAG, "Video recovery: $reason; waiting for keyframe")
         stats.onRecovery()
-        report("recovery: $reason; waiting for keyframe" + if (rebuildDecoder) "" else " (keep decoder)")
+        report("recovery: $reason; waiting for keyframe" + if (rebuildDecoder) "" else " (flush decoder)")
         if (rebuildDecoder) {
             // Recreate with codec-specific data: flush can discard CSD before the first output.
             releaseDecoder()
+        } else {
+            // M6k：不重建解码器时，必须把解码器里"在途"的旧输入/输出帧清掉。否则恢复后
+            // 它会把丢帧前残留的画面吐出来，与新关键帧混排 —— 观感就是花屏/跳帧。
+            flushDecoder()
         }
         referenceChain.reset()
         requestKeyFrameIfDue()
+    }
+
+    /** M6k：清空解码器在途帧（不释放组件）。失败则退化为重建，保证下次喂帧前状态一致。 */
+    private fun flushDecoder() {
+        val codec = decoder ?: return
+        try {
+            codec.flush()
+            stats.onFlush()
+        } catch (error: Exception) {
+            Log.w(TAG, "video decoder flush failed; rebuilding instead", error)
+            releaseDecoder()
+        }
     }
 
     private fun requestKeyFrameIfDue() {
@@ -789,6 +812,9 @@ private class AudioRenderer(
     private var lastIncrementUs = 0L
     private var expectedTimestampUs = -1L
     private var silenceScratch = ByteArray(0)
+    // M6k：丢包遮蔽（PLC）。保存最近约 20ms 的真实 PCM，缺口时平铺它并整体淡出，
+    // 代替"整段填静音"——2.4GHz 成片丢包下，纯静音缺口听感就是"声音断续"。
+    private var lastPcmTail = ByteArray(0)
     private var packetsCompensated = 0L
     private var gapUsCompensated = 0L
     // M6c/M6d：本条流落在哪个 CarPlay 音频通道（audioRoute() 里写），以及是否已把"通道活跃"通知出去。
@@ -1205,7 +1231,7 @@ private class AudioRenderer(
         if (streamActive && gapUs <= MAX_COMPENSATE_US) {
             val missingBytes = (gapUs * bytesPerSecond / 1_000_000L).toInt()
             if (missingBytes > 0) {
-                writePcmSilence(missingBytes)
+                writePcmConcealment(gapUs, missingBytes)
                 packetsCompensated++
                 gapUsCompensated += gapUs
                 if (packetsCompensated <= MAX_COMPENSATE_LOG || packetsCompensated % 100 == 0L) {
@@ -1218,6 +1244,47 @@ private class AudioRenderer(
             }
         }
         expectedTimestampUs = timestampUs + lastIncrementUs
+    }
+
+    /**
+     * M6k：丢包遮蔽。**按缺口长度分流**——这是 T47 实测（C8815，12:36 日志）后修正的关键点：
+     * 该机上音频 UDP 丢包极重（`seqForwardGaps` 每 5s 160~210、`gapCompMs≈3000/5000ms`），
+     * 缺口平均 **约 200ms**（≈10 个 AAC 帧）。若一律"平铺上一帧并整体淡出"，20ms 的样本
+     * 会被重复十几次 → 变成持续的低频嗡嗡声（用户报的"音频异常"）。
+     *
+     * 因此：
+     * - 短缺口（≤ [MAX_CONCEAL_REPEAT_US]）平铺上一帧，听感比"断一小段静音"连续；
+     * - 长缺口（> 该阈值）退回 [writePcmSilence]，只做 5ms 淡出后留静音——不制造持续音调。
+     * 还没有可复用样本时（起播即丢包）同样退回静音。
+     */
+    private fun writePcmConcealment(gapUs: Long, bytes: Int) {
+        val tailSamples = lastPcmTail.size / 2
+        if (tailSamples == 0 || gapUs > MAX_CONCEAL_REPEAT_US) {
+            writePcmSilence(bytes)
+            return
+        }
+        if (bytes <= 0 || bytesPerSecond <= 0) return
+        if (silenceScratch.size < bytes) silenceScratch = ByteArray(bytes)
+        val sampleCount = bytes / 2
+        for (index in 0 until sampleCount) {
+            val value = readS16(lastPcmTail, (index % tailSamples) * 2).toLong() *
+                (sampleCount - index) / sampleCount
+            writeS16(silenceScratch, index * 2, value)
+        }
+        if (bytes % 2 != 0) silenceScratch[bytes - 1] = 0
+        fadeInAfterGap = false
+        writePcm(silenceScratch, 0, bytes)
+        // 遮蔽段之后回来的真实音频要淡入，避免"遮蔽尾巴→真实音频"的爆音。
+        fadeInAfterGap = true
+    }
+
+    /** M6k：把本次写入的最后一段 PCM 存进 [lastPcmTail]（约 20ms，偶数长度），供丢包遮蔽复用。 */
+    private fun rememberPcmTail(data: ByteArray, offset: Int, written: Int) {
+        if (written <= 0 || bytesPerSecond <= 0) return
+        val tailBytes = maxOf(2, (bytesPerSecond / 50 / 2) * 2)
+        val copy = minOf(written, tailBytes)
+        if (lastPcmTail.size != copy) lastPcmTail = ByteArray(copy)
+        System.arraycopy(data, offset + written - copy, lastPcmTail, 0, copy)
     }
 
     private fun writePcmSilence(bytes: Int) {
@@ -1356,6 +1423,8 @@ private class AudioRenderer(
         }
         // M6f：记住最后一个采样值，丢包填静音前用它做一小段淡出（避免硬切静音的爆音）。
         if (length >= 2) lastSampleValue = readS16(data, offset + length - 2)
+        // M6k：记住刚写入的真实 PCM，供下一次丢包遮蔽复用（复用上一帧 + 淡出）。
+        rememberPcmTail(data, offset, written)
     }
 
     private fun startPlayback(track: AudioTrack) {
@@ -1516,6 +1585,9 @@ private class AudioRenderer(
         // P0: frame-loss compensation bounds. Worst observed wireless loss burst is ~640 ms.
         const val MAX_FRAME_US = 1_000_000L
         const val MAX_COMPENSATE_US = 1_000_000L
+        // M6k：缺口超过该长度就不再用"平铺上一帧"（会变持续音调），改填淡出静音。
+        // 取 40ms ≈ 2 个 AAC 帧——真实音频帧长 21.3ms，短缺口复用一两次是合理遮蔽。
+        const val MAX_CONCEAL_REPEAT_US = 40_000L
         const val MAX_PACKET_IDLE_NS = 1_000_000_000L
         const val MAX_COMPENSATE_LOG = 20
     }

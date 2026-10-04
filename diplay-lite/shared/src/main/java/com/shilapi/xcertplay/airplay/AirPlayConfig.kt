@@ -40,7 +40,11 @@ data class AirPlayConfig(
     val main: AirPlayDisplayConfig,
     val cluster: AirPlayDisplayConfig? = null,
     val rightHandDrive: Boolean = false,
-    val port: Int = 7000,
+    // M6k8 强制固定 7100（勿改回 7000）：部分车机 ROM 的互联组件占 0.0.0.0:7000（K60 实测
+    // EADDRINUSE，占用诊断见 AirPlayTcpServer.tcpPortOwners）。TCP 监听、Bonjour 广报、
+    // 0x4301 airPlayPort 全部取本字段（同源）；iPhone 按 Bonjour 广告连，改端口不影响协议。
+    // 红线：不许加"先试 7000 再兜底"的探测逻辑——端口翻转会让 iPhone 的 mDNS 缓存反复失效。
+    val port: Int = 7100,
     val entertainmentSampleRate: Int = 48000,
     val hevc: Boolean = false,
     val disableAudioOutput: Boolean = false,

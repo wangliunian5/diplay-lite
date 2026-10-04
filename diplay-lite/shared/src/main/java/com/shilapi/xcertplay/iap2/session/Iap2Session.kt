@@ -26,9 +26,27 @@ class Iap2Session private constructor(
     val isClosed: Boolean get() = channel.isClosed
 
     fun awaitReady(timeoutMillis: Long): Boolean {
-        val ready = channel.awaitReady(timeoutMillis)
+        val ready = try {
+            channel.awaitReady(timeoutMillis)
+        } catch (failure: Throwable) {
+            // M6k6：无线首握死亡（iPhone 静默掐线）此前只从这条路无声穿出（零 trace）。
+            emitTrace(
+                "IAP2 [${traceContext}] AWAIT-READY FAILED: " +
+                    (failure.message ?: failure.javaClass.simpleName),
+            )
+            dumpLinkTrace()
+            throw failure
+        }
         emitTrace("IAP2 READY [$traceContext] ready=$ready")
         return ready
+    }
+
+    /** M6k6：把底层链路事件环形记录导出到 trace，死亡现场不再缺失。 */
+    private fun dumpLinkTrace() {
+        val events = channel.recentLinkTrace()
+        if (events.isNotEmpty()) {
+            emitTrace("IAP2 LINK DUMP [$traceContext] ${events.joinToString(" | ")}")
+        }
     }
 
     fun send(frame: Iap2Frame, timeoutMillis: Long = DEFAULT_SEND_TIMEOUT_MILLIS) {
@@ -44,6 +62,7 @@ class Iap2Session private constructor(
                     failure,
                 ),
             )
+            dumpLinkTrace()
             throw failure
         }
     }
@@ -76,6 +95,7 @@ class Iap2Session private constructor(
                     failure = failure,
                 ),
             )
+            dumpLinkTrace()
             throw failure
         }
     }

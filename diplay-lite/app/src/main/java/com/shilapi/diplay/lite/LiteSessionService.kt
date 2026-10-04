@@ -88,8 +88,12 @@ class LiteSessionService : Service() {
      * M4k 触摸入口：MainActivity 的 SurfaceView 把 MotionEvent 归一化成 [AirPlayContact]
      * （x/y 为 0..1），由此转发到 shared 的 CarPlayController.sendTouch。
      * 未连接（controller 为空）时返回 false，调用方据此不消费事件。
+     *
+     * M6k：新增 [sticky]——DOWN/UP 等触点状态变化事件必须逐条送达（sticky=true），
+     * 纯 MOVE（sticky=false）可被后续 MOVE 覆盖，避免快速滑动时排队导致触摸滞后。
      */
-    fun sendTouch(contacts: List<AirPlayContact>): Boolean = controller?.sendTouch(contacts) == true
+    fun sendTouch(contacts: List<AirPlayContact>, sticky: Boolean): Boolean =
+        controller?.sendTouch(contacts, sticky) == true
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         current = this
@@ -409,7 +413,7 @@ class LiteSessionService : Service() {
     }
 
     /**
-     * M6b：把 /info 声明的显示分辨率按百分比缩小（50~100，100 = 原样返回）。
+     * M6b：把 /info 声明的显示分辨率按百分比缩小（M6k 起 10~100，100 = 原样返回）。
      * 长宽同比例缩小、各自取偶（H.264 要求偶数）；渲染仍铺满物理屏，故不会出现黑边。
      */
     private fun scaleDisplay(full: Pair<Int, Int>, percent: Int): Pair<Int, Int> {

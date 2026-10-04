@@ -12,6 +12,10 @@ internal class VideoStats(
     private var received = 0
     private var rendered = 0
     private var recoveries = 0
+    // M6k：把"我们主动丢帧/等输入"与"清解码器"分开计数，用于判断花屏是否由丢帧残留引起。
+    private var backlogs = 0
+    private var inputStalled = 0
+    private var flushes = 0
     private var bytes = 0L
     private var maxArrivalGapNs = 0L
     private var touchSamples = 0
@@ -40,6 +44,12 @@ internal class VideoStats(
 
     @Synchronized fun onRecovery() { recoveries++ }
 
+    @Synchronized fun onBacklog() { backlogs++ }
+
+    @Synchronized fun onInputStalled() { inputStalled++ }
+
+    @Synchronized fun onFlush() { flushes++ }
+
     @Synchronized fun logIfDue(): String? {
         val now = nanoTime()
         val elapsedNs = now - windowStartNs
@@ -58,16 +68,19 @@ internal class VideoStats(
         val heapUsedMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
         val heapMaxMb = runtime.maxMemory() / (1024 * 1024)
         val line = ("video stats$label rx=%.1ffps shown=%.1ffps maxGap=%dms kbps=%d recoveries=%d " +
+            "backlog=%d stalled=%d flush=%d " +
             "heap=%d/%dMB touch2frame avg=%dms max=%dms n=%d touchSendMax=%dms").format(
             rx, shown, maxGapMs,
             (bytes * 8 / 1000 / seconds).toLong(), recoveries,
+            backlogs, inputStalled, flushes,
             heapUsedMb, heapMaxMb,
             touchAvgMs, maxTouchLatencyNs / 1_000_000, touchSamples, TouchLatencyProbe.maxSendNs / 1_000_000,
         ) + " " + (processLoad.sample(now) ?: "cpu=? threads=?")
         TouchLatencyProbe.maxSendNs = 0
         Log.i(TAG, line)
         windowStartNs = now
-        received = 0; rendered = 0; recoveries = 0; bytes = 0; maxArrivalGapNs = 0
+        received = 0; rendered = 0; recoveries = 0; backlogs = 0; inputStalled = 0; flushes = 0
+        bytes = 0; maxArrivalGapNs = 0
         touchSamples = 0; touchLatencySumNs = 0; maxTouchLatencyNs = 0
         return line
     }

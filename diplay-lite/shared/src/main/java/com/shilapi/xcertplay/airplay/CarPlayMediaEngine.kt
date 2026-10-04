@@ -118,10 +118,14 @@ class CarPlayMediaEngine(
             type,
             audioType,
         )
+        // M6k7：type=102（media）的 SETUP 自带 iPhone 的 controlPort（m6f 日志 5/5 会话实证），
+        // 是主动重传 PT=85 的目的地；type=101 不带 → AudioStream 内重传/重排自动关闭。
+        val peerControlPort = (stream["controlPort"] as? Number)?.toInt() ?: 0
         val audioLog =
             "airplay audio format type=$type audioType=$audioType codec=${format.codec} " +
                 "rate=${format.sampleRate} channels=${format.channels} " +
-                "micPort=${(stream["dataPort"] as? Number)?.toInt() ?: 0}"
+                "micPort=${(stream["dataPort"] as? Number)?.toInt() ?: 0} " +
+                "peerControlPort=$peerControlPort"
         Log.i(TAG, audioLog)
         session.logDebug(audioLog)
         val connectionId = stream["streamConnectionID"]
@@ -132,7 +136,7 @@ class CarPlayMediaEngine(
 
         val capture = audioCaptureDirectory?.let { AudioPacketCapture(it, type) }
         if (capture != null) audioCaptures[type] = capture
-        val audio = AudioStream(key, type, session::logDebug)
+        val audio = AudioStream(key, type, session::logDebug, peerControlPort)
         val (dataPort, controlPort) = audio.listen(
             object : AudioStream.Listener {
                 override fun onStarted(firstSample: Int) {

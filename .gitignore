@@ -25,6 +25,9 @@ Thumbs.db
 *.log
 /.idea
 
+# JVM crash/heap dumps (local build evidence, never commit)
+*.hprof
+
 # Local beta credentials and release signing (never commit)
 .private/
 *.jks

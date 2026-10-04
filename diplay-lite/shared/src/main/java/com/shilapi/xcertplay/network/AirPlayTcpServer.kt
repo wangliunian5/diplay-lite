@@ -1,5 +1,6 @@
 package com.shilapi.xcertplay.network
 
+import android.os.Build
 import android.util.Log
 import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
@@ -127,20 +128,67 @@ class AirPlayTcpServer {
         )
     }
 
-    /** 读 /proc/net/tcp 列出占用指定端口的 socket（本地地址、状态、inode），用于定位 EADDRINUSE 来源。 */
+    /**
+     * 读 /proc/net/tcp(6) 列出占用指定端口的 socket（本地地址、状态、inode），并尽力反查持有进程，
+     * 用于定位 EADDRINUSE 来源。tcp6 也要扫：[::]:7000 这类 v6 通配监听同样会顶掉 0.0.0.0:7000 的 bind。
+     */
     private fun tcpPortOwners(port: Int): String = runCatching {
         val wanted = String.format("%04X", port)
         val found = StringBuilder()
-        val lines = File("/proc/net/tcp").readLines()
-        for (line in lines.drop(1)) {
-            val parts = line.trim().split(Regex("\\s+"))
-            if (parts.size > 9 && parts[1].endsWith(":$wanted")) {
-                found.append("[").append(parts[1]).append(" state=").append(parts[3])
-                    .append(" inode=").append(parts[9]).append("]")
+        for (table in listOf("/proc/net/tcp", "/proc/net/tcp6")) {
+            val lines = runCatching { File(table).readLines() }.getOrNull() ?: continue
+            for (line in lines.drop(1)) {
+                val parts = line.trim().split(Regex("\\s+"))
+                if (parts.size > 9 && parts[1].endsWith(":$wanted")) {
+                    val inode = parts[9]
+                    found.append("[")
+                    if (table.endsWith("6")) found.append("IPv6 ")
+                    found.append(parts[1]).append(" state=").append(parts[3]).append(" inode=").append(inode)
+                    socketOwner(inode)?.let { found.append(' ').append(it) }
+                    found.append("]")
+                }
             }
         }
         if (found.isEmpty()) "(无占用记录)" else found.toString()
     }.getOrElse { "诊断不可用" }
+
+    /**
+     * M6k3：inode → 进程反查。扫各进程 /proc/<pid>/fd 下的 socket:[inode] 软链，命中后读 cmdline/comm 取进程名。
+     * 车机 ROM 的 SELinux 普遍宽松，多数能直接读出占用者（系统服务/残留实例一目了然）；
+     * 读不到（新系统跨应用 procfs 隔离）就返回 null，诊断退回只显示 inode，与旧行为一致。
+     * 注意：本应用自己进程的 fd 一定能读 —— 10-02 那种"自己残留监听顶掉新会话"的场景会被直接点名。
+     */
+    private fun socketOwner(inode: String): String? {
+        val target = "socket:[$inode]"
+        val pids = File("/proc").listFiles { file -> file.name.all { it in '0'..'9' } } ?: return null
+        for (pidDir in pids) {
+            val fds = runCatching { File(pidDir, "fd").listFiles() }.getOrNull() ?: continue
+            for (fd in fds) {
+                if (readLink(fd) != target) continue
+                val name = runCatching {
+                    File(pidDir, "cmdline").readBytes().toString(Charsets.UTF_8).substringBefore('\u0000').trim()
+                }.getOrNull()?.ifEmpty { null }
+                    ?: runCatching { File(pidDir, "comm").readText().trim() }.getOrNull()?.ifEmpty { null }
+                    ?: "(进程名不可读)"
+                val self = if (pidDir.name.toIntOrNull() == android.os.Process.myPid()) "（本应用进程）" else ""
+                return "pid=${pidDir.name} name=$name$self"
+            }
+        }
+        return null
+    }
+
+    /** readlink：API21+ 用 Os；4.x 无该 API，反射 libcore.io.Libcore.os（平台类，与 MediaCodec 探测同款做法）。 */
+    private fun readLink(file: File): String? = try {
+        if (Build.VERSION.SDK_INT >= 21) {
+            android.system.Os.readlink(file.absolutePath)
+        } else {
+            val os = Class.forName("libcore.io.Libcore").getField("os").get(null)
+            os?.javaClass?.methods?.firstOrNull { it.name == "readlink" }
+                ?.invoke(os, file.absolutePath) as? String
+        }
+    } catch (_: Throwable) {
+        null
+    }
 
     private fun acceptLoop(
         generation: Int,

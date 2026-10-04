@@ -17,8 +17,7 @@ internal class VideoReferenceChain {
     var needsKeyFrame = true
         private set
     fun reset() { needsKeyFrame = true }
-    fun accepts(bytes: ByteArray, codec: VideoCodec): Boolean =
-        !needsKeyFrame || MediaCodecSupport.isRandomAccess(bytes, codec)
+    fun accepts(isRandomAccess: Boolean): Boolean = !needsKeyFrame || isRandomAccess
     fun onQueued() { needsKeyFrame = false }
 }
 

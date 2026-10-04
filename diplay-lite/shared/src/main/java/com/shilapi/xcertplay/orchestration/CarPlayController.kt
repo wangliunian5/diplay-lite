@@ -46,6 +46,7 @@ import java.io.Closeable
 import java.io.IOException
 import java.net.Inet6Address
 import java.net.InetAddress
+import java.util.ArrayDeque
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -137,6 +138,18 @@ class CarPlayController(
     private val touchExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val tunnelExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // M6k 触摸 latest-wins：C8815 上每个 ACTION_MOVE 都会走一次同步阻塞的 TCP 写
+    // （AirPlaySession.sendCommand 内 write+flush），手指快速滑动时 MOVE 在单线程队列里
+    // 排长队 → 触摸"不跟手"。改为：DOWN/UP（sticky）必发不合并；MOVE 只保留最新，
+    // 中间态直接丢弃。发送泵（pump）在 touchExecutor 上串行排空 pendingTouch。
+    private val touchLock = Any()
+    private val pendingTouch = ArrayDeque<PendingTouch>()
+    private var touchPumpRunning = false
+    private var touchSentCount = 0
+    private var touchCoalescedCount = 0
+    private var touchDroppedCount = 0
+    private var lastTouchStatsNs = System.nanoTime()
     private val lifecycleLock = Any()
     @Volatile private var uiListener: AirPlaySessionListener? = listener
     @Volatile private var uiStatusReporter: ((CarPlayStatus) -> Unit)? = reportStatus
@@ -287,15 +300,99 @@ class CarPlayController(
         }
     }
 
-    fun sendTouch(contacts: List<AirPlayContact>): Boolean {
+    /**
+     * M6k：触摸入口。[sticky] 为 true 表示该事件代表"触点状态变化"（DOWN/UP/POINTER_UP 等），
+     * 必须逐条送达；为 false 表示纯 MOVE，可被后续 MOVE 覆盖（latest-wins）。
+     *
+     * 与旧实现（每个事件都 execute 一个任务 → 无界排队）不同：这里先把事件并入 pendingTouch，
+     * 再确保只有一个"发送泵"任务在跑，泵在线程上串行排空队列。这样快速滑动时中间 MOVE 会被
+     * 合并掉，队列长度有界，触摸不再因排队而滞后。
+     */
+    fun sendTouch(contacts: List<AirPlayContact>, sticky: Boolean): Boolean {
         if (closed) return false
         val session = activeSession ?: return false
+        val shouldStart = synchronized(touchLock) {
+            enqueueTouchLocked(contacts, sticky)
+            if (touchPumpRunning) {
+                false
+            } else {
+                touchPumpRunning = true
+                true
+            }
+        }
+        if (!shouldStart) return true
         return try {
-            touchExecutor.execute { session.sendTouch(contacts) }
+            touchExecutor.execute { pumpTouch(session) }
             true
         } catch (_: Exception) {
+            synchronized(touchLock) { touchPumpRunning = false }
             false
         }
+    }
+
+    /** 入队：sticky 事件必留；MOVE 若队尾也是 MOVE 则就地覆盖（丢弃中间态）。 */
+    private fun enqueueTouchLocked(contacts: List<AirPlayContact>, sticky: Boolean) {
+        if (sticky) {
+            if (pendingTouch.size >= MAX_PENDING_TOUCH) {
+                // 极端滞后：丢最旧的 MOVE（队首通常是陈旧移动），但绝不丢 sticky 状态变化。
+                val head = pendingTouch.peekFirst()
+                if (head != null && !head.sticky) {
+                    pendingTouch.removeFirst()
+                    touchDroppedCount++
+                }
+            }
+            pendingTouch.addLast(PendingTouch(contacts, true))
+            return
+        }
+        val tail = pendingTouch.peekLast()
+        if (tail != null && !tail.sticky) {
+            pendingTouch.removeLast()
+            pendingTouch.addLast(PendingTouch(contacts, false))
+            touchCoalescedCount++
+        } else {
+            pendingTouch.addLast(PendingTouch(contacts, false))
+        }
+    }
+
+    /** 发送泵：在 touchExecutor 单线程上串行排空队列；排空后释放"运行中"标志。 */
+    private fun pumpTouch(session: AirPlaySession) {
+        while (true) {
+            val next = synchronized(touchLock) {
+                if (closed || pendingTouch.isEmpty()) {
+                    touchPumpRunning = false
+                    null
+                } else {
+                    pendingTouch.removeFirst()
+                }
+            } ?: return
+            try {
+                session.sendTouch(next.contacts)
+                synchronized(touchLock) { touchSentCount++ }
+            } catch (error: Exception) {
+                debugLog("touch send failed", error)
+            }
+            logTouchStatsIfDue()
+        }
+    }
+
+    /** 每 [TOUCH_STATS_INTERVAL_NS] 输出一次发送/合并/丢弃计数，用于实机验证是否在合并。 */
+    private fun logTouchStatsIfDue() {
+        val now = System.nanoTime()
+        val line = synchronized(touchLock) {
+            if (now - lastTouchStatsNs < TOUCH_STATS_INTERVAL_NS) return
+            if (touchSentCount == 0 && touchCoalescedCount == 0 && touchDroppedCount == 0) {
+                lastTouchStatsNs = now
+                return
+            }
+            val message = "touch stats sent=$touchSentCount coalesced=$touchCoalescedCount " +
+                "dropped=$touchDroppedCount pending=${pendingTouch.size}"
+            touchSentCount = 0
+            touchCoalescedCount = 0
+            touchDroppedCount = 0
+            lastTouchStatsNs = now
+            message
+        }
+        debugLog(line)
     }
 
     override fun close() {
@@ -495,7 +592,7 @@ class CarPlayController(
             }
             debugLog(
                 "wireless AirPlay listener attached bind=$hostAddressText " +
-                    "port=${airPlayConfig.port}",
+                    "port=${airPlayConfig.port} (Bonjour advertisement uses the same port)",
             )
             if (isStaleWirelessRun(generation)) {
                 closeWirelessStack()
@@ -536,14 +633,7 @@ class CarPlayController(
             }
 
             onStatus(CarPlayStatus.ConnectingBluetooth)
-            debugLog(
-                "wireless RFCOMM connecting address=${device.address} " +
-                    "uuid=$IAP2_IPHONE_UUID",
-            )
-            val socket = device
-                    .createRfcommSocketToServiceRecord(UUID.fromString(IAP2_IPHONE_UUID))
-                    .also { bluetoothSocket = it }
-            connectBluetoothSocket(socket, device.address)
+            val socket = openWirelessRfcommSocket(device)
             debugLog("wireless RFCOMM connected address=${device.address}")
             if (isStaleWirelessRun(generation)) {
                 closeWirelessStack()
@@ -963,6 +1053,52 @@ class CarPlayController(
         )
     }
 
+    /**
+     * M6k6：RFCOMM 建链加固。C8815 实测（20:33 日志）`Service discovery failed` 可连续
+     * 十余次失败（T14 手点 7 次才连上的同族问题），此前每轮重试都用同一种套接字：
+     * ①建链前取消适配器在跑的发现——发现扫描与 SDP 建链冲突是老栈的经典坑；
+     * ②安全口失败后回落不安全口（API10+；MFi 鉴权在 iAP2 层完成，不依赖 RFCOMM 加密）。
+     */
+    private fun openWirelessRfcommSocket(device: BluetoothDevice): BluetoothSocket {
+        bluetoothAdapter?.takeIf { it.isDiscovering }?.let { adapter ->
+            debugLog("wireless RFCOMM canceling discovery before connect")
+            adapter.cancelDiscovery()
+        }
+        var lastFailure: Throwable? = null
+        val modes = listOf("secure", "insecure")
+        for ((index, mode) in modes.withIndex()) {
+            try {
+                val uuid = UUID.fromString(IAP2_IPHONE_UUID)
+                val socket = if (mode == "secure") {
+                    device.createRfcommSocketToServiceRecord(uuid)
+                } else {
+                    device.createInsecureRfcommSocketToServiceRecord(uuid)
+                }.also { bluetoothSocket = it }
+                debugLog(
+                    "wireless RFCOMM connecting address=${device.address} " +
+                        "mode=$mode uuid=$IAP2_IPHONE_UUID",
+                )
+                connectBluetoothSocket(socket, device.address)
+                return socket
+            } catch (failure: Throwable) {
+                lastFailure = failure
+                debugLog(
+                    "wireless RFCOMM connect ($mode) failed: " +
+                        (failure.message ?: failure.javaClass.simpleName),
+                )
+                runCatching { bluetoothSocket?.close() }
+                if (index < modes.lastIndex) {
+                    bluetoothAdapter?.takeIf { it.isDiscovering }?.let { adapter ->
+                        debugLog("wireless RFCOMM canceling discovery before fallback")
+                        adapter.cancelDiscovery()
+                    }
+                    runCatching { Thread.sleep(RFCOMM_FALLBACK_DELAY_MILLIS) }
+                }
+            }
+        }
+        throw lastFailure ?: IOException("RFCOMM connect failed")
+    }
+
     private fun connectBluetoothSocket(socket: BluetoothSocket, address: String) {
         val result = AtomicReference<Throwable?>()
         val connected = CountDownLatch(1)
@@ -1008,28 +1144,30 @@ class CarPlayController(
     private fun closeWirelessStack() {
         wirelessConnectionProof.clear()
 
-        // 断链顺序（10-02 八轮实测调整）：先优雅结束 AirPlay 会话（关闭 control/event/timing/keepalive，
-        // 向 iPhone 发出 TCP FIN），让 iOS 先从 WiFi/AirPlay 侧感知会话结束；随后才断 iAP2 隧道与蓝牙。
-        // 原顺序「先断蓝牙后关 AirPlay」会让 iOS 把蓝牙掉线当瞬时抖动而保持 CarPlay（用户实测：
+        // 断链顺序（M6k8 调整）：**先下线 Bonjour 广报**（NsdManager unregisterService /
+        // JmDNS close 发 goodbye），iPhone 立即感知服务消失并清 mDNS 缓存；随后才关 AirPlay
+        // 监听与会话。若反序：监听已死而广报记录仍在 TTL 内，iPhone 重连会先撞死端口、
+        // 等缓存过期（实测 ~40s）。10-02 八轮实测的约束保留：AirPlay 会话的 TCP FIN 必须先于
+        // iAP2 隧道/蓝牙断开，否则 iOS 把蓝牙掉线当瞬时抖动而保持 CarPlay（用户实测：
         // 必须手动关车机热点/蓝牙才退）。每步补文件日志，供下一轮无 adb 的实机日志定位。
+        debugLog("wireless teardown step=1/5 unregistering Bonjour advertisement")
+        val activeBonjour = bonjour
+        bonjour = null
+        if (activeBonjour != null) closeBestEffort("Bonjour") { activeBonjour.close() }
+
         val activeServer = airPlayServer
         airPlayServer = null
-        debugLog("wireless teardown step=1/5 closing AirPlay server and sessions")
+        debugLog("wireless teardown step=2/5 closing AirPlay server and sessions")
         if (activeServer != null) closeBestEffort("AirPlay server") { activeServer.detach() }
 
-        debugLog("wireless teardown step=2/5 releasing iAP2 tunnel handler")
+        debugLog("wireless teardown step=3/5 releasing iAP2 tunnel handler")
         media.setIapTunnelHandler(null)
         val activeTunnel = wirelessTunnelChannel
         wirelessTunnelChannel = null
         if (activeTunnel != null) closeBestEffort("tunneled iAP2 link") { activeTunnel.close() }
 
-        debugLog("wireless teardown step=3/5 closing Bluetooth bootstrap transport")
+        debugLog("wireless teardown step=4/5 closing Bluetooth bootstrap transport")
         closeBluetoothBootstrapTransport()
-
-        debugLog("wireless teardown step=4/5 closing Bonjour")
-        val activeBonjour = bonjour
-        bonjour = null
-        if (activeBonjour != null) closeBestEffort("Bonjour") { activeBonjour.close() }
 
         debugLog("wireless teardown step=5/5 releasing hotspot handle")
         val activeHotspot = hotspot
@@ -1217,6 +1355,9 @@ class CarPlayController(
             "ERROR $message"
     }
 
+    /** M6k：排队中的一条触摸事件。[sticky] 标记它是否代表触点状态变化（不可被 MOVE 覆盖）。 */
+    private class PendingTouch(val contacts: List<AirPlayContact>, val sticky: Boolean)
+
     companion object {
         private const val IAP2_IPHONE_UUID = "00000000-deca-fade-deca-deafdecacafe"
         private const val HOTSPOT_START_TIMEOUT_MILLIS = 60_000L
@@ -1226,6 +1367,9 @@ class CarPlayController(
         // M6h：链路掉线后的自动重连（次数 + 间隔）。
         private const val MAX_WIRELESS_RETRIES = 3
         private const val WIRELESS_RETRY_DELAY_MILLIS = 5_000L
+        // M6k：触摸队列上限（超过则丢最旧 MOVE）与计数日志间隔。
+        private const val MAX_PENDING_TOUCH = 8
+        private const val TOUCH_STATS_INTERVAL_NS = 5_000_000_000L
         private val RETRYABLE_WIRELESS_FAILURES = listOf(
             "connection abort",
             "iap2 link ended",
@@ -1237,6 +1381,7 @@ class CarPlayController(
             "closed before tunnel iap2 ready",
         )
         private const val RFCOMM_CONNECT_TIMEOUT_MILLIS = 15_000L
+        private const val RFCOMM_FALLBACK_DELAY_MILLIS = 150L
         private const val EXECUTOR_CLOSE_TIMEOUT_MILLIS = 2_000L
         private const val ADAPTER_ADDRESS_PLACEHOLDER = "02:00:00:00:00:00"
         private val BLUETOOTH_ADDRESS = Regex("^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
