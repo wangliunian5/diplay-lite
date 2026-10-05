@@ -754,6 +754,23 @@ class CarPlayController(
         return RETRYABLE_WIRELESS_FAILURES.any { message.contains(it) }
     }
 
+    /**
+     * M6k9：把错误归到一族标签，纯为日志可读（判据仍是 [RETRYABLE_WIRELESS_FAILURES] 子串表，
+     * 不另建一套分类逻辑）。日志里见到 class=PEER_REQUEST/LOCAL_STOP 即「不该重连」，
+     * class=OTHER 即「不在可重连族内」。
+     */
+    private fun wirelessFailureClass(error: Throwable): String {
+        val message = error.message.orEmpty().lowercase()
+        return when {
+            !isRetryableWirelessFailure(error) -> "OTHER"
+            message.contains("abort") -> "CONNECTION_ABORT"
+            message.contains("service discovery") || message.contains("refused") -> "SERVICE_DISCOVERY_FAILED"
+            message.contains("iap2") || message.contains("tunnel") -> "IAP2_LINK_ENDED"
+            message.contains("eof") -> "EOF"
+            else -> "SOCKET_EXCEPTION"
+        }
+    }
+
     /** M6h：延时后重跑无线流水线；额度用尽才把失败交给 UI。 */
     private fun scheduleWirelessRetry(generation: Int, error: Throwable) {
         val attempt = wirelessRetryCount.incrementAndGet()
@@ -762,9 +779,15 @@ class CarPlayController(
             fail(error)
             return
         }
+        val delayMs = minOf(
+            WIRELESS_RETRY_DELAY_BASE_MILLIS * attempt,
+            WIRELESS_RETRY_DELAY_MAX_MILLIS,
+        )
         debugLog(
-            "wireless link dropped (${error.message ?: error.javaClass.simpleName}); " +
-                "auto-retry $attempt/$MAX_WIRELESS_RETRIES in $WIRELESS_RETRY_DELAY_MILLIS ms",
+            "wireless link dropped (${error.message ?: error.javaClass.simpleName}) " +
+                "class=${wirelessFailureClass(error)}; " +
+                "auto-retry $attempt/$MAX_WIRELESS_RETRIES " +
+                "RESTART gen=$generation backoff=${delayMs}ms",
         )
         mainHandler.postDelayed(
             {
@@ -777,7 +800,7 @@ class CarPlayController(
                 }
                 restartWireless()
             },
-            WIRELESS_RETRY_DELAY_MILLIS,
+            delayMs,
         )
     }
 
@@ -1054,7 +1077,8 @@ class CarPlayController(
     }
 
     /**
-     * M6k6：RFCOMM 建链加固。C8815 实测（20:33 日志）`Service discovery failed` 可连续
+     * M6k6：RFCOMM 建链加固。C8815 实测（20:31 日志，导出档 -203326；注意与车机 B 的
+     * 20:33 日志区分——后者是 `iAP2 link ended`，与 `Service discovery failed` 不同病）`Service discovery failed` 可连续
      * 十余次失败（T14 手点 7 次才连上的同族问题），此前每轮重试都用同一种套接字：
      * ①建链前取消适配器在跑的发现——发现扫描与 SDP 建链冲突是老栈的经典坑；
      * ②安全口失败后回落不安全口（API10+；MFi 鉴权在 iAP2 层完成，不依赖 RFCOMM 加密）。
@@ -1153,26 +1177,26 @@ class CarPlayController(
         debugLog("wireless teardown step=1/5 unregistering Bonjour advertisement")
         val activeBonjour = bonjour
         bonjour = null
-        if (activeBonjour != null) closeBestEffort("Bonjour") { activeBonjour.close() }
+        timedStep("Bonjour") { activeBonjour?.close() }
 
         val activeServer = airPlayServer
         airPlayServer = null
         debugLog("wireless teardown step=2/5 closing AirPlay server and sessions")
-        if (activeServer != null) closeBestEffort("AirPlay server") { activeServer.detach() }
+        timedStep("AirPlayServer") { activeServer?.detach() }
 
         debugLog("wireless teardown step=3/5 releasing iAP2 tunnel handler")
         media.setIapTunnelHandler(null)
         val activeTunnel = wirelessTunnelChannel
         wirelessTunnelChannel = null
-        if (activeTunnel != null) closeBestEffort("tunneled iAP2 link") { activeTunnel.close() }
+        timedStep("iAP2Tunnel") { activeTunnel?.close() }
 
         debugLog("wireless teardown step=4/5 closing Bluetooth bootstrap transport")
-        closeBluetoothBootstrapTransport()
+        timedStep("BtBootstrap") { closeBluetoothBootstrapTransport() }
 
         debugLog("wireless teardown step=5/5 releasing hotspot handle")
         val activeHotspot = hotspot
         hotspot = null
-        if (activeHotspot != null) closeBestEffort("wireless hotspot") { activeHotspot.close() }
+        timedStep("HotspotHandle") { activeHotspot?.close() }
         wirelessIdentification = null
         wirelessAirPlayEndpoint = null
         wirelessHandoffRequested.set(false)
@@ -1265,6 +1289,26 @@ class CarPlayController(
         } catch (error: Throwable) {
             debugLog("$name teardown failed", error)
         }
+    }
+
+    /**
+     * M6k9：teardown 逐资源打点。每条独立 try，失败只记 completed=false、不中断其余步骤
+     * （下代 bring-up 自会重建）；耗时用于判断是哪一步拖慢重连。资源为 null 时按 completed=true
+     * 记一条（表示「本代未持有，无需拆」），保证 5 步每代都有完整痕迹。
+     */
+    private inline fun timedStep(name: String, close: () -> Unit) {
+        val startedNs = System.nanoTime()
+        var ok = true
+        try {
+            close()
+        } catch (error: Throwable) {
+            ok = false
+            debugLog("$name teardown failed", error)
+        }
+        debugLog(
+            "teardown resource=$name completed=$ok " +
+                "elapsedMs=${(System.nanoTime() - startedNs) / 1_000_000}",
+        )
     }
 
     private fun controlLoopTimeoutMillis(): Long = when {
@@ -1365,8 +1409,11 @@ class CarPlayController(
         private const val LOCATION_CONTROL_LOOP_TIMEOUT_MILLIS = 24 * 60 * 60 * 1_000L
         private const val WIRELESS_HANDOFF_TIMEOUT_MILLIS = 45_000L
         // M6h：链路掉线后的自动重连（次数 + 间隔）。
-        private const val MAX_WIRELESS_RETRIES = 3
-        private const val WIRELESS_RETRY_DELAY_MILLIS = 5_000L
+        // M6k9：额度 3 → 5，间隔由固定 5s 改为指数退避（4s×attempt，封顶 15s）；
+        // 重建会话成功（WirelessActive / degraded）即 attempt 归零，避免陈旧计数放大退避。
+        private const val MAX_WIRELESS_RETRIES = 5
+        private const val WIRELESS_RETRY_DELAY_BASE_MILLIS = 4_000L
+        private const val WIRELESS_RETRY_DELAY_MAX_MILLIS = 15_000L
         // M6k：触摸队列上限（超过则丢最旧 MOVE）与计数日志间隔。
         private const val MAX_PENDING_TOUCH = 8
         private const val TOUCH_STATS_INTERVAL_NS = 5_000_000_000L
