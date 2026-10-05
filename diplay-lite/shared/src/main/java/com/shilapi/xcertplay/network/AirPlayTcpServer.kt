@@ -16,6 +16,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * AirPlay TCP 监听器（Lite：自 minapi21 分支 CarPlayVpnService.attachWireless 抽出）。
@@ -47,6 +48,10 @@ class AirPlayTcpServer {
     @Volatile private var attachment: AirPlayAttachment? = null
     private var serverSocket: ServerSocket? = null
     private var attachGeneration = 0
+    private val acceptedConnections = AtomicInteger(0)
+
+    /** 已接受的入站 TCP 连接总数（断线重连采样 tcpAccepted 判据：0=iPhone 未进来）。 */
+    fun acceptedConnectionCount(): Int = acceptedConnections.get()
 
     /** 在热点地址上启动 AirPlay 监听；重复调用会先替换旧附件。 */
     @Synchronized
@@ -197,6 +202,7 @@ class AirPlayTcpServer {
         try {
             while (active.get()) {
                 val socket: Socket = server.accept()
+                acceptedConnections.incrementAndGet()
                 Log.i(TAG, "airplay connection accepted from ${socket.remoteSocketAddress}")
                 socket.tcpNoDelay = true
                 socket.keepAlive = true

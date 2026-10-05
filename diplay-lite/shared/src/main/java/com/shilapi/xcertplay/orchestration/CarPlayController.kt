@@ -9,9 +9,11 @@ import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import com.shilapi.xcertplay.airplay.AirPlayConfig
@@ -184,6 +186,13 @@ class CarPlayController(
     private val wirelessRetryCount = AtomicInteger(0)
     private val wirelessGeneration = AtomicInteger(0)
     private val wirelessConnectionProof = WirelessConnectionProof<AirPlaySession>()
+
+    // M6k10 重连可观测：iAP2 隧道就绪即 authenticated；采样器每秒输出 tcpAccepted 等判据，
+    // 定位「连上但 iPhone 不进来」卡在 Wi-Fi 段（tcpAccepted=0）还是 RTSP 段（tcpAccepted≥1）。
+    private val wirelessAuthenticated = AtomicBoolean(false)
+    @Volatile private var wirelessBringUpStartedAtMs = 0L
+    @Volatile private var wirelessRestartEpisodeStartedAtMs = 0L
+    @Volatile private var wirelessSamplerThread: Thread? = null
     private var lastReportedStatus: CarPlayStatus? = null
     private val teardownComplete = CountDownLatch(1)
 
@@ -503,6 +512,7 @@ class CarPlayController(
     private fun runWireless(generation: Int) {
         try {
             debugLog("wireless bring-up generation=$generation starting")
+            wirelessBringUpStartedAtMs = SystemClock.elapsedRealtime()
             closeWirelessStack()
             if (closed || phase != Phase.WIRELESS || generation != wirelessGeneration.get()) {
                 return
@@ -572,6 +582,7 @@ class CarPlayController(
 
             // Lite：进程内 AirPlayTcpServer 取代 CarPlayVpnService 绑定。
             onStatus(CarPlayStatus.AttachingNetwork)
+            startWirelessSampler(generation)
             val server = AirPlayTcpServer()
             when (
                 val result = server.attach(
@@ -774,6 +785,10 @@ class CarPlayController(
     /** M6h：延时后重跑无线流水线；额度用尽才把失败交给 UI。 */
     private fun scheduleWirelessRetry(generation: Int, error: Throwable) {
         val attempt = wirelessRetryCount.incrementAndGet()
+        if (wirelessRestartEpisodeStartedAtMs == 0L) {
+            // 纪元起点 = 本轮故障第一次触发重连的时刻；SESSION_ACTIVE 的 total 由此起算。
+            wirelessRestartEpisodeStartedAtMs = SystemClock.elapsedRealtime()
+        }
         if (attempt > MAX_WIRELESS_RETRIES) {
             debugLog("wireless auto-retry exhausted after $MAX_WIRELESS_RETRIES attempts")
             fail(error)
@@ -898,6 +913,7 @@ class CarPlayController(
             return
         }
         wirelessTunnelReady.set(true)
+        wirelessAuthenticated.set(true)
         wirelessConnectionProof.authenticated(generation)
         debugLog(
             "wireless iAP2 tunnel ready; " +
@@ -909,8 +925,9 @@ class CarPlayController(
     private fun maybeCompleteWirelessHandoff() {
         if (!wirelessHandoffRequested.get() || !wirelessTunnelReady.get()) return
         if (!wirelessActiveReported.compareAndSet(false, true)) return
-        wirelessRetryCount.set(0)
         val generation = wirelessGeneration.get()
+        val attempt = wirelessRetryCount.getAndSet(0)
+        logWirelessSessionActive(generation, attempt)
         Thread(
             {
                 if (
@@ -962,7 +979,8 @@ class CarPlayController(
                             // M6g：先置位再上报，避免与控制环超时分支竞态。
                             wirelessDegradedActive.set(true)
                             // M6h：会话已经可用（A/V 在跑），自动重试额度重新给满。
-                            wirelessRetryCount.set(0)
+                            val attempt = wirelessRetryCount.getAndSet(0)
+                            logWirelessSessionActive(generation, attempt, degraded = true)
                             debugLog(
                                 "handoff degraded: keeping Bluetooth iAP2 + Wi-Fi A/V " +
                                     "(hasRenderedFrame, no type-130 iAP2 tunnel)",
@@ -1165,6 +1183,77 @@ class CarPlayController(
         }
     }
 
+    /**
+     * M6k10：bring-up 期间每秒采样关键判据（作者 0.2.11 诊断包结构）。
+     * tcpAccepted=0 → iPhone 还没加入热点 Wi-Fi（Wi-Fi 段等待）；≥1 → 已进 RTSP 阶段。
+     * active=true 或代次失效时自动停止；teardown 也会强制停止。
+     */
+    private fun startWirelessSampler(generation: Int) {
+        stopWirelessSampler()
+        val sampler = Thread(
+            {
+                var elapsedSeconds = 0L
+                while (
+                    !closed &&
+                    phase == Phase.WIRELESS &&
+                    generation == wirelessGeneration.get() &&
+                    !wirelessActiveReported.get() &&
+                    !wirelessDegradedActive.get()
+                ) {
+                    debugLog(
+                        "wireless sample gen=$generation t=+${elapsedSeconds}s " +
+                            "tcpAccepted=${airPlayServer?.acceptedConnectionCount() ?: 0} " +
+                            "authenticated=${wirelessAuthenticated.get()} " +
+                            "handoffRequested=${wirelessHandoffRequested.get()} " +
+                            "tunnelReady=${wirelessTunnelReady.get()} " +
+                            "wifiConfigs=${wifiConfigCount()}",
+                    )
+                    try {
+                        Thread.sleep(1_000L)
+                    } catch (interrupted: InterruptedException) {
+                        return@Thread
+                    }
+                    elapsedSeconds += 1
+                }
+            },
+            "xcertplay-wireless-sampler",
+        )
+        sampler.isDaemon = true
+        wirelessSamplerThread = sampler
+        sampler.start()
+    }
+
+    private fun stopWirelessSampler() {
+        val sampler = wirelessSamplerThread ?: return
+        wirelessSamplerThread = null
+        sampler.interrupt()
+    }
+
+    /** 会话建立收口：SESSION_ACTIVE 一行讲清耗时（重连总耗时从故障纪元起点起算）。 */
+    private fun logWirelessSessionActive(generation: Int, attempt: Int, degraded: Boolean = false) {
+        val now = SystemClock.elapsedRealtime()
+        val bringUpMs = wirelessBringUpStartedAtMs.takeIf { it > 0 }?.let { now - it } ?: -1L
+        val reconnectTotalMs =
+            wirelessRestartEpisodeStartedAtMs.takeIf { it > 0 }?.let { now - it }
+        wirelessRestartEpisodeStartedAtMs = 0L
+        debugLog(
+            "wireless SESSION_ACTIVE gen=$generation attempt=$attempt" +
+                "${if (degraded) " (degraded)" else ""} " +
+                "bringUpMs=$bringUpMs " +
+                "reconnectTotalMs=${reconnectTotalMs ?: "n/a(first-run)"}",
+        )
+    }
+
+    @Suppress("DEPRECATION")
+    private fun wifiConfigCount(): Int = try {
+        val wifiManager =
+            appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        wifiManager?.configuredNetworks?.size ?: -1
+    } catch (error: Exception) {
+        // API16 适配：configuredNetworks 部分厂商 ROM 抛 SecurityException/RuntimeException。
+        -1
+    }
+
     private fun closeWirelessStack() {
         wirelessConnectionProof.clear()
 
@@ -1203,6 +1292,8 @@ class CarPlayController(
         wirelessTunnelReady.set(false)
         wirelessActiveReported.set(false)
         wirelessDegradedActive.set(false)
+        wirelessAuthenticated.set(false)
+        stopWirelessSampler()
         debugLog("wireless teardown complete")
     }
 
