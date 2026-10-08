@@ -6,6 +6,8 @@ import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.AudioManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
@@ -234,18 +236,52 @@ object AudioChannelPreview {
         val minBuffer = AudioTrack.getMinBufferSize(sampleRate, channelMask, encoding)
         if (minBuffer <= 0) return null
         return if (stream <= 0) {
-            val usage = if (media) AudioAttributes.USAGE_MEDIA else AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
-            val contentType = if (media) AudioAttributes.CONTENT_TYPE_MUSIC else AudioAttributes.CONTENT_TYPE_SPEECH
-            AudioTrack.Builder()
-                .setAudioAttributes(AudioAttributes.Builder().setUsage(usage).setContentType(contentType).build())
-                .setAudioFormat(AudioFormat.Builder().setSampleRate(sampleRate).setChannelMask(channelMask).setEncoding(encoding).build())
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .setBufferSizeInBytes(minBuffer)
-                .build()
+            // API16 适配：AudioTrack.Builder/AudioAttributes 是 API 23+；更低版本回退传统
+            // stream 构造（NoSuchMethodError 是 Error，外层 catch Exception 拦不住，必须走分支）。
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                buildUsageTrack(media, sampleRate, channelMask, minBuffer)
+            } else {
+                buildLegacyTrack(sampleRate, channelMask, minBuffer)
+            }
         } else {
             @Suppress("DEPRECATION")
             AudioTrack(stream, sampleRate, channelMask, encoding, minBuffer, AudioTrack.MODE_STREAM)
         }
+    }
+
+    /** API 23+：usage 路由建轨（媒体/导航各用各的 usage），与 AndroidMediaSink 同路径。 */
+    private fun buildUsageTrack(
+        media: Boolean,
+        sampleRate: Int,
+        channelMask: Int,
+        minBuffer: Int,
+    ): AudioTrack {
+        val encoding = AudioFormat.ENCODING_PCM_16BIT
+        val usage = if (media) AudioAttributes.USAGE_MEDIA else AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
+        val contentType = if (media) AudioAttributes.CONTENT_TYPE_MUSIC else AudioAttributes.CONTENT_TYPE_SPEECH
+        return AudioTrack.Builder()
+            .setAudioAttributes(AudioAttributes.Builder().setUsage(usage).setContentType(contentType).build())
+            .setAudioFormat(AudioFormat.Builder().setSampleRate(sampleRate).setChannelMask(channelMask).setEncoding(encoding).build())
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .setBufferSizeInBytes(minBuffer)
+            .build()
+    }
+
+    /** API < 23：无 usage 路由，传统 stream 路径（与低版本实际播放一致，STREAM_MUSIC）。 */
+    @Suppress("DEPRECATION")
+    private fun buildLegacyTrack(
+        sampleRate: Int,
+        channelMask: Int,
+        minBuffer: Int,
+    ): AudioTrack {
+        return AudioTrack(
+            AudioManager.STREAM_MUSIC,
+            sampleRate,
+            channelMask,
+            AudioFormat.ENCODING_PCM_16BIT,
+            minBuffer,
+            AudioTrack.MODE_STREAM,
+        )
     }
 
     private fun stopTrack() {

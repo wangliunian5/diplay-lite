@@ -1,7 +1,10 @@
 package com.shilapi.xcertplay.network
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.wifi.ScanResult
 import android.net.wifi.SoftApConfiguration
@@ -328,6 +331,10 @@ class ManualHotspotManager(
         // 1.0.22（S7/SM-G9650 排查）：AP 模式下 STA 常不主动扫描，缓存列表里可能没有
         // 本机 AP——主动触发一次扫描并短暂等待后重读（best effort，失败不阻塞）。
         if (scanResults.none { it.BSSID.equals(localBssid, ignoreCase = true) }) {
+            // 1.0.27（S7 实测 observed=0/frequency=unknown）：observed=0 时无法区分
+            // 「扫描能力缺失」与「本机 AP 不可见」，落判别证据——Android 6+ 扫描结果
+            // 需要定位权限 + 定位服务开启，缺任一则 scanResults 恒空、观测永远失败。
+            diagnoseScanObservationMiss(scanResults.size, localBssid)
             try {
                 wifiManager.startScan()
             } catch (_: Throwable) {
@@ -355,6 +362,35 @@ class ManualHotspotManager(
             }
         }
         return null
+    }
+
+    /**
+     * 1.0.27（S7 实测 observed=0/frequency=unknownMHz，iPhone 按猜测信道扫描自然不 join）：
+     * 扫描观测失败时落判别证据。Android 6+ 的 scanResults 需要「定位权限已授予 + 定位服务
+     * 开启」，缺任一则列表恒空；权限齐全仍扫不到则记列表规模供下轮比对。
+     */
+    private fun diagnoseScanObservationMiss(cachedCount: Int, localBssid: String) {
+        val locationPermission = if (Build.VERSION.SDK_INT >= 23) {
+            val coarse = appContext.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+            val fine = appContext.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+            coarse || fine
+        } else {
+            true
+        }
+        val locationEnabled = try {
+            val lm = appContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            lm.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+                lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+        } catch (_: Throwable) {
+            false
+        }
+        onDiagnostic(
+            "Manual hotspot scan observation miss: cachedResults=$cachedCount ownBssid=$localBssid " +
+                "locationPermission=$locationPermission locationEnabled=$locationEnabled " +
+                "(Android 6+ needs location permission + location service ON for scan results)",
+        )
     }
 
     /** SSID 与 frequency 在 API 21 才转正，4.x 运行时存在同名字段，反射读取兜底。 */

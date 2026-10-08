@@ -2195,9 +2195,15 @@ class CarPlayController(
                 return null
             }
         }
-        val bridge = Ipv6NcmBridge(ncm, tun, hostMac) { error ->
-            debugLog("wired NCM bridge error: ${error.message ?: error.javaClass.simpleName}")
-        }
+        val bridge = Ipv6NcmBridge(
+            ncm = ncm,
+            tun = tun,
+            hostMac = hostMac,
+            onDiagnostic = ::debugLog,
+            onError = { error ->
+                debugLog("wired NCM bridge error: ${error.message ?: error.javaClass.simpleName}")
+            },
+        )
         bridge.start()
         return bridge
     }

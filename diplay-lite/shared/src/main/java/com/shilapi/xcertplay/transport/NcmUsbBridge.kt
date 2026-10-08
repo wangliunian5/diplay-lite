@@ -42,6 +42,15 @@ class NcmUsbBridge internal constructor(
     private var buffered = ByteArray(0)
     private var bufferedSize = 0
     private val readBuffer = ByteArray(READ_CHUNK_BYTES)
+    // 1.0.25（3e 1.0.24 双会话实测 21:02:48/21:03:19）：EMUI 的 UsbRequest.queue() 会瞬时
+    // 返回 false（21:02:48.685+48.999、21:03:19.875×2），原实现直接 failSession → NCM 读线程
+    // 死亡 → 音视频同刻冻结（rx=3.4fps 即窗口残值、touch2frame max=25304ms、用户感知卡死）。
+    // queue() 失败按可恢复瞬态处理：本轮降级同步读；连续 ASYNC_QUEUE_FAILURE_LIMIT 次失败
+    // 才永久退化（API 26+ 首选异步的原因见 asyncRead 注释——同步 bulkTransfer 全程钉住
+    // JNI critical 区会拖慢 GC，表现为 ~0.8s 音视频顿卡，故不作默认）。
+    @Volatile
+    private var permanentSyncRead = false
+    private var asyncQueueFailures = 0
     // Bulk IN uses one persistent async request on API 26+: bulkTransfer() pins its byte[] in a
     // JNI critical section for the whole wait, which blocks ART's GC thread flip and, with it,
     // every other USB transfer (seen as ~0.8 s stalls of video and audio). A timed-out request
@@ -142,6 +151,29 @@ class NcmUsbBridge internal constructor(
         if (asyncRead) runCatching { requestToClose?.close() }
     }
 
+    /**
+     * 1.0.26（3e 1.0.25 实测 21:17:50/21:18:07）：对数据面 IN 端点发 CLEAR_FEATURE
+     * (ENDPOINT_HALT)。EMUI USB 栈偶发把 IN 端点楔死（queue() 失败、同步读也永远
+     * 拿不到数据），clear halt 有机会恢复数据流；对未 halt 的健康端点是 USB spec
+     * 定义内的无害 no-op。与 close 用 stateLock 互斥。
+     */
+    fun clearHaltInEndpoints() {
+        synchronized(stateLock) {
+            if (closed) return
+            runCatching {
+                connection.controlTransfer(
+                    /* requestType = */ 0x02, // standard, endpoint recipient, host-to-device
+                    /* request = */ 0x01, // CLEAR_FEATURE
+                    /* value = */ 0x0000, // ENDPOINT_HALT
+                    /* index = */ inEndpoint.address,
+                    /* buffer = */ null,
+                    /* length = */ 0,
+                    /* timeout = */ 100,
+                )
+            }
+        }
+    }
+
     private fun drainStatus(endpoint: UsbEndpoint) {
         val buffer = ByteArray(endpoint.maxPacketSize.coerceAtLeast(64))
         var loggedFirst = false
@@ -228,7 +260,7 @@ class NcmUsbBridge internal constructor(
 
     private fun readChunk(timeoutMillis: Long): Int? {
         checkOpen()
-        return if (asyncRead) readChunkAsync(timeoutMillis) else readChunkSync(timeoutMillis)
+        return if (asyncRead && !permanentSyncRead) readChunkAsync(timeoutMillis) else readChunkSync(timeoutMillis)
     }
 
     /** API < 26：同步 bulkTransfer 读（超时/失败返回 null，交由上层重试）。 */
@@ -242,6 +274,7 @@ class NcmUsbBridge internal constructor(
     }
 
     private fun readChunkAsync(timeoutMillis: Long): Int? {
+        var queueFailed = false
         val request = try {
             // Publish and queue atomically with close(), so detach cannot miss a new request.
             synchronized(stateLock) {
@@ -255,14 +288,43 @@ class NcmUsbBridge internal constructor(
                 }
                 if (!readQueued) {
                     directReadBuffer.clear()
-                    if (!current.queue(directReadBuffer)) throw failSession("Android could not queue the NCM read request")
-                    readQueued = true
+                    // 1.0.25：queue() 返回 false（EMUI 瞬态）或抛 RuntimeException 都不再
+                    // failSession——标记本轮降级同步读，锁外执行（同步 bulkTransfer 可能
+                    // 阻塞整个超时窗口，绝不能握着 stateLock 阻塞 send()）。
+                    val queued = try {
+                        current.queue(directReadBuffer)
+                    } catch (_: RuntimeException) {
+                        false
+                    }
+                    if (!queued) {
+                        asyncQueueFailures += 1
+                        // 1.0.26：降级首次发生时落日志——3e 1.0.25 实测中降级是静默的，
+                        // 无法与入向楔死（USBMUX fallback 同刻）做日志对齐取证。
+                        if (asyncQueueFailures == 1) {
+                            Log.i(
+                                IphoneCarPlayConfiguration.TAG,
+                                "ncm async queue unavailable; sync fallback engaged this round",
+                            )
+                        }
+                        if (asyncQueueFailures >= ASYNC_QUEUE_FAILURE_LIMIT && !permanentSyncRead) {
+                            permanentSyncRead = true
+                            Log.w(
+                                IphoneCarPlayConfiguration.TAG,
+                                "ncm async queue keeps failing (x$asyncQueueFailures); degrading to sync reads",
+                            )
+                        }
+                        queueFailed = true
+                    } else {
+                        asyncQueueFailures = 0
+                        readQueued = true
+                    }
                 }
-                current
+                if (queueFailed) null else current
             }
         } catch (error: RuntimeException) {
             throw failSession("NCM read failed", error)
         }
+        if (request == null) return readChunkSync(timeoutMillis)
         try {
             val completed = try {
                 connection.requestWait(timeoutMillis.coerceAtLeast(1))
@@ -321,6 +383,7 @@ class NcmUsbBridge internal constructor(
         private const val MAX_QUEUED_FRAMES = 256
         private const val MAX_QUEUED_BYTES = 1 shl 20
         private const val NANOS_PER_MILLISECOND = 1_000_000L
+        private const val ASYNC_QUEUE_FAILURE_LIMIT = 3
 
         /** 1.0.3：getAlternateSetting 是 API 24+，< 24 固定打 0（仅诊断日志用途）。 */
         private fun altOf(usbInterface: UsbInterface): Int =
