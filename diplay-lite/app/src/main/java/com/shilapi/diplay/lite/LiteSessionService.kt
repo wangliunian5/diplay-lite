@@ -269,6 +269,13 @@ class LiteSessionService : Service() {
                         else -> config.password
                     },
                     manualHotspotSecurity = security,
+                    // 1.0.22（S7 实测）：UI「IPV4首选信道」从未接线——此处构造
+                    // CarPlayRuntimeConfig 时一直漏传 manualHotspotChannel（恒默认 0），
+                    // ManualHotspotManager 观测失败后永远兜底下发信道 6，iPhone 按凭证
+                    // 扫不到实际在别的信道的热点（S7×7 代 First TCP timeout 根因，
+                    // 设置页「即时生效」提示名不副实）。车机热点模式接上手填信道
+                    // （0=自动）；relay 复用凭据字段不吃信道、usb 无热点，均保持 0。
+                    manualHotspotChannel = if (usb || relay) 0 else config.carIpv4Channel,
                     wirelessBluetoothDeviceAddress = config.bluetoothAddress.takeIf { it.isNotBlank() },
                 ),
                 airPlayConfig = AirPlayConfig(

@@ -131,6 +131,15 @@ class ManualHotspotManager(
                     throw IOException("Manual hotspot is secured but no passphrase was provided")
                 }
 
+                // 1.0.22（S7 实测）：非 ASCII SSID（如误输入的中文句号）会进 0x5703 凭证，
+                // iPhone 扫描结果与凭证的编码比对易失配导致拒绝自动加入——留下诊断证据。
+                if (expectedSsid.any { it.code > 126 }) {
+                    onDiagnostic(
+                        "Manual hotspot ssid contains non-ASCII characters " +
+                            "(iPhone auto-join may fail): \"$expectedSsid\"",
+                    )
+                }
+
                 if (observedChannel == 0) {
                     Log.w(
                         TAG,
@@ -311,23 +320,41 @@ class ManualHotspotManager(
 
     private fun frequencyFromScanResult(localInterface: LocalHotspotInterface): Int? {
         val localBssid = localInterface.hardwareAddress ?: return null
-        // API16 适配（B3 实测坑）：车机热点开启后 STA 停止扫描，部分 4.x ROM 的
-        // getScanResults() 返回 null 而非空列表（平台类型直接使用会 NPE）。
-        // null 按拿不到信道处理，交由 channel=0（auto）兜底。
-        val scanResults = try {
-            wifiManager.scanResults ?: return null
+        var scanResults = try {
+            wifiManager.scanResults
         } catch (_: SecurityException) {
-            return null
-        }
-        return scanResults
-            .mapNotNull { result ->
-                if (result.BSSID.equals(localBssid, ignoreCase = true)) {
-                    scanResultFrequency(result)
-                } else {
-                    null
-                }
+            null
+        } ?: return null
+        // 1.0.22（S7/SM-G9650 排查）：AP 模式下 STA 常不主动扫描，缓存列表里可能没有
+        // 本机 AP——主动触发一次扫描并短暂等待后重读（best effort，失败不阻塞）。
+        if (scanResults.none { it.BSSID.equals(localBssid, ignoreCase = true) }) {
+            try {
+                wifiManager.startScan()
+            } catch (_: Throwable) {
+                // 权限/频控失败不致命
             }
-            .firstOrNull { it > 0 }
+            sleep(900_000_000L)
+            scanResults = try {
+                wifiManager.scanResults
+            } catch (_: SecurityException) {
+                null
+            } ?: return null
+        }
+        for (result in scanResults) {
+            if (!result.BSSID.equals(localBssid, ignoreCase = true)) continue
+            // 1.0.22：BSSID 命中即为本机 AP，不再要求 SSID 字符串相等——非 ASCII SSID
+            // （如带中文句号）在 ScanResult.SSID 里的转义可能与配置串不一致，曾导致
+            // BSSID 命中仍被 SSID 比对拦下、observed=0 退回猜测信道（S7 实测）。
+            val frequency = scanResultFrequency(result)
+            if (frequency != null && frequency > 0) {
+                onDiagnostic(
+                    "Manual hotspot scan hit own AP bssid=$localBssid frequency=$frequency " +
+                        "ssidObserved=${result.SSID}",
+                )
+                return frequency
+            }
+        }
+        return null
     }
 
     /** SSID 与 frequency 在 API 21 才转正，4.x 运行时存在同名字段，反射读取兜底。 */
@@ -342,16 +369,8 @@ class ManualHotspotManager(
             }
         }
         if (frequency <= 0) return null
-        val ssid = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            result.SSID
-        } else {
-            try {
-                ScanResult::class.java.getField("SSID").get(result) as? String
-            } catch (_: Throwable) {
-                null
-            }
-        }
-        return if (ssid == expectedSsid) frequency else null
+        // 1.0.22：SSID 只做证据记录、不再做相等门槛（BSSID 命中已足以确认是本机 AP）。
+        return frequency
     }
 
     @SuppressLint("PrivateApi")

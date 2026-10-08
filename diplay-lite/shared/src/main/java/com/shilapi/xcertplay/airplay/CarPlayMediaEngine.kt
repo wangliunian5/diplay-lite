@@ -329,7 +329,10 @@ class CarPlayMediaEngine(
         val port = (stream["dataPort"] as? Number)?.toInt() ?: return null
         if (port !in 1..65535) return null
         val host = session.remoteAddress ?: return null
-        val key = dataStreamKey(session, stream, DATASTREAM_INPUT_KEY) ?: return null
+        // 1.0.22 分叉判据实验（3e 201413 日志）：上行 mic 数据健康（TX 50pkt/s、peak 上万）但
+        // 通话对方听不到 + Siri 零反应，而下行用 Output 标签解密正常 → 怀疑 iPhone 对车机上行
+        // 也用 Output 标签派生（同一标签、不同 streamConnectionID salt），互换验证。
+        val key = dataStreamKey(session, stream, DATASTREAM_OUTPUT_KEY) ?: return null
         val formatBits = (stream["audioFormat"] as? Number)?.toLong() ?: 0L
         val framesPerPacket = (stream["framesPerPacket"] as? Number)?.toInt() ?: 0
         val frameMillis = if (format.codec == AudioCodecKind.OPUS) {

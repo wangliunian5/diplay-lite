@@ -287,9 +287,10 @@ class IphoneUsbHost(
                 val switched = connection.setConfiguration(configuration)
                 report("attempt#$attempt setConfiguration(${configuration.id}) success=$switched")
                 if (!switched) {
-                    throw IphoneUsbException.DeviceUnavailable(
-                        "could not switch iPhone USB configuration to CarPlay (id=${configuration.id})",
-                    )
+                    // 1.0.21（3e 实测 195341 日志）：设备已在目标配置时 EMUI setConfiguration 返回
+                    // false（0x4301 重启代际场景：iPhone 已处于 CarPlay 配置，无重枚举）。
+                    // 不再立即失败——继续走接口发现/claim，接口真不在再由 claim 路径报错。
+                    report("attempt#$attempt switch returned false; assuming already in CarPlay configuration and continuing")
                 }
                 IphoneCarPlayConfiguration.usbMuxInterface(configuration)
                     ?: throw IphoneUsbException.Protocol("CarPlay configuration exposes no USBMUX interface")

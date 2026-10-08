@@ -182,12 +182,17 @@ class NcmUsbBridge internal constructor(
             }
             val blockLength = readU16(buffered, 8)
             if (blockLength < 28) throw failSession("Invalid NTB16 block length $blockLength")
-            val padded = blockLength % USB_PACKET_SIZE == 0
-            val wireLength = blockLength + if (padded) 1 else 0
+            // 1.0.22（3e 实测 20:42 首画即卡死）：wBlockLength 为 512 整数倍时 iPhone 的
+            // 定界方式既可能是 1 字节 0x00 短包、也可能是 ZLP（bulkTransfer 层面 0 长度，
+            // 字节流中不可见）。原实现假设必有 0x00 pad：ZLP 定界时下一字节实为下一个
+            // NTB 的 NTH16 签名首字节 → 校验失败 failSession → NCM 读线程终止 → 视频
+            // 冻结（rx=6fps shown=1fps，"Invalid NTB16 short-packet pad"×2）。改为 pad
+            // 可选：块边界处等下一字节判别，0x00 才消费 pad，否则按 blockLength 原样解析。
+            val blockAligned = blockLength % USB_PACKET_SIZE == 0
+            if (blockAligned && bufferedSize <= blockLength) return
+            val wireLength =
+                if (blockAligned && buffered[blockLength].toInt() == 0) blockLength + 1 else blockLength
             if (bufferedSize < wireLength) return
-            if (padded && buffered[blockLength].toInt() != 0) {
-                throw failSession("Invalid NTB16 short-packet pad")
-            }
             for (frame in Ntb16Codec.parse(buffered, 0, blockLength)) enqueueFrame(frame)
             val remaining = bufferedSize - wireLength
             buffered.copyInto(buffered, 0, wireLength, bufferedSize)
