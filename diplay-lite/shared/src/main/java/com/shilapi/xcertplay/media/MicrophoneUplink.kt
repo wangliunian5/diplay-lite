@@ -33,6 +33,9 @@ internal class MicrophoneUplink(
 ) : Closeable {
     private val running = AtomicBoolean(false)
     private val firstPacketLogged = AtomicBoolean(false)
+    /** 1.0.7：TX 计数落盘（每秒一次），判定 Siri 卡死时 mic 数据有没有真正出门。 */
+    private val txPackets = java.util.concurrent.atomic.AtomicLong(0)
+    private var lastTxLogMs = 0L
     @Volatile private var recorder: AudioRecord? = null
     @Volatile private var socket: DatagramSocket? = null
     @Volatile private var opusEncoder: OpusFrameEncoder? = null
@@ -234,10 +237,25 @@ internal class MicrophoneUplink(
         }
     }
 
+    // 1.0.12 验证改动：优先绑定会话源地址（与 IapTunnel 同款），避免多网卡车机上 mic 包
+    // 从错误接口发出；绑定失败再逐级回落 IPv6 通配/IPv4 通配。
     // API16 适配：绑 IPv6 通配 [::] 在本机 ROM 上会抛 “Can't bind to a link-local address
     // without a scope id”，回退 IPv4 通配（与 AudioStream/ScreenStream 的处理一致）。
     // 少了这个回退，libopus 补上之后麦克风仍会停在 "socket creation failed"。
     private fun bindAnyPort(): DatagramSocket {
+        config.bindAddress?.let { bind ->
+            try {
+                val socket = DatagramSocket(null)
+                socket.reuseAddress = true
+                socket.bind(InetSocketAddress(bind, 0))
+                diagnostics?.invoke("microphone socket bound to ${bind.hostAddress}")
+                return socket
+            } catch (error: Exception) {
+                diagnostics?.invoke(
+                    "microphone 绑定会话地址 ${bind.hostAddress} 失败，回落通配: ${error.message}",
+                )
+            }
+        }
         val socket = DatagramSocket(null)
         socket.reuseAddress = true
         return try {
@@ -256,8 +274,16 @@ internal class MicrophoneUplink(
     private fun capture(recorder: AudioRecord, socket: DatagramSocket) {
         val frame = ByteArray(config.frameBytes)
         val readBuffer = ByteArray(maxOf(frame.size, MIN_READ_BYTES))
-        val counters = MicrophoneCounters()
+        // 1.0.19 回归上游：RTP 头 SSRC 位恒 0（上游 sealPacket 根本不写 8–11 字节）。
+        // BE+SSRC=0（1.0.8）与 BE+SSRC=rand（1.0.12）在 3e 均失败 → SSRC 非主因，
+        // 但基线必须与上游逐字节等价，排除变量后剩余失败才能归因到包外。
+        val counters = MicrophoneCounters(ssrc = 0)
         var filled = 0
+        // 1.0.8 Siri 排查：包数正常≠有声。每秒统计帧峰值并落盘，判定采集内容是否静音
+        // （包格式/密钥/发送已与上游逐字节对齐，剩余嫌疑只有 PCM 内容）。
+        var windowPeak = 0
+        var windowFrames = 0
+        var lastLevelLog = 0L
         try {
             while (running.get()) {
                 // API16 适配：带 mode 的 AudioRecord.read 是 API 23+；低版本用阻塞语义的 int 重载。
@@ -280,17 +306,50 @@ internal class MicrophoneUplink(
                     filled += copied
                     offset += copied
                     if (filled == frame.size) {
+                        windowPeak = maxOf(windowPeak, framePeak(frame))
+                        windowFrames++
                         sendFrame(socket, counters, frame)
                         filled = 0
+                        val now = System.currentTimeMillis()
+                        if (now - lastLevelLog >= 1000) {
+                            lastLevelLog = now
+                            // 峰值满量程=32767；持续 <300 视为近静音（采集源问题）。
+                            diagnostics?.invoke(
+                                "Microphone level window frames=$windowFrames peak=$windowPeak",
+                            )
+                            windowPeak = 0
+                            windowFrames = 0
+                        }
                     }
                 }
             }
         } catch (error: Exception) {
-            if (running.get()) Log.e(TAG, "microphone capture failed", error)
+            if (running.get()) {
+                Log.e(TAG, "microphone capture failed", error)
+                // 1.0.7：采集线程死亡必须落盘，否则字段日志看到"uplink started"后无下文。
+                diagnostics?.invoke(
+                    "Microphone capture failed: ${error.javaClass.simpleName}: ${error.message}",
+                )
+            }
         } finally {
             running.set(false)
             release()
         }
+    }
+
+    /** Peak absolute sample of one little-endian PCM16 frame (full scale = 32767). */
+    private fun framePeak(frame: ByteArray): Int {
+        var peak = 0
+        var index = 0
+        while (index + 1 < frame.size) {
+            val sample =
+                ((frame[index].toInt() and 0xff) or (frame[index + 1].toInt() shl 8)).toShort()
+                    .toInt()
+            val magnitude = if (sample < 0) -sample else sample
+            if (magnitude > peak) peak = magnitude
+            index += 2
+        }
+        return peak
     }
 
     private fun sendFrame(socket: DatagramSocket, counters: MicrophoneCounters, frame: ByteArray) {
@@ -324,16 +383,39 @@ internal class MicrophoneUplink(
         )
         try {
             socket.send(DatagramPacket(packet, packet.size, config.host, config.port))
+            val total = txPackets.incrementAndGet()
             if (firstPacketLogged.compareAndSet(false, true)) {
+                // 1.0.7：首包走文件日志（原来只进 logcat），字段报告能判定 mic 是否出门。
+                diagnostics?.invoke(
+                    "Microphone first packet bytes=${packet.size} body=${body.size} " +
+                        "head=${packet.copyOf(minOf(packet.size, 16)).toHexString()} " +
+                        "ssrc=${counters.ssrc} localPort=${socket.localPort} " +
+                        "be=${MicrophonePacketizer.PCM_WIRE_BIG_ENDIAN} " +
+                        "host=${config.host.hostAddress} port=${config.port}",
+                )
                 Log.i(
                     TAG,
                     "microphone first packet bytes=${packet.size} body=${body.size} " +
                         "head=${packet.copyOf(minOf(packet.size, 16)).toHexString()} " +
                         "port=${config.port}",
                 )
+                lastTxLogMs = System.currentTimeMillis()
+            } else if (total % 50L == 0L) {
+                // 每约 1 秒（50 包 × 20ms 帧）落一条 TX 心跳。
+                val now = System.currentTimeMillis()
+                if (now - lastTxLogMs >= 900) {
+                    lastTxLogMs = now
+                    diagnostics?.invoke("Microphone uplink tx packets=$total")
+                }
             }
         } catch (error: Exception) {
-            if (running.get()) throw error
+            if (running.get()) {
+                // 1.0.7：发送异常进文件日志（原来只进 logcat，上行线程死了字段无感知）。
+                diagnostics?.invoke(
+                    "Microphone send failed: ${error.javaClass.simpleName}: ${error.message}",
+                )
+                throw error
+            }
         }
     }
 

@@ -6,6 +6,9 @@ import java.net.InetAddress
 
 enum class CarPlayTransport {
     WIRELESS,
+
+    /** USB 有线：USBMUX/lockdown 控制面 + NCM 数据面，不走路机热点/蓝牙/Bonjour。 */
+    WIRED,
 }
 
 enum class MfiTarget {
@@ -15,6 +18,8 @@ enum class MfiTarget {
 enum class WirelessHotspotMode {
     MANUAL,
     MANUAL_IPV4,
+    /** 双 client 中继：本机接入外部网络（随身WiFi），复用 manualHotspotSsid/Passphrase 字段作凭据。 */
+    RELAY,
     ;
 
     /** Both manual modes attach to the car's own hotspot; IPV4 only changes the address family. */
@@ -64,6 +69,18 @@ class CarPlayRuntimeConfig(
         require(label.isNotBlank()) { "label must not be blank" }
         require(hostName.isNotBlank()) { "hostName must not be blank" }
         // Lite: 只保留 MANUAL 热点配置校验
+        if (transport == CarPlayTransport.WIRELESS && wirelessHotspotMode == WirelessHotspotMode.RELAY) {
+            require(!manualHotspotSsid.isNullOrBlank()) {
+                "relaySsid is required in relay mode"
+            }
+            val relayPassphrase = manualHotspotPassphrase.orEmpty()
+            require('\u0000' !in relayPassphrase) {
+                "relayPassphrase must not contain U+0000"
+            }
+            require(relayPassphrase.isEmpty() || relayPassphrase.length in 8..63) {
+                "relayPassphrase must be empty or between 8 and 63 characters"
+            }
+        }
         if (transport == CarPlayTransport.WIRELESS && wirelessHotspotMode.isManualHotspot) {
             val ssid = manualHotspotSsid
             require(!ssid.isNullOrBlank()) {

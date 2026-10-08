@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 1.0.20：USB_DEVICE_ATTACHED 意图过滤——只匹配 Apple 设备（vendor 0x05ac=1452），
+     不限 product/class，兼容 iPhone 各模式 pid（0x12a8 等）。 -->
+<resources>
+    <usb-device vendor-id="1452" />
+</resources>

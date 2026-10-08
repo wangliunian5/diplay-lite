@@ -46,7 +46,9 @@ object LiteLog {
                 Log.w("LiteLog", "文件日志不可用: ${error.message}")
             }
         }
-        log("log", "文件日志挂载：${currentFile?.absolutePath ?: "(失败)"}")
+        val metrics = android.content.res.Resources.getSystem().displayMetrics
+        log("log", "文件日志挂载：${currentFile?.absolutePath ?: "(失败)"} " +
+            "screen=${metrics.widthPixels}x${metrics.heightPixels} density=${metrics.density}")
     }
 
     /** 当前日志目录；未挂载或失败时为 null。 */

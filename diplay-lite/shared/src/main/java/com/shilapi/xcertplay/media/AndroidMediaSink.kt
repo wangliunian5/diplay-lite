@@ -54,6 +54,26 @@ class AndroidMediaSink(
      * 用取值函数而不是常量，这样 App 改设置后下一次播报就能生效，无需重建 sink。
      */
     private val navigationDuckPercent: () -> Int = { 100 },
+    /**
+     * M6x（参考 fork 0.2.7 音频路由）：媒体/导航音频的传统 stream type 覆盖。
+     * 0=自动 usage 路由（默认，行为不变）；1~20=旧 AudioTrack 构造的 streamType
+     * （车机音频流编号，ROM 拒绝时自动回退 usage 构建）。通话流不受此控制。
+     */
+    private val mediaStreamOverride: Int = 0,
+    private val navStreamOverride: Int = 0,
+    /**
+     * 1.0.16（P0-1，3e 无声修复）：「通话声音走扬声器」勾选时，telephony 下行 track
+     * 直接按 USAGE_MEDIA（STREAM_MUSIC）路由，绕开华为等 ROM 上「无真实蜂窝通话时
+     * VOICE_COMMUNICATION+IN_COMMUNICATION 的 DSP 路径静默」问题。取值函数——
+     * 每次建流现读，改设置后下一条 telephony 流即生效（iPhone 通话中会重建流）。
+     */
+    private val callsRoutedToMedia: () -> Boolean = { false },
+    /**
+     * 1.0.11（FE-6 拉伸）：解码器实际输出尺寸回调（crop 优先于 KEY_WIDTH/HEIGHT）。
+     * iPhone 实际编码尺寸可能与声明的流尺寸不一致（如超宽屏 + 高缩放被编码器封顶），
+     * UI 层据此把 SurfaceView 等比适配，避免硬拉伸变形。
+     */
+    private val onVideoOutputSizeChanged: ((Int, Int) -> Unit)? = null,
 ) : MediaSink {
     private val screenStateLock = Any()
     private val activeScreenTypes = mutableSetOf<Int>()
@@ -203,6 +223,7 @@ class AndroidMediaSink(
             preferSoftwareHevcDecoder,
             requestKeyFrame = { requestVideoRecovery(type) },
             report = { videoDiagnosticHandlers[type]?.invoke(it) },
+            onOutputSizeChanged = onVideoOutputSizeChanged,
         )
         return videoDecoders.putIfAbsent(type, created) ?: created
     }
@@ -212,7 +233,17 @@ class AndroidMediaSink(
         val existing = audioRenderers[type]
         if (existing?.format == format) return existing
         existing?.close()
-        return AudioRenderer(format, advancedAudioChannelMapping, mediaBufferMillis, onAudioDiagnostic, ::onRendererChannelState).also { audioRenderers[type] = it }
+        return AudioRenderer(
+            format,
+            advancedAudioChannelMapping,
+            mediaBufferMillis,
+            onAudioDiagnostic,
+            ::onRendererChannelState,
+            mediaStreamOverride,
+            navStreamOverride,
+            // 1.0.16（P0-1）：建流瞬间现读「通话声音走扬声器」，命中则通话下行按 MEDIA 路由。
+            callsRoutedToMedia(),
+        ).also { audioRenderers[type] = it }
     }
 
     // ---------- M6d：导航压低音乐 ----------
@@ -264,6 +295,7 @@ private class VideoDecoder(
     private val preferSoftwareHevcDecoder: Boolean,
     private val requestKeyFrame: () -> Unit,
     private val report: (String) -> Unit,
+    private val onOutputSizeChanged: ((Int, Int) -> Unit)? = null,
 ) : Closeable {
     private val queue = VideoDecodeQueue()
     @Volatile private var running = true
@@ -313,6 +345,14 @@ private class VideoDecoder(
     }
 
     private fun run() {
+        // M6v：视频解码线程抬到 nice -8（THREAD_PRIORITY_URGENT_DISPLAY，即 URGENT_AUDIO 附近的解码档）：
+        // 高于系统默认(0)/后台，仍低于音频写轨(-16)与收包(-19)，保证弱机上「收包 > 音频 > 视频」的调度次序；
+        // 部分 ROM 拒绝该调用，拒绝就记一行继续。
+        try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
+        } catch (error: Throwable) {
+            report("Video: setThreadPriority(-8) refused ${error.javaClass.simpleName}")
+        }
         try {
             while (running) {
                 val job = queue.poll(5)
@@ -691,6 +731,20 @@ private class VideoDecoder(
     }
 
     private fun logOutputFormat(format: MediaFormat) {
+        // 1.0.11（FE-6 拉伸）：实际编码尺寸以 crop 为准（部分解码器 KEY_WIDTH/HEIGHT 是对齐后的 stride 尺寸）。
+        val cropLeft = format.intOrNull("crop-left")
+        val cropTop = format.intOrNull("crop-top")
+        val cropRight = format.intOrNull("crop-right")
+        val cropBottom = format.intOrNull("crop-bottom")
+        val codedWidth = if (cropLeft != null && cropRight != null) cropRight - cropLeft + 1
+            else format.intOrNull(MediaFormat.KEY_WIDTH) ?: width
+        val codedHeight = if (cropTop != null && cropBottom != null) cropBottom - cropTop + 1
+            else format.intOrNull(MediaFormat.KEY_HEIGHT) ?: height
+        try {
+            if (codedWidth > 0 && codedHeight > 0) onOutputSizeChanged?.invoke(codedWidth, codedHeight)
+        } catch (error: Throwable) {
+            Log.w(TAG, "video output size callback failed", error)
+        }
         report("output format requested=${width}x${height} " +
             "coded=${format.intOrNull(MediaFormat.KEY_WIDTH)}x${format.intOrNull(MediaFormat.KEY_HEIGHT)} " +
             "crop=${format.intOrNull("crop-left")},${format.intOrNull("crop-top")}," +
@@ -762,6 +816,14 @@ private class AudioRenderer(
     private val report: (String) -> Unit,
     /** M6c/M6d：通道活跃状态变化（PHONE=听筒/扬声器、NAVIGATION/MEDIA=duck）。 */
     private val onChannelState: ((AudioChannel?, Boolean) -> Unit)? = null,
+    /** M6x：媒体/导航各自的传统 stream type 覆盖（0=usage 路由，1~20=旧构造 streamType）。 */
+    private val mediaStreamOverride: Int = 0,
+    private val navStreamOverride: Int = 0,
+    /**
+     * 1.0.16（P0-1）：true 时 PHONE 通道按 USAGE_MEDIA（STREAM_MUSIC）路由扬声器，
+     * 不再走 VOICE_COMMUNICATION+IN_COMMUNICATION（华为等 ROM 无真实通话时该 DSP 路径静默）。
+     */
+    private val callsRoutedToMedia: Boolean = false,
 ) : Closeable {
     private data class AudioPacket(val rtp: ByteArray, val sample: Int)
 
@@ -778,6 +840,14 @@ private class AudioRenderer(
     private var playbackStarted = false
     private var prebufferBytes = 0
     private var startThresholdBytes = 0
+    // M6v：低水位补缓冲（EasyPlay 逆向方案）。queuedMs 由「累计写入 vs 播放头」估算（API16 无
+    // getUnderrunCount），跌破水位 = 即将 rebuffer：只 pause 不 flush、不重置 track，等上层补包、
+    // prebuffer 重新攒到 startThreshold 后再 play，避免 AudioFlinger 跑空产生 underrun 咔哒声。
+    // watermark 取 min(capacity/4, start/2, capacity-start)：末项保证「残量 + 起播阈值 < 容量」，
+    // 否则暂停态下 prebuffer 写满整条 paused track 会永久阻塞（write 对暂停且满的轨不返回）。
+    private var lowWatermarkMs = 0L
+    private var watermarkPauseNs = 0L
+    private var lowWatermarkLogged = false
     private var fadeApplied = false
     // M6f：丢包补偿（填静音）之后，下一段真实音频要淡入，消除"静音→有声"的爆音；
     // lastSampleValue 用来在填静音前做一小段淡出（硬切静音同样会"啪"一下）。
@@ -832,7 +902,14 @@ private class AudioRenderer(
     private val thread = Thread({
         // 音频解码 + 写轨：抬到 AUDIO —— 低于收包（URGENT_AUDIO），但高于视频/系统默认，
         // 避免它和视频解码抢 CPU 时被拖出 underrun。
-        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+        // M6v：部分 ROM 拒绝 setThreadPriority（SecurityException/IllegalArgumentException），
+        // 拒绝时记一行继续跑。值保持 -16：已优于方案目标 nice -8，不降级。
+        try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+        } catch (error: Throwable) {
+            Log.w(TAG, "audio thread setThreadPriority refused", error)
+            report("Audio: setThreadPriority(-16) refused ${error.javaClass.simpleName} audioType=${format.audioType}")
+        }
         run()
     }, "carplay-audio").apply { isDaemon = true }
 
@@ -991,7 +1068,93 @@ private class AudioRenderer(
         // 先算纯 Int 的 usage/contentType（AudioAttributes.USAGE_* 为编译期内联常量，16 上安全），
         // 仅 >=23 分支构造 AudioAttributes 对象；4.x 与 5.x 统一走旧 AudioTrack 构造。
         val route = audioRoute()
-        val built = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        // M6x：媒体/导航流的传统 streamType 覆盖（参考 fork）。0=走现有 usage 路由路径；
+        // 1~20=旧 AudioTrack 构造（车机音频流编号，部分车机 ROM 只认传统 stream type 才
+        // 路由到指定输出）。构造抛异常或 state != STATE_INITIALIZED（ROM 拒绝）时回退
+        // usage 构建，保证总有声。通话/助手等其他通道不做覆盖。
+        val streamOverride = when (routeChannel) {
+            AudioChannel.MEDIA -> mediaStreamOverride
+            AudioChannel.NAVIGATION -> navStreamOverride
+            else -> 0
+        }
+        var routeLabel: String? = null
+        val built = if (streamOverride in 1..20) {
+            routeLabel = "streamType=$streamOverride"
+            val legacy = try {
+                @Suppress("DEPRECATION")
+                AudioTrack(
+                    streamOverride,
+                    format.sampleRate,
+                    channelMask,
+                    encoding,
+                    plan.trackBufferBytes,
+                    AudioTrack.MODE_STREAM,
+                )
+            } catch (error: Throwable) {
+                Log.w(TAG, "streamType=$streamOverride rejected by this ROM; falling back to usage-based track", error)
+                report("Audio: streamType=$streamOverride rejected by this ROM (${error.javaClass.simpleName}); " +
+                    "falling back to usage routing audioType=${format.audioType}")
+                null
+            }
+            if (legacy != null && legacy.state == AudioTrack.STATE_INITIALIZED) {
+                legacy
+            } else {
+                routeLabel = "streamType=$streamOverride(fallback=usage)"
+                Log.w(TAG, "streamType=$streamOverride rejected by this ROM (state=${legacy?.state}); " +
+                    "falling back to usage-based track")
+                report("Audio: streamType=$streamOverride rejected by this ROM (state=${legacy?.state}); " +
+                    "falling back to usage routing audioType=${format.audioType}")
+                legacy?.release()
+                buildUsageRoutedTrack(route, channelMask, encoding, plan.trackBufferBytes)
+            }
+        } else {
+            buildUsageRoutedTrack(route, channelMask, encoding, plan.trackBufferBytes)
+        }
+        track = built
+        val capacityBytes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            built.bufferSizeInFrames * frameBytes
+        } else {
+            plan.trackBufferBytes
+        }
+        startThresholdBytes = MediaAudioBuffer.startBytesFor(plan.startBytes, capacityBytes, PREBUFFER_WRITE_CHUNK_BYTES)
+        // M6v：低水位 = min(容量 25%, 起播阈值一半, 容量-起播阈值)。第三项防死锁：暂停态补缓冲时
+        // 「残量(<水位) + 起播阈值」必须小于容量，否则 blocking write 会卡死在写满的 paused track 上。
+        lowWatermarkMs = minOf(
+            capacityBytes * 1000L / bytesPerSecond / 4,
+            startThresholdBytes * 1000L / bytesPerSecond / 2,
+            (capacityBytes - startThresholdBytes) * 1000L / bytesPerSecond,
+        )
+        // M6x：streamType 覆盖生效时在诊断行带上最终路由结论（回退后标 fallback=usage）。
+        val routeFragment = routeLabel?.let { "route=$it " } ?: ""
+        report("Audio: ready audioType=${format.audioType} codec=${format.codec} " +
+            "rate=${format.sampleRate} channels=${format.channels} " + routeFragment +
+            "bufferMs=${capacityBytes * 1000L / bytesPerSecond} startMs=${startThresholdBytes * 1000L / bytesPerSecond} " +
+            "lowWaterMs=$lowWatermarkMs")
+        Log.i(
+            TAG,
+            "audio track prepared type=${format.payloadType} audioType=${format.audioType} " +
+                "codec=${format.codec} " +
+                "rate=${format.sampleRate} channels=${format.channels} " + routeFragment +
+                "buffer=${capacityBytes * 1000L / bytesPerSecond}ms start=${startThresholdBytes * 1000L / bytesPerSecond}ms",
+        )
+        // M6c/M6d：输出轨一建好就通知"通道活跃"（PHONE→App 切听筒/扬声器；NAVIGATION→压低音乐）。
+        if (routeChannel != null && !channelActiveNotified) {
+            channelActiveNotified = true
+            onChannelState?.invoke(routeChannel, true)
+        }
+    }
+
+    /**
+     * 现有 usage 路由构建路径（M6x 覆盖回退也走这里）：API 23+ 走 AudioTrack.Builder，
+     * 更低版本走旧构造（按 usage 反推 streamType）。API 23+ 分支仍在运行时 SDK 守卫内。
+     */
+    private fun buildUsageRoutedTrack(
+        route: AudioRoute,
+        channelMask: Int,
+        encoding: Int,
+        trackBufferBytes: Int,
+    ): AudioTrack =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             // API16 适配：AudioAttributes/AudioTrack.Builder 构造内联在此 API 23+ 守卫内。
             val attributes = AudioAttributes.Builder()
                 .setUsage(route.usage)
@@ -1006,7 +1169,7 @@ private class AudioRenderer(
                         .setChannelMask(channelMask)
                         .build(),
                 )
-                .setBufferSizeInBytes(plan.trackBufferBytes)
+                .setBufferSizeInBytes(trackBufferBytes)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
         } else {
@@ -1026,33 +1189,10 @@ private class AudioRenderer(
                 format.sampleRate,
                 channelMask,
                 encoding,
-                plan.trackBufferBytes,
+                trackBufferBytes,
                 AudioTrack.MODE_STREAM,
             )
         }
-        track = built
-        val capacityBytes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            built.bufferSizeInFrames * frameBytes
-        } else {
-            plan.trackBufferBytes
-        }
-        startThresholdBytes = MediaAudioBuffer.startBytesFor(plan.startBytes, capacityBytes, PREBUFFER_WRITE_CHUNK_BYTES)
-        report("Audio: ready audioType=${format.audioType} codec=${format.codec} " +
-            "rate=${format.sampleRate} channels=${format.channels} " +
-            "bufferMs=${capacityBytes * 1000L / bytesPerSecond} startMs=${startThresholdBytes * 1000L / bytesPerSecond}")
-        Log.i(
-            TAG,
-            "audio track prepared type=${format.payloadType} audioType=${format.audioType} " +
-                "codec=${format.codec} " +
-                "rate=${format.sampleRate} channels=${format.channels} " +
-                "buffer=${capacityBytes * 1000L / bytesPerSecond}ms start=${startThresholdBytes * 1000L / bytesPerSecond}ms",
-        )
-        // M6c/M6d：输出轨一建好就通知"通道活跃"（PHONE→App 切听筒/扬声器；NAVIGATION→压低音乐）。
-        if (routeChannel != null && !channelActiveNotified) {
-            channelActiveNotified = true
-            onChannelState?.invoke(routeChannel, true)
-        }
-    }
 
     private fun aacAudioSpecificConfig(): ByteArray {
         val frequencyIndex = MediaCodecSupport.aacFrequencyIndex(format.sampleRate)
@@ -1097,7 +1237,11 @@ private class AudioRenderer(
 
     private fun usageFor(channel: AudioChannel): Int = when (channel) {
         AudioChannel.MEDIA -> AudioAttributes.USAGE_MEDIA
-        AudioChannel.PHONE -> AudioAttributes.USAGE_VOICE_COMMUNICATION
+        // 1.0.16（P0-1）：通话走扬声器开关打开 → 按 MEDIA 路由（STREAM_MUSIC），绕开
+        // 华为等 ROM 上 IN_COMMUNICATION DSP 静默路径；走听筒语义时保持原 VOICE 路由。
+        AudioChannel.PHONE ->
+            if (callsRoutedToMedia) AudioAttributes.USAGE_MEDIA
+            else AudioAttributes.USAGE_VOICE_COMMUNICATION
         AudioChannel.ASSISTANT -> AudioAttributes.USAGE_ASSISTANT
         AudioChannel.NAVIGATION -> AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
     }
@@ -1431,7 +1575,30 @@ private class AudioRenderer(
         underrunsAtPlaybackStart = trackUnderruns(track)
         track.play()
         playbackStarted = true
+        watermarkPauseNs = 0L
     }
+
+    /**
+     * M6v：queuedMs 估算（EasyPlay 逆向方案）。API16 没有 getUnderrunCount（API 24+），
+     * 用「累计写入字节 - 播放头帧数 × 帧宽」估算 track 里还没播完的毫秒数；
+     * 播放头跨 wrap 由 [AudioBufferProgress.queuedBytes] 处理，负值钳到 0（头读数异常时只退化、不误停）。
+     */
+    private fun queuedMillis(track: AudioTrack): Long {
+        if (bytesPerSecond <= 0) return 0L
+        return bufferProgress.queuedBytes(track.playbackHeadPosition) * 1000L / bytesPerSecond
+    }
+
+    /** 只暂停不 flush、不重置 track：已排队的 PCM 原样保留，恢复时接着播（消 underrun 咔哒声的关键）。 */
+    private fun pauseForRebuffer(track: AudioTrack) {
+        track.pause()
+        playbackStarted = false
+        prebufferBytes = 0
+        rebufferCount++
+    }
+
+    /** 短促交互音不做低水位停轨：源发完即止，水位逻辑只会把残量卡成静音。 */
+    private fun lowWatermarkExempt(audioType: String): Boolean =
+        audioType == "speechrecognition" || audioType == "alert"
 
     private fun maintainPlaybackBuffer() {
         val track = track ?: return
@@ -1439,10 +1606,29 @@ private class AudioRenderer(
                 trackUnderruns(track) > underrunsAtPlaybackStart, queue.isEmpty(), track.playbackHeadPosition)) {
             // The hardware buffer has actually drained. Pause without flushing or discarding PCM,
             // then use the configured start threshold again when music resumes.
-            track.pause()
-            playbackStarted = false
-            prebufferBytes = 0
-            rebufferCount++
+            pauseForRebuffer(track)
+        } else if (playbackStarted && queue.isEmpty() && lowWatermarkMs > 0 &&
+            queuedMillis(track) < lowWatermarkMs && !lowWatermarkExempt(format.audioType)) {
+            // M6v：低水位补缓冲（API<24 上 underrunCount 恒 0、上面的 reactive 判定失效，这是主路径）：
+            // queuedMs 跌破水位就先主动 pause（不 flush），等上层补包、prebuffer 攒到 startThreshold 再 play。
+            // 仅在压缩包队列已空时触发——队列还有货说明瓶颈在本地解码，写循环自己会追上，无需停轨。
+            // 1.0.9：speechrecognition/alert 是短促交互音（iPhone 发完就停，如 Siri「嘟」），
+            // 水位停轨只会让它反复 rebuffer 直至静音（214032 日志 rx=172 包 playing=false 实证）
+            // —— 这类流宁可放行残量（可能一次轻微咔哒），也绝不停轨。
+            if (!lowWatermarkLogged) {
+                lowWatermarkLogged = true
+                report("Audio: low watermark audioType=${format.audioType} queuedMs=${queuedMillis(track)} " +
+                    "thresholdMs=$lowWatermarkMs → pause+rebuffer (no flush)")
+            }
+            pauseForRebuffer(track)
+            watermarkPauseNs = System.nanoTime()
+        } else if (!playbackStarted && watermarkPauseNs != 0L && queue.isEmpty() &&
+            System.nanoTime() - watermarkPauseNs >= WATERMARK_PAUSE_MAX_NS) {
+            // M6v：「暂停一小段」的界：等补缓冲超过 WATERMARK_PAUSE_MAX_NS 仍无新包，就放行残量——
+            // 流尾残量自然播完（否则被永久卡住）；长停顿则接受结尾一次咔哒，好过无限期静音。
+            // 残量已为 0 就只清标志保持暂停，等数据回来走正常 prebuffer。
+            watermarkPauseNs = 0L
+            if (queuedMillis(track) > 0L) startPlayback(track)
         }
         // A short final burst may never reach the start threshold. Play it after a bounded wait.
         if (!playbackStarted && prebufferBytes > 0 && queue.isEmpty() &&
@@ -1457,6 +1643,8 @@ private class AudioRenderer(
         if (statsWindowStartNs == 0L) statsWindowStartNs = now
         if (!force && now - statsWindowStartNs < STATS_WINDOW_NS) return
         val underruns = track?.let(::trackUnderruns) ?: 0
+        // M6v：track 内未播完的毫秒数（估算），配合 lowWaterMs 判读 rebuffer 是否按预期工作。
+        val queuedMs = track?.let { queuedMillis(it) } ?: -1L
         val lastRx = lastArrivalNs.get()
         BandwidthMonitor.setAudioMetrics(
             maxArrivalGapMs.get().toInt(),
@@ -1465,6 +1653,7 @@ private class AudioRenderer(
         )
         val line = "audio stats audioType=${format.audioType} codec=${format.codec} rx=${packetsReceived.getAndSet(0)} " +
             "dropped=${packetsDropped.getAndSet(0)} underruns=+${underruns - statsLastUnderruns} queue=${queue.size} " +
+            "queuedMs=$queuedMs lowWaterMs=$lowWatermarkMs " +
             "playing=$playbackStarted maxGapMs=${maxArrivalGapMs.getAndSet(0)} " +
             "gapCompMs=${gapUsCompensated / 1000} gapFrames=$packetsCompensated " +
             "sinceRxMs=${if (lastRx == 0L) -1 else (now - lastRx) / 1_000_000L} maxWriteMs=$maxWriteMs " +
@@ -1576,6 +1765,8 @@ private class AudioRenderer(
         const val INPUT_TIMEOUT_US = 10_000L
         const val AUDIO_POLL_MILLIS = 10L
         const val BUFFER_TAIL_WAIT_NS = 500_000_000L
+        // M6v：低水位 pause 后等补缓冲的最长时长（「一小段」）；超时放行残量，防止流尾被永久卡住。
+        const val WATERMARK_PAUSE_MAX_NS = 1_000_000_000L
         // Holds a burst after a Wi-Fi gap (~4 s of AAC) instead of dropping it.
         const val MAX_QUEUED_PACKETS = 192
         const val PREBUFFER_WRITE_CHUNK_BYTES = 2 * 1024

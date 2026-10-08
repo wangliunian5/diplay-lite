@@ -355,6 +355,10 @@ class CarPlayMediaEngine(
             key = key,
             codec = format.codec,
             bitrate = if (format.codec == AudioCodecKind.OPUS) opusBitrate else null,
+            // 1.0.12 验证改动：绑定会话源地址；仅当地址族与目的地址一致时传入（v4 socket 发不了 v6 包）。
+            bindAddress = session.localAddress?.takeIf {
+                (it is Inet6Address) == (host is Inet6Address)
+            },
         )
     }
 

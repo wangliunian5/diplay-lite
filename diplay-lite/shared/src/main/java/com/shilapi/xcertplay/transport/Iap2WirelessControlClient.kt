@@ -29,6 +29,7 @@ class Iap2WirelessControlClient(
         onReady: () -> Unit = {},
         onIncoming: (Iap2Frame) -> Unit = {},
         onProgress: (String) -> Unit = {},
+        phoneOnAirPlay: () -> Boolean = { false },
     ): Iap2WirelessControlResult {
         require(identification.wireless != null) {
             "Wireless control requires an Iap2IdentificationConfig with wireless transport"
@@ -129,10 +130,15 @@ class Iap2WirelessControlClient(
                         )
                     }
                     val resendAt = nextCredentialResendNanos
+                    // M6k24 凭证重发闸门（A 方案）：iPhone 只要已经发起过任何 AirPlay TCP 连接，
+                    // 就绝不再重发 0x5703/0x4301 —— 8815 实测（11:52 日志）：会话已建到 SETUP
+                    // （cseq=6）后 100ms 又收到重发，iPhone 随即弃连。重发只服务于
+                    // 「iPhone 还没收到凭证/还没入网」的场景。
                     if (
                         resendAt != null &&
                         credentialResendsSent < MAX_CREDENTIAL_RESENDS &&
-                        System.nanoTime() >= resendAt
+                        System.nanoTime() >= resendAt &&
+                        !phoneOnAirPlay()
                     ) {
                         send(accessoryWiFiConfiguration(endpoint), deadlineNanos)
                         send(carPlayStartSession(endpoint), deadlineNanos)

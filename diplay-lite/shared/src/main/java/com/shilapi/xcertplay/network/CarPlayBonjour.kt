@@ -136,8 +136,16 @@ class CarPlayBonjour(
         // API16 改走系统 NsdManager 广播（setter API16 可用、系统处理接口与多播）。
         // 接口模式（绑多播接口地址）仅保留给 5.0+ 完整版 VPN 多接口场景。
         useInterfaceMdns && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP
-    private val nsdManager = (context.applicationContext ?: context)
-        .getSystemService(Context.NSD_SERVICE) as NsdManager
+    // 山海车机实测（10-06，T53/M6k14 栈顶帧实证）：该 ROM 的 nsd 系统服务残废，
+    // getSystemService(NSD) 在 NsdManager.<init>（getMessenger:592）当场 NPE——
+    // 而此处是构造期急切求值，JmDNS 分支（API<21）根本用不到它，NPE 直接致命化整个 bring-up。
+    // 修复：获取加护栏置空，NSD 分支用到时再降级报「广播失败（非致命）」，蓝牙直连不受影响。
+    private val nsdManager: NsdManager? = runCatching {
+        (context.applicationContext ?: context)
+            .getSystemService(Context.NSD_SERVICE) as NsdManager
+    }.onFailure {
+        android.util.Log.w("CarPlayBonjour", "NsdManager unavailable on this ROM: $it")
+    }.getOrNull()
     private val services = LinkedBlockingQueue<NsdServiceInfo>()
     private val interfaceServices = LinkedBlockingQueue<Pair<CarPlayBonjourEndpoint, InetAddress>>()
     private val discoveryEvents = LinkedBlockingQueue<CarPlayBonjourEvent.Discovery>(32)
@@ -169,7 +177,14 @@ class CarPlayBonjour(
         }
 
         override fun serviceRemoved(event: ServiceEvent) {
-            seenServices.remove(event.name)
+            // 1.0.15：去重键含地址（见 serviceResolved），按名字前缀清理该服务的所有地址条目。
+            // 注意：不用 Collection.removeIf（Java 8 默认方法，API<24 无 desugaring 保证）。
+            val prefix = event.name + "|"
+            val iterator = seenServices.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry == event.name || entry.startsWith(prefix)) iterator.remove()
+            }
         }
 
         override fun serviceResolved(event: ServiceEvent) {
@@ -187,7 +202,10 @@ class CarPlayBonjour(
                 ))
                 return
             }
-            if (!seenServices.add(event.name)) return
+            // 1.0.15（借鉴 carlito 61e3fa4）：多网卡车机上同一服务名可能经多个 LAN 地址
+            // 应答；去重键加入地址维度，避免首个（可能是陈旧/错误网段的）地址独占去重，
+            // 后续正确网段的应答仍可进入探测队列。
+            if (!seenServices.add(event.name + "|" + (address.hostAddress ?: ""))) return
             val endpoint = CarPlayBonjourEndpoint(
                 event.name, address.hostAddress ?: return, info.port,
                 info.getPropertyString("id"),
@@ -255,11 +273,28 @@ class CarPlayBonjour(
                     val address = requireNotNull(localAdvertisedAddress ?: fallbackLocalAddress()) {
                         "Interface mDNS requires a local advertised address"
                     }
+                    // M6k20（移植自 carlito fork dfb638c「preserve discovery」思想）：
+                    // 接口绑定失败（ENODEV/ENODEV 类）时回落无接口模式（内核选默认多播出口），
+                    // 而不是直接放弃广播。全部失败才向上抛（controller 侧仍有非致命降级）。
                     val dns = try {
                         JmDNS.create(address, "carplay-${config.deviceId.replace(":", "")}")
-                    } catch (error: IOException) {
+                    } catch (error: Exception) {
                         // 实测坑：报错需可区分 mDNS(5353) 与 AirPlay(7000) 的端口占用。
-                        throw IOException("JmDNS mDNS(UDP 5353) 绑定失败: ${error.message}", error)
+                        // 山海车机实测（10-06）：JmDNS 枚举畸形网卡时抛 NPE 而非 IOException，
+                        // catch 收窄会穿透致命化整个 bring-up，故放宽到 Exception。
+                        val bindFailure = IOException(
+                            "JmDNS mDNS(UDP 5353) 绑定失败: ${error.javaClass.simpleName}: ${error.message}",
+                            error,
+                        )
+                        try {
+                            JmDNS.create("carplay-${config.deviceId.replace(":", "")}")
+                        } catch (fallbackError: Exception) {
+                            throw IOException(
+                                "${bindFailure.message}；无接口回落也失败: " +
+                                    "${fallbackError.javaClass.simpleName}: ${fallbackError.message}",
+                                fallbackError,
+                            )
+                        }
                     }
                     interfaceMdns = dns
                     dns.addServiceListener("$CARPLAY_CONTROL_SERVICE_TYPE.local.", interfaceListener)
@@ -273,9 +308,10 @@ class CarPlayBonjour(
                     // 模式由内核选默认多播出口。discovery 仍不可用（getter 21+），不影响广播。
                     val dns = try {
                         JmDNS.create("carplay-${config.deviceId.replace(":", "")}")
-                    } catch (error: IOException) {
+                    } catch (error: Exception) {
+                        // 同上：JmDNS 可能抛 NPE（畸形网卡枚举），放宽 catch 防穿透。
                         throw IOException(
-                            "JmDNS mDNS(UDP 5353) 无接口绑定失败: ${error.message}" +
+                            "JmDNS mDNS(UDP 5353) 无接口绑定失败: ${error.javaClass.simpleName}: ${error.message}" +
                                 "；接口诊断 ${networkInterfaceDiagnostics()}",
                             error,
                         )
@@ -287,9 +323,13 @@ class CarPlayBonjour(
                         0, 0, CarPlayBonjourProtocol.airPlayTxtRecords(config, identity),
                     ))
                 } else {
-                    registerAirPlay()
+                    val nsd = nsdManager ?: throw IOException(
+                        "NsdManager 系统服务不可用（ROM 残废，广播降级非致命）: " +
+                            networkInterfaceDiagnostics(),
+                    )
+                    registerAirPlay(nsd)
                     registrationRequested = true
-                    nsdManager.discoverServices(
+                    nsd.discoverServices(
                         CARPLAY_CONTROL_SERVICE_TYPE,
                         NsdManager.PROTOCOL_DNS_SD,
                         discoveryListener,
@@ -304,11 +344,11 @@ class CarPlayBonjour(
                 closed = true
                 if (registrationRequested) {
                     registrationRequested = false
-                    runCatching { nsdManager.unregisterService(registrationListener) }
+                    nsdManager?.let { nsd -> runCatching { nsd.unregisterService(registrationListener) } }
                 }
                 if (discoveryRequested) {
                     discoveryRequested = false
-                    runCatching { nsdManager.stopServiceDiscovery(discoveryListener) }
+                    nsdManager?.let { nsd -> runCatching { nsd.stopServiceDiscovery(discoveryListener) } }
                 }
                 worker?.interrupt()
                 worker = null
@@ -328,11 +368,11 @@ class CarPlayBonjour(
             closed = true
             if (registrationRequested) {
                 registrationRequested = false
-                runCatching { nsdManager.unregisterService(registrationListener) }
+                nsdManager?.let { nsd -> runCatching { nsd.unregisterService(registrationListener) } }
             }
             if (discoveryRequested) {
                 discoveryRequested = false
-                runCatching { nsdManager.stopServiceDiscovery(discoveryListener) }
+                nsdManager?.let { nsd -> runCatching { nsd.stopServiceDiscovery(discoveryListener) } }
             }
             activeSocket?.let { socket -> runCatching { socket.close() } }
             activeSocket = null
@@ -351,7 +391,7 @@ class CarPlayBonjour(
     }
 
     @Suppress("DEPRECATION")
-    private fun registerAirPlay() {
+    private fun registerAirPlay(nsd: NsdManager) {
         // API16 实测修正（10-02 20:26）：NsdServiceInfo 的 setter 中仅
         // serviceName/serviceType/port 是 API 16，setAttribute/setHost 是 API 21+。
         // 低版本广播由 JmDNS 无接口分支接管，此处守卫仅作防御。
@@ -368,7 +408,7 @@ class CarPlayBonjour(
                 localAdvertisedAddress?.let(::setHost)
             }
         }
-        nsdManager.registerService(
+        nsd.registerService(
             serviceInfo,
             NsdManager.PROTOCOL_DNS_SD,
             registrationListener,
@@ -513,7 +553,7 @@ class CarPlayBonjour(
             }
             val submitted = try {
                 synchronized(lifecycleLock) {
-                    if (closed) {
+                    if (closed || nsdManager == null) {
                         false
                     } else {
                         nsdManager.resolveService(service, listener)

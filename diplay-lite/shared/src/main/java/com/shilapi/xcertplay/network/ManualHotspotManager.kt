@@ -103,7 +103,17 @@ class ManualHotspotManager(
                 // 实测读不到信道时（C8815/nova3e 的 4.x / 9 ROM 在 AP 模式下既拿不到
                 // scanResults、也读不到 apChannel）退回用户手填的信道——UI 的信道栏本就为
                 // 此准备（“留空自动实测，失败请手填”）；否则会永远下发 channel=0。
-                val channel = if (observedChannel > 0) observedChannel else expectedChannel
+                // 1.0.13：观测信道吸附到标准信道（2.4G→1/6/11，5G→36/44/149/157）；
+                // 1.0.15：观测/手填都没有时，优先复用上次会话成功确认过的信道
+                // （ConfirmedChannelMemory），最后才兜底猜 6。
+                val channel = when {
+                    observedChannel > 0 -> snapHotspotChannel(observedChannel)
+                    expectedChannel > 0 -> snapHotspotChannel(expectedChannel)
+                    else ->
+                        ConfirmedChannelMemory.recall(appContext, ConfirmedChannelMemory.ROLE_CAR)
+                            .takeIf { it > 0 }
+                            ?: 6
+                }
                 val frequencyMHz = when {
                     apConfiguration?.frequencyMHz != null -> apConfiguration.frequencyMHz
                     connectionFrequency != null -> connectionFrequency
@@ -112,7 +122,8 @@ class ManualHotspotManager(
                 }
                 val security = apConfiguration?.security ?: expectedSecurity
                 onDiagnostic("Manual hotspot configReadable=${apConfiguration != null} " +
-                    "security=$security channelKnown=${observedChannel > 0} channel=$channel " +
+                    "security=$security channelKnown=${observedChannel > 0} " +
+                    "observed=$observedChannel advertised=$channel " +
                     "hardwareAddressKnown=${localInterface.hardwareAddress != null} iface=${localInterface.name} " +
                     "ipv4Preferred=$preferIpv4 " +
                     "family=${if (localInterface.hostAddress is Inet6Address) "IPv6" else "IPv4"}")
@@ -125,7 +136,7 @@ class ManualHotspotManager(
                         TAG,
                         "Could not read the active hotspot channel from Android public APIs; " +
                             "advertising $channel" +
-                            if (channel > 0) " (user-supplied)" else " (auto)",
+                            if (channel > 0) " (best guess)" else " (auto)",
                     )
                 }
                 val observedBandLabel = wifiBandLabel(apConfiguration?.band)

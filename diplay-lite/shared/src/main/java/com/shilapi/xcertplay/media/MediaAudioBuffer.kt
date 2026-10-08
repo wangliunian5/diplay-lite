@@ -23,7 +23,8 @@ object MediaAudioBuffer {
     // Wireless logs show periodic gaps up to ~260 ms that previously underran an ~80 ms buffer.
     private const val NON_MEDIA_START_MILLIS = 200
 
-    fun sanitize(millis: Int): Int = millis.takeIf { it in presets } ?: DEFAULT_MILLIS
+    // M6k19：设置页开放 10-4000ms 自由输入，不再限于旧预设档位。
+    fun sanitize(millis: Int): Int = millis.coerceIn(10, 4000)
 
     data class Plan(val trackBufferBytes: Int, val startBytes: Int)
 

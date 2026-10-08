@@ -100,6 +100,13 @@ class AirPlaySession(
 
     internal fun logDebug(message: String) = debugLog(message)
 
+    /**
+     * M6k23：控制连接结束原因（peer EOF / control decrypt failed / control I/O failed 等）。
+     * 上层（CarPlayController）用它判定「未建流阶段的异常断开」并触发整代重启。
+     */
+    var lastCloseReason = "session closed"
+        private set
+
     internal fun videoFrameRendered() {
         if (!closed.get()) listener.onVideoFrameRendered(this)
     }
@@ -265,12 +272,11 @@ class AirPlaySession(
         controlOutput = output
         var accumulated = ByteArray(0)
         val buffer = ByteArray(READ_CHUNK_BYTES)
-        var closeReason = "session closed"
         try {
             while (!closed.get()) {
                 val count = input.read(buffer)
                 if (count < 0) {
-                    closeReason = "peer EOF"
+                    lastCloseReason = "peer EOF"
                     break
                 }
                 var plaintext = buffer.copyOf(count)
@@ -280,8 +286,8 @@ class AirPlaySession(
                     val decrypted = try {
                         activeCipher.decrypt(encBuf)
                     } catch (error: Exception) {
-                        closeReason = "control decrypt failed: ${error.message ?: error.javaClass.simpleName}"
-                        Log.e(TAG, "airplay $closeReason encrypted=${encBuf.size}", error)
+                        lastCloseReason = "control decrypt failed: ${error.message ?: error.javaClass.simpleName}"
+                        Log.e(TAG, "airplay $lastCloseReason encrypted=${encBuf.size}", error)
                         break
                     }
                     encBuf = decrypted.rest
@@ -336,10 +342,10 @@ class AirPlaySession(
                 notifySetupResponseSent()
             }
         } catch (error: Exception) {
-            closeReason = "control I/O failed: ${error.message ?: error.javaClass.simpleName}"
-            if (!closed.get()) Log.e(TAG, "airplay $closeReason", error)
+            lastCloseReason = "control I/O failed: ${error.message ?: error.javaClass.simpleName}"
+            if (!closed.get()) Log.e(TAG, "airplay $lastCloseReason", error)
         } finally {
-            debugLog("airplay control closing reason=$closeReason activeStreams=$activeStreams")
+            debugLog("airplay control closing reason=$lastCloseReason activeStreams=$activeStreams")
             close()
         }
     }

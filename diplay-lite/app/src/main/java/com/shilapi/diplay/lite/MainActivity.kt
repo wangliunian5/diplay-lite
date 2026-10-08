@@ -1,77 +1,152 @@
 package com.shilapi.diplay.lite
 
 import android.app.Activity
-import android.app.AlarmManager
 import android.app.AlertDialog
-import android.app.PendingIntent
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
 import android.content.Intent
+import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
+import android.hardware.usb.UsbManager
+import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
-import android.provider.Settings
-import android.text.InputType
+import android.text.TextUtils
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
-import android.widget.ArrayAdapter
 import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import com.shilapi.xcertplay.media.CarPlayTouchMapper
 import kotlin.math.abs
 
 /**
- * DiPlay Lite 主界面：单屏程序化 UI（零 XML 资源、零 AndroidX、无图片）。
+ * DiPlay Lite 主界面（原版式视觉重构）：视觉语言对齐上游原版 DiPlayActivity（DiAuto 设计）。
  *
- * M0 骨架阶段：热点表单 + 服务启停 + 状态/日志显示；
- * 连接编排（shared 模块 CarPlayController）在 M2 接入 LiteSessionService。
- * M4k：车机形态——默认全屏横屏，SurfaceView 铺满整屏做触摸目标；
- * 配置/日志面板作为浮层（连接成功后自动收起，右上角可拖拽的圆形悬浮球可随时唤回）。
+ * 结构（原版式）：page 字符串路由 + render() 整页重建，构建代码收敛为原版式辅助函数
+ * （dip/label/button/card/column/row/space/matchButton/rounded）。M6k25 单 Activity 化：
+ * page = "home" | "settings" | "caricon" | "hotspot-car" | "hotspot-relay"，原
+ * SettingsActivity/CarIconActivity/HotspotConfigActivity 收编为同包页面对象
+ * （SettingsPage/CarIconPage/HotspotPage），根除子 Activity 新窗口出生方向闪转问题。
  *
- * 状态刷新用 500ms 轮询（Handler），代替广播与生命周期库，保持零依赖。
+ * home 页形态（M6k21，对齐原版）：
+ * - hero 区（原版式）：ACCENT 眉题 + 大标题 + MUTED 副题；
+ * - 「CARPLAY 状态」大状态卡（原版「无线 CARPLAY」式）：眉题 + 实时状态大字 + 主按钮
+ *   （空闲=按默认通道连接 / 会话中=断开）+ 默认通道提示；
+ * - USB 直连键（原版右列位）：竖屏在状态卡下方独立成行；横屏在右列 USB+设置。
+ *   通道卡取消：热点/中继网络配置入口移入设置页（「车机热点网络配置」「中继热点网络配置」）。
+ *
+ * 必须保留的既有能力（勿破坏）：
+ * - USB 通道连接路径：USB 设备探测（Apple VID）→ VpnService.prepare 授权 → startSession；
+ * - 视频层：SurfaceView 铺满 + forwardTouch 触摸转发，ACTIVE 时面板收起、悬浮球唤回；
+ * - 悬浮球：初始右对齐上下居中，拖拽后吸附最近左/右边（attachBallDrag）；
+ * - errorCard：FAILED 态居中小卡片（≤300dp，标题 + 3 行省略 + 重试）；
+ * - 旋转：onConfigurationChanged 分屏处理；布局方向用 Display 实际宽高判定
+ *   （isLandscapeDisplay，勿信 configuration.orientation）；ACTIVE/CONNECTING 仅换面板
+ *   不动 SurfaceView；空闲态 render() 整页重建。
+ *
+ * API16 红线：letterSpacing/stateListAnimator/RippleDrawable 均 ≥API21，全部显式护栏；
+ * clipToOutline（API18）沿用既有护栏。零 XML，不改 Manifest。
  */
 class MainActivity : Activity() {
 
     private val handler = Handler()
-    private lateinit var statusDot: TextView
-    private lateinit var statusLine: TextView
-    private lateinit var logView: TextView
-    private lateinit var ssidInput: EditText
-    private lateinit var passwordInput: EditText
-    private lateinit var channelInput: EditText
-    private lateinit var securityInput: Spinner
-    private lateinit var bluetoothPickButton: Button
-    private lateinit var fps30Check: CheckBox
-    private lateinit var scaleInput: EditText
-    private lateinit var speakerCallsCheck: CheckBox
-    private lateinit var duckInput: EditText
-    private lateinit var softDecodeCheck: CheckBox
-    private lateinit var connectButton: Button
-    private lateinit var disconnectButton: Button
+
+    /** 原版式 page 字符串路由（M6k25 单 Activity 化：全部页面均在本 Activity 内重建）。 */
+    private var page = "home"
+
+    // 子页对象：与 page 一一对应，离开页面时 cleanup()（persist/向导注销/线程池关闭等）。
+    private var settingsPage: SettingsPage? = null
+    private var carIconPage: CarIconPage? = null
+    private var hotspotPage: HotspotPage? = null
+
+    // 视图引用：render()/homePanel() 程序化构建并在其中完成全部监听挂接与引用赋值
     private lateinit var video: SurfaceView
-    private lateinit var panel: ScrollView
-    private lateinit var panelToggle: TextView
+    private lateinit var panel: View
+    private lateinit var ballRoot: View
+    private lateinit var statusDot: View
+    private lateinit var statusLine: TextView
+    // FAILED 态的居中小卡片（标题 + 3 行省略 + 结束）。
+    private lateinit var errorCard: View
+    private lateinit var errorTextView: TextView
+    // M6k24：状态卡三键 —— 立即连接（常驻，连接中置灰）/ 选择 iPhone（常驻）/ 断开连接（仅连接中出现）。
+    // 大状态卡主按钮不再做 0/1 状态切换（对齐原版交互）。
+    private lateinit var primaryActionButton: Button
+    private lateinit var pickIphoneButton: Button
+    private lateinit var disconnectButton: Button
+    // 默认通道提示行：设置页改默认通道后回主页实时刷新。
+    private lateinit var hintLabel: TextView
+
     private var panelVisible = true
     private var lastActive = false
-    // M6k5：日志区渲染节流。renderState 500ms 一跳，原实现每次都全量 setText ——
-    // TextView 不做内容比较，200 行日志整块重排；连接期间日志持续增长，滚动正好每 500ms 被打断一次。
-    private var lastLogText: String? = null
-    private var lastPanelScrollY = 0
-    // M6k3：蓝牙点选的当前值。地址落盘 LiteConfig.bt_address（连接时用），名字只用于按钮展示。
-    private var bluetoothAddress = ""
-    private var bluetoothName = ""
+    // 与设置页同步：记录当前渲染出的默认通道，tick 里比对 LiteConfig.activeChannel
+    private var shownActiveChannel: String? = null
+    // 自动连接一个进程生命周期只发起一次，避免用户断开后再被拉起
+    private var autoConnectTried = false
+
+    // 1.0.16（方案四②）：开机自启等待弹窗——上电后等勾选的蓝牙/热点就绪并稳定 10s 再自动连接。
+    private var autostartWaitActive = false
+    private var autostartDialog: AlertDialog? = null
+    private var autostartStableSecs = 0
+    private var autostartDeadline = 0L
+
+    private val autostartPoll = object : Runnable {
+        override fun run() {
+            if (!autostartWaitActive || !isFinishing) return
+            val config = LiteConfig.load(this@MainActivity)
+            // 就绪判定：勾了蓝牙自启 → 蓝牙已开；勾了热点自启 → AP state=13（AOSP ENABLED）。
+            val btReady = !config.bootAutoBluetooth || runCatching {
+                android.bluetooth.BluetoothAdapter.getDefaultAdapter()?.isEnabled == true
+            }.getOrDefault(false)
+            val apReady = !config.bootAutoHotspot || runCatching {
+                val wifi = getSystemService(WIFI_SERVICE) as? android.net.wifi.WifiManager
+                val state = wifi?.let {
+                    android.net.wifi.WifiManager::class.java.getMethod("getWifiApState").invoke(it) as Int
+                } ?: -1
+                state == 13
+            }.getOrDefault(false)
+            if (btReady && apReady) {
+                autostartStableSecs += 1
+            } else {
+                autostartStableSecs = 0
+            }
+            autostartDialog?.setMessage(
+                "等待勾选的蓝牙或WIFI热点启动…" +
+                    (if (autostartStableSecs > 0) "（已就绪，稳定中 $autostartStableSecs/10s）" else ""),
+            )
+            if (autostartStableSecs >= AUTOSTART_STABLE_SECS) {
+                LiteLog.log("ui", "自启等待：勾选项就绪且稳定 ${AUTOSTART_STABLE_SECS}s，发起自动连接")
+                finishAutostartWait()
+                maybeAutoConnect()
+                return
+            }
+            if (System.currentTimeMillis() >= autostartDeadline) {
+                LiteLog.log("ui", "自启等待：超时 ${AUTOSTART_WAIT_TIMEOUT_MILLIS / 1000}s，自动连接已取消")
+                autostartWaitActive = false
+                autostartDialog?.apply {
+                    setMessage("等待超时：勾选的蓝牙/热点未就绪，自动连接已取消")
+                    setButton(AlertDialog.BUTTON_POSITIVE, "确定") { d, _ -> d.dismiss() }
+                    show()
+                }
+                autostartDialog = null
+                return
+            }
+            handler.postDelayed(this, 1_000)
+        }
+    }
 
     private val refreshTask = object : Runnable {
         override fun run() {
@@ -87,21 +162,28 @@ class MainActivity : Activity() {
             WindowManager.LayoutParams.FLAG_FULLSCREEN,
             WindowManager.LayoutParams.FLAG_FULLSCREEN,
         )
-        // M4l：车机屏绝不能休眠。屏幕一黑一亮，SurfaceView 的 Surface 就会销毁重建，
-        // 而 API16 不支持 setOutputSurface（API23+），只能重建解码器 + 等下一个关键帧，
-        // 期间收到的帧全部丢弃（实测 M4k 日志里 shown 从 17fps 掉到 2.8fps 就是这种窗口）。
+        // M4l：车机屏绝不能休眠（API16 无 setOutputSurface，Surface 重建 = 解码器重配）。
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        setContentView(buildUi())
-        loadIntoForm()
-        setPanelVisible(true)
-        renderState()
-        LiteLog.log("ui", "DiPlay Lite M0 骨架就绪（minSdk 16）")
+        applyOrientationMode(this, LiteConfig.load(this).orientationMode)
+        render()
+        // 1.0.16（方案四②）：开机自启拉起（BootReceiver 带 EXTRA_AUTOSTART）→ 等待弹窗。
+        if (intent?.getBooleanExtra(EXTRA_AUTOSTART, false) == true) {
+            beginAutostartWait()
+        }
+        // 1.0.11（FE-6 拉伸）：解码器实际输出尺寸 ≠ 面板尺寸时等比 letterbox，不硬拉伸。
+        LiteVideoBridge.setVideoSizeListener { width, height ->
+            runOnUiThread { applyVideoFit(width, height) }
+        }
+        LiteLog.log("ui", "主界面就绪（原版式视觉：page 路由 + render 整页重建）")
     }
 
     override fun onResume() {
         super.onResume()
         LiteLog.log("ui", "onResume")
+        // M6k24：设置页可能改过横竖屏 —— 回主页立即按最新设置强制窗口方向。
+        applyOrientationMode(this, LiteConfig.load(this).orientationMode)
         handler.post(refreshTask)
+        maybeAutoConnect()
     }
 
     override fun onPause() {
@@ -110,23 +192,223 @@ class MainActivity : Activity() {
         handler.removeCallbacks(refreshTask)
     }
 
-    /**
-     * M4l 诊断：Activity 重建本身会让 SurfaceView 的 Surface 销毁重建（见 onCreate 注释）。
-     * 这条日志用来区分"只是 Surface 重建"（无 onDestroy）与"Activity 真的被销毁"（有 onDestroy）。
-     */
     override fun onDestroy() {
         LiteLog.log("ui", "onDestroy（Activity 被销毁，下一次进入会重建 Surface 与解码器）")
+        LiteVideoBridge.setVideoSizeListener(null)
+        detachCurrentPage()
         super.onDestroy()
     }
 
-    // ---------- UI 构造（纯代码，无 XML） ----------
+    /**
+     * 1.0.11（FE-6 拉伸）：按解码器实际输出尺寸把 SurfaceView 等比适配到容器内并居中。
+     * width/height<=0 表示流已结束，恢复铺满。触摸映射（forwardTouch）基于 video 视图
+     * 尺寸，等比适配后映射自动正确。
+     */
+    private fun applyVideoFit(width: Int, height: Int) {
+        val parent = video.parent as? android.view.ViewGroup ?: return
+        if (width <= 0 || height <= 0) {
+            val lp = video.layoutParams
+            if (lp.width == FrameLayout.LayoutParams.MATCH_PARENT &&
+                lp.height == FrameLayout.LayoutParams.MATCH_PARENT
+            ) return
+            lp.width = FrameLayout.LayoutParams.MATCH_PARENT
+            lp.height = FrameLayout.LayoutParams.MATCH_PARENT
+            video.layoutParams = lp
+            video.requestLayout()
+            return
+        }
+        val pw = parent.width
+        val ph = parent.height
+        if (pw <= 0 || ph <= 0) return
+        val scale = minOf(pw.toDouble() / width, ph.toDouble() / height)
+        val fitW = Math.max(1, Math.round(width * scale).toInt())
+        val fitH = Math.max(1, Math.round(height * scale).toInt())
+        val lp = video.layoutParams
+        if (lp.width == fitW && lp.height == fitH) return
+        lp.width = fitW
+        lp.height = fitH
+        if (parent is FrameLayout) {
+            (lp as FrameLayout.LayoutParams).gravity = android.view.Gravity.CENTER
+        }
+        video.layoutParams = lp
+        video.requestLayout()
+        LiteLog.log("ui", "视频等比适配 coded=${width}x${height} → view=${fitW}x${fitH} panel=${pw}x${ph}")
+    }
 
-    private fun buildUi(): View {
-        val pad = dip(12)
-        // 根容器用 FrameLayout：SurfaceView 铺满整屏（车机画面），配置/日志面板浮在上面。
-        val outer = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        // M3：CarPlay 画面镜像到该 SurfaceView；Surface 经 LiteVideoBridge 交给后台 MediaCodec。
-        // M4k：铺满屏幕 + 接手势 —— CarPlay 的触摸全靠这个 View 转成 HID 报告发回 iPhone。
+    // ---------- M6k25：单 Activity 页面路由 ----------
+
+    /** 切页：离开旧页先清理（persist/向导注销/试听关闭等），再整页重建。 */
+    fun setPage(target: String) {
+        if (target == page) return
+        detachCurrentPage()
+        page = target
+        render()
+    }
+
+    /** 返回主页（原各子 Activity 的 finish()）。 */
+    fun goHome() = setPage("home")
+
+    /** 设置页热点配置入口（原 HotspotConfigActivity.intent(this, mode)）。 */
+    fun openHotspotPage(mode: String) = setPage("hotspot-$mode")
+
+    /** 离开当前子页并释放其资源；home 页无资源需要释放。 */
+    private fun detachCurrentPage() {
+        when (page) {
+            "settings" -> settingsPage?.cleanup()
+            "caricon" -> carIconPage?.cleanup()
+            "hotspot-car", "hotspot-relay" -> hotspotPage?.cleanup()
+        }
+        settingsPage = null
+        carIconPage = null
+        hotspotPage = null
+    }
+
+    /**
+     * CarIconPage 图库选择：统一由 MainActivity 发起（原 CarIconActivity.pickImage 的
+     * startActivityForResult；单 Activity 后子页不能再自行启动结果回调）。
+     */
+    fun launchGalleryPicker() {
+        val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "image/*"
+        }
+        try {
+            startActivityForResult(Intent.createChooser(intent, "选择图标图片"), REQUEST_GALLERY_PICK)
+        } catch (_: Exception) {
+            toast("未找到图片选择器")
+        }
+    }
+
+    /**
+     * 方向盘学习向导的本地 KeyEvent 捕获（原 SettingsActivity.onKeyDown）：
+     * 仅设置页且向导监听/验证态（钩子非空）时消费。
+     */
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (page == "settings") {
+            settingsPage?.let { if (it.consumeKeyDown(keyCode, event)) return true }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    /**
+     * 旋转重建（M6k24 起仅兜底用）：方向已是强制二选一，系统旋转不再发生在会话中；
+     * 设置页切换横竖屏回主页时窗口方向变化会走到这里。空闲态 render() 整页重建。
+     * ACTIVE/CONNECTING 拒绝整页重建 —— Surface 换了会冻结画面，仅换面板不动 SurfaceView。
+     */
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val phase = LiteState.phase
+        // M6k25：子页。会话中不整页重建（与原独立子页行为一致，视图随 configChanges 自动重排）；
+        // 空闲态重建当前页（render() 按 page 分发，天然重建正确）。
+        if (page != "home") {
+            if (phase == LiteState.Phase.IDLE) {
+                render()
+                LiteLog.log("ui", "旋转：空闲态整页重建（page=$page）")
+            } else {
+                LiteLog.log("ui", "旋转：子页保持（page=$page phase=$phase）")
+            }
+            return
+        }
+        if (phase == LiteState.Phase.ACTIVE || phase == LiteState.Phase.CONNECTING) {
+            val root = video.parent as? FrameLayout
+            if (root != null) {
+                root.removeView(panel)
+                panel = homePanel()
+                root.addView(panel, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+                // 旋转后让视频 SurfaceView 跟随新窗口尺寸重排（MediaCodec 输出自动缩放到 Surface）。
+                video.requestLayout()
+                setPanelVisible(panelVisible)
+                renderState()
+            }
+            LiteLog.log("ui", "旋转：会话进行中，仅重建面板（视频 Surface 保持）")
+            return
+        }
+        render()
+        LiteLog.log("ui", "旋转：空闲态整页重建（page=$page）")
+    }
+
+    // ---------- 原版式构建辅助（对齐 DiPlayActivity 的写法） ----------
+
+    private fun dip(value: Int): Int = Ui.dip(this, value)
+
+    /**
+     * 面板布局方向改用 Display 实际宽高判定，不再信 configuration.orientation ——
+     * C8815（4.1 dalvik）实测强制横屏后 config 仍报 portrait，竖屏布局被画进横屏窗口，
+     * 整版文字转 90°（"背景错位"）。Display 宽高与窗口真实形状同源，不受该 ROM bug 影响。
+     */
+    /**
+     * M6k24：布局方向完全跟随设置（强制横屏/强制竖屏二选一，自动旋转已取消）。
+     * 不再信 Display/configuration —— 8815 实测两者都会漂移（540x960↔960x540 翻转），
+     * 导致竖屏设置下主页偶尔画成横版。窗口方向由 applyOrientationMode 强制，与设定一致。
+     */
+    private fun isLandscapeUi(): Boolean = LiteConfig.load(this).orientationMode != "portrait"
+
+    private fun column() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        layoutParams = LinearLayout.LayoutParams(-1, -2)
+    }
+
+    private fun row() = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        layoutParams = LinearLayout.LayoutParams(-1, -2)
+    }
+
+    private fun label(value: String, size: Int, color: Int, bold: Boolean = false) = TextView(this).apply {
+        text = value; textSize = size.toFloat(); setTextColor(color); gravity = Gravity.CENTER_VERTICAL
+        typeface = if (bold) Typeface.create("sans-serif-medium", Typeface.NORMAL) else Typeface.create("sans-serif", Typeface.NORMAL)
+        setLineSpacing(dip(3).toFloat(), 1f)
+    }
+
+    /**
+     * 原版式按钮：primary = ACCENT 实心 + BG 文字；secondary = CARD 面 + BORDER 描边 + TEXT 文字。
+     * RippleDrawable/stateListAnimator 是 API21+，必须护栏（API16 红线）。
+     */
+    private fun button(title: String, primary: Boolean, height: Int = 46, click: () -> Unit) = Button(this).apply {
+        text = title; isAllCaps = false; textSize = 15f
+        setTextColor(if (primary) Ui.BG else Ui.TEXT)
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        val fill = if (primary) Ui.ACCENT else Ui.CARD
+        val stroke = if (primary) Ui.ACCENT else Ui.BORDER
+        background = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            RippleDrawable(ColorStateList.valueOf(0x336F9FD9), rounded(fill, stroke), null)
+        } else {
+            rounded(fill, stroke)
+        }
+        setPadding(dip(12), 0, dip(12), 0); minHeight = dip(height)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) stateListAnimator = null
+        setOnClickListener { click() }
+    }
+
+    private fun card() = column().apply {
+        background = rounded(Ui.CARD, Ui.BORDER)
+        setPadding(dip(16), dip(14), dip(16), dip(16))
+    }
+
+    private fun rounded(color: Int, stroke: Int) = GradientDrawable().apply {
+        setColor(color); cornerRadius = dip(20).toFloat(); setStroke(dip(1), stroke)
+    }
+
+    private fun matchButton(top: Int = 0, height: Int = 50) =
+        LinearLayout.LayoutParams(-1, dip(height)).apply { topMargin = dip(top) }
+
+    private fun space(height: Int) = View(this).apply { layoutParams = LinearLayout.LayoutParams(1, dip(height)) }
+
+    /** 眉题字距：TextView.letterSpacing 是 API21+，护栏后应用（原版 .12f/.16f）。 */
+    private fun TextView.applyLetterSpacing(spacing: Float) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) letterSpacing = spacing
+    }
+
+    // ---------- 原版式 render：整页重建 ----------
+
+    /**
+     * 根视图：Surface 铺满 → home 面板 → 悬浮球 → errorCard。
+     * 面板布局方向用 Display 实际宽高判定（isLandscapeDisplay），勿信 configuration.orientation。
+     */
+    internal fun render() {
+        val root = FrameLayout(this).apply { background = ColorDrawable(Ui.BG) }
+
+        // M3：CarPlay 画面镜像到该 SurfaceView；M4k：铺满整屏 + 接手势转发。
+        // 子页时铺在页面底下（子页根布局不透明遮住），Surface 常驻避免切页反复换 Surface。
         video = SurfaceView(this)
         video.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
@@ -142,243 +424,307 @@ class MainActivity : Activity() {
             }
         })
         video.setOnTouchListener { _, event -> forwardTouch(event) }
-        outer.addView(
-            video,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            ),
-        )
-        panel = ScrollView(this)
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
-            setBackgroundColor(BG)
-        }
-        panel.addView(root)
-        outer.addView(
-            panel,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            ),
-        )
-        // M6k：面板开关改为可拖拽的圆形悬浮球（原来贴右上角的矩形按钮）。
-        // 无条件浮在最上层，面板收起后它是唯一能唤回配置/日志的入口；可拖到任意角落，避免挡住 CarPlay 内容。
-        val ballSize = dip(46)
-        panelToggle = TextView(this).apply {
-            text = "面板"
-            textSize = 12f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.argb(150, 40, 44, 52))
-                setStroke(dip(1), Color.argb(190, 200, 210, 220))
+        root.addView(video, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+        panel = when (page) {
+            "settings" -> {
+                val newPage = SettingsPage(this)
+                settingsPage = newPage
+                newPage.buildRoot()
             }
-            alpha = 0.85f
-            setOnClickListener { setPanelVisible(!panelVisible) }
+            "caricon" -> {
+                val newPage = CarIconPage(this)
+                carIconPage = newPage
+                newPage.buildRoot()
+            }
+            "hotspot-car", "hotspot-relay" -> {
+                val newPage = HotspotPage(this, page.removePrefix("hotspot-"))
+                hotspotPage = newPage
+                newPage.buildRoot()
+            }
+            else -> homePanel()
         }
-        val toggleParams = FrameLayout.LayoutParams(ballSize, ballSize, Gravity.TOP or Gravity.END)
-        toggleParams.setMargins(0, dip(6), dip(6), 0)
-        attachBallDrag(panelToggle, toggleParams)
-        outer.addView(panelToggle, toggleParams)
+        root.addView(panel, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
-        // 标题行：状态圆点 + 标题
-        val title = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+        if (page == "home") {
+            // M4k/M6k：可拖拽悬浮球，面板收起后的唯一唤回入口（home 专属；子页用 attachPageBall）。
+            val ball = FrameLayout(this).apply {
+                background = Ui.pillSolid(this@MainActivity, 0x66FFFFFF).apply { cornerRadius = dip(23).toFloat() }
+                // setClipToOutline 是 API 18+；部分白牌 ROM（山海等）谎报 SDK_INT≥18 但 framework 缺方法，
+                // SDK_INT 护栏拦不住 → 改反射探测，方法不存在时静默跳过。
+                runCatching {
+                    FrameLayout::class.java
+                        .getMethod("setClipToOutline", Boolean::class.javaPrimitiveType)
+                        .invoke(this, true)
+                }
+            }
+            val ballIcon = ImageView(this).apply {
+                setImageDrawable(IconPainter.arrows(this@MainActivity, 20, Ui.TEXT))
+            }
+            ball.addView(
+                ballIcon,
+                FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER),
+            )
+            ball.setOnClickListener { setPanelVisible(!panelVisible) }
+            // 悬浮球初始位置 = 右对齐 + 上下居中；拖拽后吸附最近左/右边。
+            val ballSize = dip(46)
+            val ballParams = FrameLayout.LayoutParams(ballSize, ballSize, Gravity.TOP or Gravity.END)
+            ballParams.topMargin = ((resources.displayMetrics.heightPixels - ballSize) / 2).coerceAtLeast(0)
+            ballParams.rightMargin = dip(12)
+            ball.layoutParams = ballParams
+            attachBallDrag(ball, ballParams)
+            ballRoot = ball
+            root.addView(ball, ballParams)
         }
-        statusDot = TextView(this).apply {
-            text = "●"
-            textSize = 18f
-            setTextColor(Color.GRAY)
-        }
-        title.addView(statusDot)
-        title.addView(TextView(this).apply {
-            text = "DiPlay Lite"
-            textSize = 22f
-            setTextColor(Color.WHITE)
-            setPadding(dip(8), 0, 0, 0)
-        })
-        root.addView(title)
 
-        statusLine = TextView(this).apply {
-            setTextColor(Color.LTGRAY)
-            textSize = 14f
-            setPadding(0, dip(4), 0, dip(8))
+        // FAILED 态：居中小卡片（宽度 ≤300dp：标题 + 3 行省略 + 结束按钮）。
+        // M6k24：「重试」改「结束」—— 点击只结束当前会话回空闲，由用户自己再点连接。
+        val errorCardView = FrameLayout(this).apply {
+            background = rounded(Ui.CARD, Ui.BORDER)
+            setPadding(dip(18), dip(14), dip(18), dip(16))
         }
-        root.addView(statusLine)
-
-        // 表单：SSID / 密码 / 信道 / 加密 / 蓝牙地址
-        ssidInput = EditText(this).apply {
-            hint = "车机热点 SSID"
-            setSingleLine()
+        val errorColumn = column()
+        errorColumn.addView(label("连接失败", 14, Ui.WARNING, true))
+        errorTextView = label("", 13, Ui.TEXT).apply {
+            maxWidth = dip(264)
+            maxLines = 3
+            ellipsize = TextUtils.TruncateAt.END
+            setLineSpacing(dip(2).toFloat(), 1f)
         }
-        root.addView(fieldRow("热点 SSID", ssidInput))
-
-        // M6k3：热点开关直达 —— 车机热点开关常埋在设置深处，给测试一个一键入口。
-        root.addView(
-            Button(this).apply {
-                text = "打开系统热点设置"
-                setOnClickListener { openHotspotSettings() }
+        errorColumn.addView(
+            errorTextView,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dip(6) },
+        )
+        errorColumn.addView(
+            button("结束", false, height = 40) {
+                errorCardView.visibility = View.GONE
+                disconnect()
             },
+            matchButton(top = 12, height = 40),
+        )
+        errorCardView.addView(errorColumn, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+        errorCard = errorCardView
+        errorCardView.setOnClickListener { errorCardView.visibility = View.GONE }
+        errorCardView.visibility = View.GONE
+        // errorCard 仅在 home 页展示（与原版一致：子 Activity 时代卡片只存在于 MainActivity）。
+        if (page == "home") {
+            root.addView(
+                errorCardView,
+                FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER).apply {
+                    leftMargin = dip(24); rightMargin = dip(24)
+                },
+            )
+        }
+        setContentView(root)
+        setPanelVisible(panelVisible)
+        // M6k24k 方向诊断：每个 page 构建完成后记录一次（tag=当前 page）。
+        logOrientation(this, page)
+        renderState()
+    }
+
+    // ---------- home 页 ----------
+
+    /**
+     * home 面板（M6k21）：竖屏 = hero → 状态大卡 → USB 直连（按钮+说明）；
+     * 横屏 = hero+状态卡（左）｜USB 直连+设置（右）。
+     */
+    private fun homePanel(): View {
+        // M6k24：布局方向完全跟随设置（强制横屏/强制竖屏），不再读 Display。
+        val wide = isLandscapeUi()
+        val config = LiteConfig.load(this)
+        shownActiveChannel = config.activeChannel
+
+        val content = column().apply { setPadding(dip(16), dip(10), dip(16), dip(20)) }
+        content.addView(buildHeader())
+        content.addView(space(12))
+
+        // hero 区（原版式）：ACCENT 眉题 + 大标题 + MUTED 副题。
+        val hero = column()
+        hero.addView(label("你的车机 · 你的 CARPLAY。", 12, Ui.ACCENT, true).apply { applyLetterSpacing(0.16f) })
+        hero.addView(
+            label("熟悉的驾驶体验。", if (wide) 30 else 24, Ui.TEXT, true).apply { setPadding(0, dip(10), 0, dip(8)) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+        )
+        hero.addView(
+            label("无线 CarPlay 与 USB 直连，随时就绪。", 14, Ui.MUTED),
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
         )
 
-        passwordInput = EditText(this).apply {
-            hint = "热点密码"
-            setSingleLine()
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        }
-        root.addView(fieldRow("密码", passwordInput))
+        val statusCard = buildStatusCard(config)
 
-        channelInput = EditText(this).apply {
-            hint = "留空自动实测（B3），失败请手填"
-            setSingleLine()
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        root.addView(fieldRow("信道（1-165，2.4G/5G）", channelInput))
+        if (wide) {
+            // 右列（原版式）：USB 直连 + 设置入口。
+            val right = column().apply { gravity = Gravity.CENTER_HORIZONTAL }
+            right.addView(button("USB 直连", false) { connect("usb") })
+            right.addView(
+                label("将 iPhone 插入车机 USB 数据接口，\n当 iPhone 提示时允许 CarPlay。", 12, Ui.MUTED).apply {
+                    gravity = Gravity.CENTER
+                    setPadding(dip(8), dip(10), dip(8), dip(12))
+                },
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+            )
+            // M6k24：右列同样提供 3 个系统设置快捷入口 + 设置键。
+            right.addView(quickSettingsRow(), LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            right.addView(button("设置", false) { setPage("settings") })
 
-        securityInput = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_item,
-                listOf("WPA2", "WPA2-WPA3", "WPA3", "OPEN"),
-            ).also {
-                it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-            }
+            val topRow = row().apply { gravity = Gravity.TOP }
+            topRow.addView(
+                column().apply {
+                    addView(hero)
+                    addView(space(14))
+                    addView(statusCard)
+                },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.6f),
+            )
+            topRow.addView(space(16), LinearLayout.LayoutParams(dip(16), 1))
+            topRow.addView(right, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            content.addView(topRow)
+        } else {
+            content.addView(hero)
+            content.addView(space(12))
+            content.addView(statusCard)
+            // 竖屏：USB 直连键独立成行（原版右列键位）。
+            content.addView(
+                button("USB 直连", false) { connect("usb") },
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dip(50)).apply { topMargin = dip(12) },
+            )
+            content.addView(
+                label("将 iPhone 插入车机 USB 数据接口，当 iPhone 提示时允许 CarPlay。", 12, Ui.MUTED).apply {
+                    setPadding(dip(4), dip(8), dip(4), 0)
+                },
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+            )
+            // M6k23：竖屏最底部加「设置」入口（USB 直连同款样式按钮；齿轮已从头部删除）。
+            // M6k24：设置键上方加 3 个系统设置快捷入口。
+            content.addView(
+                quickSettingsRow(),
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dip(12) },
+            )
+            content.addView(
+                button("设置", false) { setPage("settings") },
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dip(50)).apply { topMargin = dip(8) },
+            )
         }
-        root.addView(fieldRow("加密方式", securityInput))
-
-        // M6k4：蓝牙地址由手输改为点选 —— 弹已配对设备列表（名字+地址对照，同名多台不混淆）；
-        // 长按按钮 = 清除恢复自动。
-        bluetoothPickButton = Button(this).apply {
-            text = bluetoothButtonText()
-            setOnClickListener { showBluetoothDeviceDialog() }
-            setOnLongClickListener {
-                applyBluetoothPick("", "")
-                toast("已清除蓝牙选择，恢复自动")
-                true
-            }
-        }
-        root.addView(fieldRow("iPhone 蓝牙设备（可选）", bluetoothPickButton))
-
-        // M6b 性能项：C8815 硬解 960x540 撑不到 60fps，这里允许把 /info 的 maxFPS 降到 30。
-        fps30Check = CheckBox(this).apply {
-            text = "限制视频帧率 30fps（省 CPU，动态画面略顿）"
-            setTextColor(Color.LTGRAY)
-            textSize = 13f
-        }
-        root.addView(fps30Check)
-
-        // M6b 性能项：按百分比缩小 /info 声明的分辨率（长宽等比，各自取偶）。
-        // 像素少 33~44% 是弱机最直接的省算力手段；渲染仍铺满物理屏，故画面无黑边。
-        scaleInput = EditText(this).apply {
-            hint = "10-100，100 = 原生分辨率"
-            setSingleLine()
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        root.addView(fieldRow("分辨率百分比（10-100）", scaleInput))
-
-        // M6c：CarPlay 通话声音路由。默认听筒（本机 telephony 流走 STREAM_VOICE_CALL）；
-        // 勾上则通话期间切扬声器（MODE_IN_COMMUNICATION + setSpeakerphoneOn）。开关即时生效，无需重连。
-        speakerCallsCheck = CheckBox(this).apply {
-            text = "通话声音走扬声器（默认听筒）"
-            setTextColor(Color.LTGRAY)
-            textSize = 13f
-            // 即时持久化：服务侧每次通话流开始时现读 LiteConfig，所以勾完直接打电话即可生效，无需重新连接。
-            setOnCheckedChangeListener { _, _ -> saveFromForm() }
-        }
-        root.addView(speakerCallsCheck)
-
-        // M6d：导航播报时把音乐压低（type=101 与音乐同走 STREAM_MUSIC，只能我们自己做 duck）。
-        duckInput = EditText(this).apply {
-            hint = "30-70，导航播报时音乐的音量百分比"
-            setSingleLine()
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        root.addView(fieldRow("导航压低音乐到（30-70%）", duckInput))
-
-        // M6e：强制软件解码视频。默认关（现状=厂商硬解）；给硬解异常的机型兜底，也用于二分定位。
-        // 注意：8815（Cortex-A5、无 NEON）上软解会比硬解慢很多，帧率可能掉到个位数。
-        softDecodeCheck = CheckBox(this).apply {
-            text = "强制软件解码视频（默认关；弱机可能掉帧）"
-            setTextColor(Color.LTGRAY)
-            textSize = 13f
-        }
-        root.addView(softDecodeCheck)
-
-        // 操作行：连接 / 断开
-        val actions = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dip(12), 0, dip(12))
-        }
-        connectButton = Button(this).apply {
-            text = "连接"
-            setOnClickListener { connect() }
-        }
-        disconnectButton = Button(this).apply {
-            text = "断开"
-            setOnClickListener { disconnect() }
-        }
-        actions.addView(connectButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        actions.addView(disconnectButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        root.addView(actions)
-
-        // 导出日志：把当前日志复制到同目录下的新文件（带时间戳），避免同名文件"看不到更新"。
-        val exportButton = Button(this).apply {
-            text = "导出日志"
-            setOnClickListener { exportLog() }
-        }
-        root.addView(exportButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-
-        // 日志区（长按清空）
-        logView = TextView(this).apply {
-            typeface = android.graphics.Typeface.MONOSPACE
-            textSize = 12f
-            setTextColor(Color.rgb(170, 200, 170))
-            setBackgroundColor(Color.rgb(10, 12, 18))
-            setPadding(dip(8), dip(8), dip(8), dip(8))
-            minHeight = dip(180)
-            text = ""
-            setOnLongClickListener {
-                LiteLog.clear()
-                true
-            }
-        }
-        root.addView(logView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-
-        return outer
-    }
-
-    private fun fieldRow(label: String, input: View): View {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, dip(6), 0, dip(6))
-            addView(TextView(this@MainActivity).apply {
-                text = label
-                setTextColor(Color.LTGRAY)
-                textSize = 13f
-                setPadding(0, 0, 0, dip(4))
-            })
-            addView(input, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        return ScrollView(this).apply {
+            // 面板底色不透明 —— 悬浮球唤回菜单后不再透出 CarPlay 画面（8815 实测反馈）。
+            setBackgroundColor(Ui.BG)
+            isFillViewport = true
+            addView(content, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
         }
     }
 
-    private fun dip(value: Int): Int = (value * resources.displayMetrics.density + 0.5f).toInt()
-
-    /** 配置/日志面板的显隐：收起后整屏都是 CarPlay 画面与触摸区。 */
-    private fun setPanelVisible(visible: Boolean) {
-        panelVisible = visible
-        panel.visibility = if (visible) View.VISIBLE else View.GONE
-        panelToggle.text = if (visible) "隐藏" else "面板"
+    /** 头部：DiPlay Lite + 版本。M6k23：右上角齿轮删除（设置入口走竖屏底部/横屏右列按钮）。 */
+    private fun buildHeader(): View {
+        val left = column()
+        left.addView(label("DiPlay Lite", 18, Ui.TEXT, true))
+        left.addView(
+            label("LITE · ${readVersionName()}", 10, Ui.MUTED).apply { setPadding(0, dip(2), 0, 0); applyLetterSpacing(0.08f) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+        )
+        return left
     }
 
     /**
-     * M6k：让悬浮球可拖拽。按下记位、移动改 FrameLayout 的 right/top margin、抬起若几乎没移动
-     * 则当作点击（performClick → 切换面板显隐）。用 TOP|END 定位，所以向右拖 = rightMargin 减小。
-     * 拖动范围钳在父容器内，球不会被拖出屏幕。
+     * 「CARPLAY 状态」大状态卡（原版「无线 CARPLAY」式）：
+     * ACCENT 眉题 + 实时状态点 + 状态大字 + 主按钮（按默认通道连接/断开）+ 默认通道提示。
+     */
+    private fun buildStatusCard(config: LiteConfig): View {
+        val card = card()
+        val eyebrowRow = row().apply { gravity = Gravity.CENTER_VERTICAL }
+        eyebrowRow.addView(
+            label("CARPLAY 状态", 12, Ui.ACCENT, true).apply { applyLetterSpacing(0.12f) },
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        statusDot = View(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.GRAY)
+            }
+        }
+        eyebrowRow.addView(statusDot, LinearLayout.LayoutParams(dip(10), dip(10)))
+        card.addView(eyebrowRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        statusLine = label(LiteState.statusText, 20, Ui.TEXT, true).apply {
+            setPadding(0, dip(10), 0, dip(12))
+            maxLines = 3
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        card.addView(statusLine, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        // M6k24：三键纵排（对齐原版交互）—— 立即连接（常驻，连接中置灰）
+        // → 选择 iPhone（常驻，弹热点配置页同款蓝牙选择对话框）→ 断开连接（仅连接中出现）。
+        primaryActionButton = button("立即连接", primary = true, height = 50) {
+            connect(LiteConfig.load(this@MainActivity).activeChannel)
+        }
+        card.addView(primaryActionButton, matchButton())
+
+        pickIphoneButton = button("选择 iPhone", primary = false, height = 46) {
+            SystemSettingsJumps.showIphonePickerDialog(this@MainActivity) { address, name ->
+                LiteConfig.saveBluetoothPick(this@MainActivity, address, name)
+                toast(
+                    if (address.isBlank()) "已清除选择：连接时自动匹配已配对 iPhone"
+                    else "已选择 $name $address",
+                )
+                LiteLog.log("ui", "主页选择 iPhone：address=$address name=$name")
+            }
+        }
+        card.addView(pickIphoneButton, matchButton(top = 8, height = 46))
+
+        disconnectButton = button("断开连接", primary = false, height = 46) { disconnect() }
+        disconnectButton.visibility = View.GONE
+        card.addView(disconnectButton, matchButton(top = 8, height = 46))
+
+        hintLabel = label(defaultChannelHint(config.activeChannel), 12, Ui.MUTED).apply { setPadding(0, dip(12), 0, 0) }
+        card.addView(
+            hintLabel,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+        )
+        return card
+    }
+
+    private fun defaultChannelHint(channel: String): String = when (channel) {
+        "relay" -> "默认通道：中继热点。车机与手机同连随身WIFI后自动建立 CarPlay。"
+        "usb" -> "默认通道：USB 连接。数据线直连，当 iPhone 提示时允许 CarPlay。"
+        else -> "默认通道：车机热点。手机连上车机热点后自动建立 CarPlay。"
+    }
+
+    /**
+     * M6k24：主页快捷入口行（WiFi / 蓝牙 / 热点），放在设置键上方，一行三列等宽。
+     * 跳转逻辑与热点配置页共用 SystemSettingsJumps（三级降级）。
+     */
+    private fun quickSettingsRow(): View {
+        val rowView = row()
+        val entries = listOf(
+            "WiFi" to { SystemSettingsJumps.openWifiSettings(this) },
+            "蓝牙" to { SystemSettingsJumps.openBluetoothSettings(this) },
+            "热点" to { SystemSettingsJumps.openHotspotSettings(this) },
+        )
+        entries.forEachIndexed { index, (title, onClick) ->
+            val entry = button(title, primary = false, height = 44, click = onClick)
+            entry.layoutParams = LinearLayout.LayoutParams(0, dip(44), 1f).apply {
+                if (index > 0) leftMargin = dip(8)
+            }
+            rowView.addView(entry)
+        }
+        return rowView
+    }
+
+    // ---------- 视图状态 ----------
+
+    /** 配置面板的显隐：收起后整屏都是 CarPlay 画面与触摸区（home 页专属机制）。 */
+    private fun setPanelVisible(visible: Boolean) {
+        panelVisible = visible
+        // M6k25：子页没有面板显隐机制 —— 只记录状态，回主页 render 时按状态生效。
+        // （避免 refreshTask 的 setPanelVisible(!active) 把正在看的子页整个隐藏。）
+        if (page != "home") return
+        panel.visibility = if (visible) View.VISIBLE else View.GONE
+        // 面板展开时悬浮球淡化（避免和标题栏抢视觉），收起时恢复醒目。
+        ballRoot.alpha = if (visible) 0.5f else 1f
+    }
+
+    /**
+     * 悬浮球可拖拽。按下记位、移动改 right/top margin、抬起几乎未动则视为点击。
+     * TOP|END 定位：向右拖 = rightMargin 减小；范围钳在父容器内；松手吸边。
      */
     private fun attachBallDrag(ball: View, params: FrameLayout.LayoutParams) {
         val slop = dip(6)
@@ -412,7 +758,22 @@ class MainActivity : Activity() {
                     true
                 }
                 MotionEvent.ACTION_UP -> {
-                    if (!dragging) view.performClick()
+                    if (dragging) {
+                        // 松手吸边 —— 球心在左半屏贴左、右半屏贴右，纵向保持松手位置。
+                        val parent = view.parent as? View
+                        val parentWidth = parent?.width ?: 0
+                        if (parentWidth > 0) {
+                            val centerX = parentWidth - params.rightMargin - view.width / 2
+                            params.rightMargin = if (centerX > parentWidth / 2) {
+                                dip(12)
+                            } else {
+                                (parentWidth - view.width - dip(12)).coerceAtLeast(0)
+                            }
+                            view.layoutParams = params
+                        }
+                    } else {
+                        view.performClick()
+                    }
                     true
                 }
                 MotionEvent.ACTION_CANCEL -> true
@@ -422,97 +783,146 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 触摸转发：把屏幕坐标归一化成 0..1 的 [AirPlayContact]，交给当前会话发 HID 报告。
-     * 未连接时返回 false（不消费事件）；尺寸未布局完时用屏幕尺寸兜底。
+     * 触摸转发：屏幕坐标归一化成 0..1 的接触点，交给当前会话发 HID 报告。
+     * 未连接时返回 false（不消费事件）。
      */
+    private var lastMoveForwardMs = 0L
+
     private fun forwardTouch(event: MotionEvent): Boolean {
         val service = LiteSessionService.current ?: return false
         val width = video.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
         val height = video.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
         if (width <= 0 || height <= 0) return false
-        // M6k：只有 ACTION_MOVE 是可合并的中间态；DOWN/UP/POINTER_*/CANCEL 都必须逐条送达。
+        // 只有 ACTION_MOVE 是可合并的中间态；DOWN/UP/POINTER_*/CANCEL 都必须逐条送达。
         val sticky = event.actionMasked != MotionEvent.ACTION_MOVE
+        // 1.0.7：MOVE 按 30fps 节流——手指按屏抖动会以 60Hz 洪灌 HID 通道
+        // （3e 实测 15 秒 310 条 POST），DOWN/UP 不受影响。
+        if (!sticky) {
+            val now = System.currentTimeMillis()
+            if (now - lastMoveForwardMs < 33) return true
+            lastMoveForwardMs = now
+        }
         return service.sendTouch(CarPlayTouchMapper.contacts(event, width, height), sticky)
     }
 
-    // ---------- 表单读写 ----------
+    // ---------- 连接动作 ----------
 
-    private fun loadIntoForm() {
+    /** 按通道发起连接。中继/USB 底层未接入前给出明确提示（避免误认为故障）。 */
+    private fun connect(channel: String) {
         val config = LiteConfig.load(this)
-        ssidInput.setText(config.ssid)
-        passwordInput.setText(config.password)
-        channelInput.setText(if (config.channel > 0) config.channel.toString() else "")
-        val securities = listOf("WPA2", "WPA2-WPA3", "WPA3", "OPEN")
-        securityInput.setSelection(securities.indexOf(config.security).coerceAtLeast(0))
-        bluetoothAddress = config.bluetoothAddress
-        bluetoothName = LiteConfig.bluetoothDeviceName(this)
-        bluetoothPickButton.text = bluetoothButtonText()
-        fps30Check.isChecked = config.limit30Fps
-        scaleInput.setText(config.videoScalePercent.toString())
-        speakerCallsCheck.isChecked = config.speakerForCalls
-        duckInput.setText(config.navDuckPercent.toString())
-        softDecodeCheck.isChecked = config.softwareVideoDecoder
+        when (channel) {
+            "car" -> {
+                if (config.ssid.isBlank()) {
+                    toast("请先在「设置 → 车机热点网络配置」里填写热点名称")
+                    return
+                }
+                val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps)
+                // M6d：实测改分辨率后不重启+重连会出现渲染异常，这里拦一道二次确认。
+                if (config.appliedVideoKey.isNotEmpty() && config.appliedVideoKey != key) {
+                    confirmVideoChange()
+                    return
+                }
+                startSession(config, key)
+            }
+            "relay" -> {
+                if (config.relaySsid.isBlank()) {
+                    toast("请先在「设置 → 中继热点网络配置」里填写随身WIFI信息")
+                    return
+                }
+                val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps)
+                // M6d：实测改分辨率后不重启+重连会出现渲染异常，这里拦一道二次确认。
+                if (config.appliedVideoKey.isNotEmpty() && config.appliedVideoKey != key) {
+                    confirmVideoChange()
+                    return
+                }
+                startSession(config, key, "relay")
+            }
+            "usb" -> {
+                // U4 USB 有线：数据面 TUN 需要 VPN 授权（一次性系统对话框）；
+                // 已授权（prepare 返回 null）则直接进入连接流程。
+                val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps)
+                if (config.appliedVideoKey.isNotEmpty() && config.appliedVideoKey != key) {
+                    confirmVideoChange()
+                    return
+                }
+                if (!hasAppleUsbDevice()) {
+                    toast("未检测到 iPhone：请用数据线把 iPhone 连到车机 USB 口")
+                    LiteLog.log("ui", "USB 通道连接请求：未发现 Apple VID(0x05ac) USB 设备")
+                    return
+                }
+                val consent = try {
+                    VpnService.prepare(this)
+                } catch (error: Exception) {
+                    LiteLog.log("ui", "USB 通道：VpnService.prepare 失败 ${error.message}")
+                    null
+                }
+                if (consent != null) {
+                    startActivityForResult(consent, REQUEST_VPN_PERMISSION)
+                    LiteLog.log("ui", "USB 通道：请求 VPN 授权")
+                    return
+                }
+                startSession(config, key, "usb")
+            }
+            else -> {
+                toast("未知连接通道")
+                LiteLog.log("ui", "未知通道连接请求：$channel")
+            }
+        }
     }
 
-    private fun saveFromForm(): LiteConfig {
-        val channelText = channelInput.text.toString().trim()
-        // 百分比非法（空/非数字/越界）一律钳到 10~100，避免把 0 或 999 写进 /info。
-        val scale = scaleInput.text.toString().trim().toIntOrNull()
-            ?.coerceIn(LiteConfig.MIN_SCALE_PERCENT, LiteConfig.MAX_SCALE_PERCENT)
-            ?: LiteConfig.MAX_SCALE_PERCENT
-        // 压低值同样钳到 30~70，避免把 0（静音）或 100（等于没压）写进去。
-        val duck = duckInput.text.toString().trim().toIntOrNull()
-            ?.coerceIn(LiteConfig.MIN_DUCK_PERCENT, LiteConfig.MAX_DUCK_PERCENT)
-            ?: 50
-        val config = LiteConfig(
-            ssid = ssidInput.text.toString().trim(),
-            password = passwordInput.text.toString(),
-            channel = channelText.toIntOrNull() ?: 0,
-            security = securityInput.selectedItem as? String ?: "WPA2",
-            bluetoothAddress = this@MainActivity.bluetoothAddress,
-            limit30Fps = fps30Check.isChecked,
-            videoScalePercent = scale,
-            speakerForCalls = speakerCallsCheck.isChecked,
-            navDuckPercent = duck,
-            softwareVideoDecoder = softDecodeCheck.isChecked,
-        )
-        LiteConfig.save(this, config)
-        return config
-    }
+    /** 枚举 USB 设备看是否有 Apple VID（iPhone/iPad），无需任何权限。 */
+    private fun hasAppleUsbDevice(): Boolean =
+        (getSystemService(USB_SERVICE) as? UsbManager)?.deviceList?.values?.any {
+            it.vendorId == APPLE_USB_VENDOR_ID
+        } == true
 
-    // ---------- 动作 ----------
-
-    private fun connect() {
-        if (ssidInput.text.toString().trim().isEmpty()) {
-            toast("请先填写车机热点 SSID")
+    /** VpnService 授权 / CarIconPage 图库选择的系统回调。 */
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        // M6k25：图库选择结果转发给 CarIconPage（requestCode=1001）。
+        if (requestCode == REQUEST_GALLERY_PICK) {
+            carIconPage?.onGalleryResult(resultCode, data)
             return
         }
-        val config = saveFromForm()
-        val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps)
-        // M6d：实测改分辨率后不重启+重连会出现渲染异常，所以这里拦一道二次确认。
-        if (config.appliedVideoKey.isNotEmpty() && config.appliedVideoKey != key) {
-            confirmVideoChange(key)
-            return
+        if (requestCode != REQUEST_VPN_PERMISSION) return
+        if (resultCode == RESULT_OK) {
+            startSession(LiteConfig.load(this), LiteConfig.videoKeyOf(LiteConfig.load(this).videoScalePercent, LiteConfig.load(this).limit30Fps), "usb")
+        } else {
+            toast("未授予 VPN 权限，USB 连接无法建立")
+            LiteLog.log("ui", "USB 通道：VPN 授权被拒绝")
         }
-        startSession(config, key)
     }
 
-    private fun startSession(config: LiteConfig, videoKey: String) {
+    private fun startSession(config: LiteConfig, videoKey: String, channel: String = "car") {
         LiteConfig.saveAppliedVideoKey(this, videoKey)
-        LiteLog.log(
-            "ui",
-            "发起连接：ssid=${config.ssid} channel=${config.channel} security=${config.security} " +
-                "videoKey=$videoKey duck=${config.navDuckPercent}%",
+        // 记录本轮会话通道：每卡绿点按它判定"哪张卡在连/已连"（UI 层自有键，不动 LiteConfig）。
+        getSharedPreferences(SESSION_PREFS, MODE_PRIVATE)
+            .edit()
+            .putString(SESSION_CHANNEL_KEY, channel)
+            .apply()
+        if (channel == "relay") {
+            LiteLog.log(
+                "ui",
+                "发起连接（relay）：ssid=${config.relaySsid} videoKey=$videoKey duck=${config.navDuckPercent}%",
+            )
+        } else {
+            LiteLog.log(
+                "ui",
+                "发起连接（car）：ssid=${config.ssid} channel=${config.carIpv4Channel} security=${config.security} " +
+                    "videoKey=$videoKey duck=${config.navDuckPercent}%",
+            )
+        }
+        startService(
+            Intent(this, LiteSessionService::class.java).putExtra(LiteSessionService.EXTRA_CHANNEL, channel),
         )
-        startService(Intent(this, LiteSessionService::class.java))
         toast("已启动会话服务")
     }
 
     /**
-     * M6d：分辨率/帧率变更的二次确认。确认后立刻断开当前连接并重启软件 ——
-     * 用户实测：改了视频参数不重启会渲染异常（解码器尺寸与 Surface 对不上）。
+     * M6d：分辨率/帧率变更的二次确认。确认后立刻停止会话并重建界面 ——
+     * 改了视频参数不重启会渲染异常（解码器尺寸与 Surface 对不上）。
      */
-    private fun confirmVideoChange(videoKey: String) {
+    private fun confirmVideoChange() {
         AlertDialog.Builder(this)
             .setTitle("已修改分辨率/帧率")
             .setMessage(
@@ -521,24 +931,34 @@ class MainActivity : Activity() {
             )
             .setNegativeButton("取消", null)
             .setPositiveButton("断开并重启") { _, _ ->
-                LiteConfig.saveAppliedVideoKey(this, videoKey)
-                disconnect()
-                restartApp()
+                restartAppForVideoChange()
             }
             .show()
     }
 
-    /** 4.1 上最稳的自重启：先用 AlarmManager 预约拉起自己，再杀掉当前进程。 */
-    private fun restartApp() {
+    /**
+     * 视频参数（分辨率/帧率/横竖屏）修改后的统一生效路径。
+     *
+     * 原「AlarmManager 预约拉起 + killProcess」在 EMUI9 实测不可靠：set() 是批量闹钟，
+     * 进程死后自启动又受启动管理限制 —— 应用被杀后不再回来（"没有自动重启"）；残留现场里
+     * stopService 的异步拆栈未等待，此时点连接会卡在连接中（残留 7000 监听，见
+     * LiteSessionService 的 EADDRINUSE 记录）。
+     *
+     * M6k25 单 Activity 化后改为进程内重建：appliedVideoKey 落成新值（重启后点主页连接
+     * 直接按新参数发起，不再二次弹确认）→ 停会话服务（拆栈由 closingController await 收口）
+     * → finish + startActivity 重建 MainActivity（全新 SurfaceView 与页面状态），不杀进程、
+     * 不依赖闹钟，行为等价于进程冷启动的"重启软件"。
+     */
+    internal fun restartAppForVideoChange() {
+        val config = LiteConfig.load(this)
+        LiteConfig.saveAppliedVideoKey(this, LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps))
+        stopService(Intent(this, LiteSessionService::class.java))
         val intent = Intent(this, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         }
-        val pending = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_CANCEL_CURRENT)
-        (getSystemService(ALARM_SERVICE) as? AlarmManager)
-            ?.set(AlarmManager.RTC, System.currentTimeMillis() + 400, pending)
-        LiteLog.log("ui", "视频参数已改：断开连接并重启软件")
+        LiteLog.log("ui", "视频参数已改：停止会话并重建界面以应用")
+        startActivity(intent)
         finish()
-        android.os.Process.killProcess(android.os.Process.myPid())
     }
 
     private fun disconnect() {
@@ -546,142 +966,140 @@ class MainActivity : Activity() {
         LiteLog.log("ui", "用户断开")
     }
 
-    /** 导出当前日志到同目录下的新文件（带时间戳）；避免 MTP/文件管理器对同名文件的缓存。 */
-    private fun exportLog() {
-        if (LiteLog.directory() == null) {
-            toast("导出失败：日志未挂载")
+    // ---------- 自动连接 ----------
+
+    /**
+     * 勾了"启动后自动连接"时回到前台自动以默认通道发起。
+     * car/relay/usb 均可自动连接；视频参数被改过则跳过（避免开机弹确认框）。
+     */
+    private fun maybeAutoConnect() {
+        if (autoConnectTried) return
+        // 1.0.16（方案四②）：自启等待期间不发起，等勾选项就绪且稳定后由 autostartPoll 触发。
+        if (autostartWaitActive) return
+        if (LiteState.phase != LiteState.Phase.IDLE) return
+        if (LiteSessionService.current != null) return
+        val config = LiteConfig.load(this)
+        if (!config.autoConnect) return
+        val channel = config.activeChannel
+        if (channel != "car" && channel != "relay" && channel != "usb") return
+        val ssidBlank = when (channel) {
+            "car" -> config.ssid.isBlank()
+            "relay" -> config.relaySsid.isBlank()
+            else -> false // USB 有线不依赖热点凭据
+        }
+        if (ssidBlank) return
+        autoConnectTried = true
+        val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps)
+        if (config.appliedVideoKey.isNotEmpty() && config.appliedVideoKey != key) {
+            LiteLog.log("ui", "自动连接跳过：视频参数已改，请手动连接并确认重启")
             return
         }
-        val exported = LiteLog.exportSnapshot()
-        if (exported == null) {
-            toast("导出失败：日志为空")
+        LiteLog.log("ui", "自动连接：按默认通道（$channel）自动发起")
+        connect(channel)
+    }
+
+    // ---------- 1.0.16（方案四②）开机自启等待弹窗 ----------
+
+    /**
+     * 上电拉起主页后显示「等待勾选的蓝牙或WIFI热点启动」弹窗：
+     * - 弹窗带「断开」键，点击即结束自动流程（已开的蓝牙/热点保留不关）；
+     * - 勾选项一直不开启则一直等待，直到 60s 超时显示失败提示（不再自动连接）；
+     * - 勾选项全部就绪后需连续稳定 10s（滤波，防 ROM 状态抖动）才发起自动连接。
+     * 仅当勾了蓝牙/热点自启且开了自动连接时才弹；否则走原自动连接（onResume 即发）。
+     */
+    private fun beginAutostartWait() {
+        val config = LiteConfig.load(this)
+        val hasWaitItems = config.bootAutoBluetooth || config.bootAutoHotspot
+        if (!config.autoConnect || !hasWaitItems || autostartWaitActive) {
+            LiteLog.log(
+                "ui",
+                "自启等待跳过：autoConnect=${config.autoConnect} bt=${config.bootAutoBluetooth} " +
+                    "ap=${config.bootAutoHotspot}",
+            )
             return
         }
-        LiteLog.log("ui", "日志已导出：${exported.name}")
-        toast("已导出：${exported.name}")
-    }
-
-    // ---------- M6k3：蓝牙设备点选 ----------
-
-    private fun bluetoothButtonText(): String = when {
-        bluetoothAddress.isBlank() -> "选择蓝牙设备（未选 = 自动）"
-        bluetoothName.isNotBlank() -> "已选：$bluetoothName（$bluetoothAddress）"
-        else -> "已选：$bluetoothAddress"
-    }
-
-    private fun applyBluetoothPick(address: String, name: String) {
-        bluetoothAddress = address
-        bluetoothName = name
-        bluetoothPickButton.text = bluetoothButtonText()
-        LiteConfig.saveBluetoothPick(this, address, name)
-    }
-
-    /** M6k4：已配对设备列表（名字+MAC 对照，同名机靠 MAC 区分）+ 手动输入 + 清除。 */
-    private fun showBluetoothDeviceDialog() {
-        val adapter: BluetoothAdapter? = try {
-            BluetoothAdapter.getDefaultAdapter()
-        } catch (_: Throwable) {
-            null
-        }
-        if (adapter == null) {
-            toast("本机没有蓝牙适配器，请长按按钮手动输入地址")
-            return
-        }
-        val devices = adapter.bondedDevices.orEmpty()
-            .sortedWith(compareBy({ it.name?.lowercase() ?: "" }, { it.address }))
-        if (devices.isEmpty()) {
-            LiteLog.log("ui", "蓝牙选择：无已配对设备")
-            toast("没有已配对的蓝牙设备，请先在车机系统设置里与 iPhone 配对")
-        }
-        val labels = ArrayList<String>(devices.size + 2)
-        devices.forEach { labels.add("${it.name ?: "未知设备"}\n${it.address}") }
-        labels.add("手动输入地址…")
-        labels.add("清除选择（恢复自动）")
-        AlertDialog.Builder(this)
-            .setTitle("选择 iPhone 蓝牙设备")
-            .setItems(labels.toTypedArray()) { _, which ->
-                when {
-                    which < devices.size -> {
-                        val device = devices[which]
-                        applyBluetoothPick(device.address, device.name ?: "")
-                    }
-                    which == devices.size -> promptManualBluetoothAddress()
-                    else -> applyBluetoothPick("", "")
-                }
+        autostartWaitActive = true
+        autostartStableSecs = 0
+        autostartDeadline = System.currentTimeMillis() + AUTOSTART_WAIT_TIMEOUT_MILLIS
+        autostartDialog = AlertDialog.Builder(this)
+            .setTitle("开机自启动")
+            .setMessage("等待勾选的蓝牙或WIFI热点启动…")
+            .setCancelable(false)
+            .setNegativeButton("断开") { d, _ ->
+                LiteLog.log("ui", "自启等待：用户点击断开，结束自动流程")
+                autostartWaitActive = false
+                handler.removeCallbacks(autostartPoll)
+                d.dismiss()
             }
-            .show()
-    }
-
-    private fun promptManualBluetoothAddress() {
-        val input = EditText(this).apply {
-            setSingleLine()
-            hint = "AA:BB:CC:DD:EE:FF"
-            setText(bluetoothAddress)
-        }
-        AlertDialog.Builder(this)
-            .setTitle("手动输入蓝牙地址")
-            .setView(input)
-            .setNegativeButton("取消", null)
-            .setPositiveButton("确定") { _, _ ->
-                applyBluetoothPick(input.text.toString().trim().uppercase(), "")
-            }
-            .show()
-    }
-
-    // ---------- M6k3：系统热点设置直达 ----------
-
-    /** 三级降级：TetherSettings 组件（AOSP 通用）→ 隐藏 TETHER_SETTINGS action（部分 OEM）→ 无线设置页（公开 action 兜底）。 */
-    private fun openHotspotSettings() {
-        val attempts = listOf(
-            "热点/网络共享页" to Intent().setClassName("com.android.settings", "com.android.settings.TetherSettings"),
-            "热点/网络共享页（隐式）" to Intent("android.settings.TETHER_SETTINGS"),
-            "无线和网络设置" to Intent(Settings.ACTION_WIRELESS_SETTINGS),
+            .create()
+        autostartDialog?.show()
+        LiteLog.log(
+            "ui",
+            "自启等待：开始等待勾选项就绪（超时 ${AUTOSTART_WAIT_TIMEOUT_MILLIS / 1000}s，稳定 ${AUTOSTART_STABLE_SECS}s）",
         )
-        for ((label, intent) in attempts) {
-            try {
-                startActivity(intent)
-                LiteLog.log("ui", "热点设置：已打开$label")
-                return
-            } catch (error: Exception) {
-                LiteLog.log("ui", "热点设置：$label 不可用（${error.javaClass.simpleName}）")
-            }
-        }
-        toast("本机没有可直达的热点设置，请在系统设置里手动开启")
+        handler.postDelayed(autostartPoll, 1_000)
+    }
+
+    private fun finishAutostartWait() {
+        autostartWaitActive = false
+        handler.removeCallbacks(autostartPoll)
+        autostartDialog?.dismiss()
+        autostartDialog = null
     }
 
     // ---------- 状态渲染 ----------
 
     private fun renderState() {
-        statusDot.setTextColor(
-            when (LiteState.phase) {
-                LiteState.Phase.ACTIVE -> Color.rgb(80, 220, 100)
-                LiteState.Phase.CONNECTING -> Color.rgb(240, 200, 60)
-                LiteState.Phase.FAILED -> Color.rgb(240, 80, 80)
+        val phase = LiteState.phase
+        val running = LiteState.running
+        // 大状态卡状态点：总览实时状态。
+        (statusDot.background as? GradientDrawable)?.setColor(
+            when (phase) {
+                LiteState.Phase.ACTIVE -> Ui.GREEN
+                LiteState.Phase.CONNECTING -> DOT_CONNECTING
+                LiteState.Phase.FAILED -> DOT_FAILED
                 LiteState.Phase.IDLE -> Color.GRAY
             },
         )
         statusLine.text = LiteState.statusText
-        // 连接成功即自动收起面板 —— 此时用户要看的是 CarPlay 画面，而不是配置表单。
-        // 断开后（或用户点"面板"）再自动展开，方便改配置重连。
-        val active = LiteState.phase == LiteState.Phase.ACTIVE
+        // 默认通道提示与设置页三选项同步（设置页改动后回到主页实时刷新）。
+        val activeChannel = LiteConfig.load(this).activeChannel
+        if (activeChannel != shownActiveChannel) {
+            shownActiveChannel = activeChannel
+            hintLabel.text = defaultChannelHint(activeChannel)
+        }
+        // M6k24：主按钮固定「立即连接」（连接中/激活置灰）；断开连接独立成键，仅连接中出现。
+        primaryActionButton.isEnabled = !running
+        primaryActionButton.alpha = if (running) 0.5f else 1f
+        disconnectButton.visibility = if (running) View.VISIBLE else View.GONE
+        // FAILED 态弹居中小卡片（标题+3行省略+重试）；其余状态收起。
+        val failed = phase == LiteState.Phase.FAILED
+        if (failed && errorCard.visibility != View.VISIBLE) {
+            errorTextView.text = LiteState.statusText
+            errorCard.visibility = View.VISIBLE
+        } else if (!failed && errorCard.visibility == View.VISIBLE) {
+            errorCard.visibility = View.GONE
+        }
+        // 连接成功即自动收起面板 —— 此时用户要看的是 CarPlay 画面；断开后再自动展开。
+        val active = phase == LiteState.Phase.ACTIVE
         if (active != lastActive) {
             lastActive = active
             setPanelVisible(!active)
         }
-        val sb = StringBuilder()
-        LiteLog.currentFile()?.let {
-            sb.append("日志文件: ").append(it.absolutePath).append("\n\n")
+    }
+
+    /** 当前会话通道（仅服务存活时有效）；errorCard 重试与每卡绿点用它定位通道。 */
+    private fun currentSessionChannel(): String? =
+        if (LiteState.running) {
+            getSharedPreferences(SESSION_PREFS, MODE_PRIVATE).getString(SESSION_CHANNEL_KEY, null)
+        } else {
+            null
         }
-        for (line in LiteLog.snapshot()) sb.append(line).append('\n')
-        // M6k5：文本没变就不 setText（省整块重排）；scrollY 在变 = 惯性滚动中，也跳过，
-        // 停止后的下一轮会补渲染 —— 滚动不再被周期性重排打断。
-        val text = sb.toString()
-        val scrolling = panel.scrollY != lastPanelScrollY
-        lastPanelScrollY = panel.scrollY
-        if (text != lastLogText && !scrolling) {
-            lastLogText = text
-            logView.text = text
-        }
+
+    internal fun readVersionName(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+    } catch (_: Exception) {
+        ""
     }
 
     private fun toast(message: String) {
@@ -689,6 +1107,23 @@ class MainActivity : Activity() {
     }
 
     companion object {
-        private val BG = Color.rgb(16, 20, 28)
+        // UI 层自有 prefs：只记"本轮会话通道"，不触碰 LiteConfig 逻辑字段。
+        private const val SESSION_PREFS = "diplay_lite_ui"
+        private const val SESSION_CHANNEL_KEY = "session_channel"
+        // U4 USB 有线：VpnService 授权回调码 + Apple USB 厂商 ID（与 IphoneUsbMatcher 一致）。
+        private const val REQUEST_VPN_PERMISSION = 7001
+        // M6k25：CarIconPage 图库选择回调码（原 CarIconActivity.REQ_PICK_IMAGE=4301）。
+        private const val REQUEST_GALLERY_PICK = 1001
+        private const val APPLE_USB_VENDOR_ID = 0x05ac
+        private val DOT_CONNECTING = Color.rgb(240, 200, 60)
+        private val DOT_FAILED = Color.rgb(240, 80, 80)
+
+        // 1.0.16（方案四②）开机自启等待弹窗参数。
+        /** BootReceiver 拉起主页时标记「开机自启等待」流程。 */
+        const val EXTRA_AUTOSTART = "autostart_wait"
+        /** 勾选项就绪后需连续保持的稳定时长（滤波）。 */
+        const val AUTOSTART_STABLE_SECS = 10
+        /** 等待勾选项就绪的总超时。 */
+        const val AUTOSTART_WAIT_TIMEOUT_MILLIS = 60_000L
     }
 }

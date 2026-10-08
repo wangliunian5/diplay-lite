@@ -17,6 +17,18 @@ object LiteVideoBridge {
     @Volatile private var sink: AndroidMediaSink? = null
     @Volatile private var surface: Surface? = null
 
+    /** 1.0.11（FE-6 拉伸）：解码器实际输出尺寸回调，MainActivity 注册用于等比适配 SurfaceView。 */
+    @Volatile private var videoSizeListener: ((Int, Int) -> Unit)? = null
+
+    fun setVideoSizeListener(listener: ((Int, Int) -> Unit)?) {
+        videoSizeListener = listener
+    }
+
+    /** Service 构造 sink 时把解码器尺寸回调转给 UI 层。 */
+    fun notifyVideoSize(width: Int, height: Int) {
+        videoSizeListener?.invoke(width, height)
+    }
+
     /** Service 创建/销毁 sink 时调用；传入已存在的 Surface 会立即接线。 */
     fun bindSink(newSink: AndroidMediaSink?) = synchronized(lock) {
         sink = newSink

@@ -11,10 +11,11 @@ android {
         applicationId = "com.shilapi.diplay.lite"
         minSdk = 16
         targetSdk = 19
-        versionCode = 1
+        versionCode = 35
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
-        // 每次出包改这里的阶段后缀，启动日志会打印它（见 LiteSessionService 构建标识行）。
-        versionName = "0.1-lite-m6k10"
+
+        // 版本迭代规则（1.0.x 起）：每次出包 patch +1（1.0.1、1.0.2…）。
+        versionName = "1.0.20"
     }
 
     compileOptions {
@@ -57,6 +58,8 @@ android {
 
     lint {
         abortOnError = false
+        // M6k24：release 构建跳过 lintVital（targetSdk=19 会触发 ExpiredTargetSdkVersion fatal）
+        checkReleaseBuilds = false
         // M1（A4）：app lint 全量扫描 shared 依赖源码，NewApi 兜底。
         // 此前未开启时 shared 里的 API 21+ 调用（如 AudioAttributes）完全不在扫描范围。
         checkDependencies = true

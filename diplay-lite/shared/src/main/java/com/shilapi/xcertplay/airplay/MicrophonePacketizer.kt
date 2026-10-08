@@ -14,6 +14,8 @@ data class MicrophoneConfig(
     val key: ByteArray,
     val codec: AudioCodecKind = AudioCodecKind.LPCM,
     val bitrate: Int? = null,
+    /** 1.0.12 验证改动：上行 socket 显式绑定会话源地址，避免多网卡时 mic 包走错接口。 */
+    val bindAddress: InetAddress? = null,
 ) {
     val samplesPerPacket: Int
         get() = if (codec == AudioCodecKind.OPUS) {
@@ -35,6 +37,8 @@ class MicrophoneCounters(
     var sequence: Int = 0,
     var timestamp: Int = 0,
     var nonce: Long = 0,
+    /** RTP SSRC。1.0.12 验证改动：RTP 规范禁止 0（0=未设置），此前恒 0 可能被 iPhone 整流丢弃。 */
+    var ssrc: Int = 0,
 )
 
 /**
@@ -48,6 +52,27 @@ object MicrophonePacketizer {
     const val TAG_LEN = 16
     const val NONCE_LEN = 8
 
+    /**
+     * 1.0.19 静态定罪：下行 LPCM 解密后必须 `byteSwapS16` 再喂 AudioTrack 才出声
+     * （AndroidMediaSink.handle），证明 wired CarPlay LPCM 线格式为**大端**，mic 方向同理。
+     * 1.0.13 的小端实验（false）与该证据矛盾，作废回滚，不再等实测。
+     */
+    const val PCM_WIRE_BIG_ENDIAN = true
+
+    /** Captured Android PCM is little-endian; CarPlay's wired microphone payload is big-endian. */
+    fun toWirePcm(pcmLittleEndian: ByteArray): ByteArray {
+        if (!PCM_WIRE_BIG_ENDIAN) return pcmLittleEndian
+        val output = pcmLittleEndian.copyOf()
+        var index = 0
+        while (index + 1 < output.size) {
+            val first = output[index]
+            output[index] = output[index + 1]
+            output[index + 1] = first
+            index += 2
+        }
+        return output
+    }
+
     fun sealPacket(
         key: ByteArray,
         payloadType: Int,
@@ -60,6 +85,7 @@ object MicrophonePacketizer {
         header[1] = (payloadType and 0x7f).toByte()
         putU16Be(header, 2, counters.sequence)
         putU32Be(header, 4, counters.timestamp)
+        putU32Be(header, 8, counters.ssrc)
 
         val nonce = ByteArray(12)
         putU64Le(nonce, 4, counters.nonce)
@@ -79,19 +105,6 @@ object MicrophonePacketizer {
         counters.timestamp += samples
         counters.nonce++
         return packet
-    }
-
-    /** Captured Android PCM is little-endian; CarPlay's wired microphone payload is big-endian. */
-    fun toWirePcm(pcmLittleEndian: ByteArray): ByteArray {
-        val output = pcmLittleEndian.copyOf()
-        var index = 0
-        while (index + 1 < output.size) {
-            val first = output[index]
-            output[index] = output[index + 1]
-            output[index + 1] = first
-            index += 2
-        }
-        return output
     }
 
     private fun putU16Be(target: ByteArray, offset: Int, value: Int) {

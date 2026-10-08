@@ -8,6 +8,7 @@ enum class WirelessHotspotBackend(val label: String) {
     WIFI_P2P("Wi-Fi P2P"),
     LOCAL_ONLY_HOTSPOT("LocalOnlyHotspot"),
     MANUAL_HOTSPOT("Manual hotspot"),
+    RELAY_CLIENT("Relay (随身WiFi)"),
 }
 
 /** The live Wi-Fi credentials and interface details for one wireless CarPlay hotspot. */
@@ -101,4 +102,34 @@ internal fun observedManualHotspotChannel(
     scanFrequencyMHz?.let(::wifiFrequencyMhzToChannel)?.let { return it }
     apFrequencyMHz?.let(::wifiFrequencyMhzToChannel)?.let { return it }
     return 0
+}
+
+/** 2.4 GHz 的三个非重叠标准信道。 */
+private val STANDARD_CHANNELS_2G = intArrayOf(1, 6, 11)
+/** 5 GHz 常用非 DFS 信道（车机热点场景足够覆盖）。 */
+private val STANDARD_CHANNELS_5G = intArrayOf(36, 44, 149, 157)
+
+/**
+ * 把观测到的信道吸附到最近的标准信道后随 0x5703 下发，iPhone 据此定向扫描、加快 join。
+ *
+ * - 2.4 GHz（1..14）→ 最近 1/6/11（如 3→1、4→6、13→11）
+ * - 5 GHz（32..177）→ 最近 36/44/149/157（如 38→36、48→44、161→157）
+ * - 信道未知（0）→ 无法猜测实际信道，原样返回 0，由调用方决定兜底值
+ */
+internal fun snapHotspotChannel(channel: Int): Int {
+    val table = when (channel) {
+        in 1..14 -> STANDARD_CHANNELS_2G
+        in 32..177 -> STANDARD_CHANNELS_5G
+        else -> return channel
+    }
+    var best = table[0]
+    var bestDistance = Math.abs(channel - best)
+    for (candidate in table) {
+        val distance = Math.abs(channel - candidate)
+        if (distance < bestDistance) {
+            best = candidate
+            bestDistance = distance
+        }
+    }
+    return best
 }

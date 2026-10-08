@@ -5,6 +5,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- M6k16 中继通道：addNetwork/enableNetwork/reconnect 需要它 -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <!-- mDNS 组播存活的关键（难点 B1） -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.BLUETOOTH" />
@@ -19,32 +21,80 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- 无 adb 实测：文件日志写 /sdcard/DiPlayLite（普通权限，4.1 安装即授予） -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <!-- M6k-UI：开机自启 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!-- U4 USB 有线：USB 主机特性声明为可选（无 USB Host 能力的设备仍可安装，无线模式不受影响） -->
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="false" />
+
+    <!-- M6k14：回归零 XML，主题用系统 DeviceDefault 深色（视觉由程序化深色背景承担） -->
     <application
         android:name=".LiteApp"
         android:label="DiPlay Lite"
         android:allowBackup="false"
-        android:hardwareAccelerated="true">
+        android:hardwareAccelerated="true"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
-        <!-- M4k：车机场景默认横屏（/info 的车机屏尺寸、视频编码尺寸、触摸坐标都随之变成 960x540 这种横向值）。
-             M4l：configChanges 补齐所有可能触发重建的配置项——本工程零 XML 资源（无布局/无字符串），
-             重建什么都不会变好，只会白销毁一次 SurfaceView 的 Surface（解码器要重配+等关键帧，画面冻 1~5s）。
-             实测 M4k 一次会话里 Activity 被重建 3 次（`M0 骨架就绪` 4 条），每次都对应一段 shown 掉到 2.8fps 的卡顿。 -->
+        <!-- M4k：/info 的车机屏尺寸、视频编码尺寸、触摸坐标随之确定。
+             M4l：configChanges 补齐所有可能触发重建的配置项——重建只会白销毁一次 SurfaceView 的
+             Surface（解码器要重配+等关键帧，画面冻 1~5s）。
+             M6k-UI：横竖屏由设置页的"横竖屏切换"驱动
+             （LiteConfig.orientationMode，主页 onCreate/onResume 经 applyOrientationMode 应用）；
+             M6k14：旋转重建改为程序化按方向重走 buildRoot（竖屏卡片 / 横屏三列）。
+             M6k24i：冷启动先竖屏再横屏排查（nova 3e 视频复盘）——窗口创建方向取自 Manifest，
+             requestedOrientation 要等窗口落定才生效，纯运行时设置治不了首帧。
+             主 Manifest 的 MainActivity 声明 landscape（主流模式=强制横屏，冷启动零闪转）；
+             强制竖屏模式仍由 applyOrientationMode 运行时覆盖（冷启动首帧会有一次
+             横→竖切换，属系统行为，落定后全程竖屏稳定）。
+             M6k24k：ANE-AL00 日志定案——子页面（settings/hotspot/caricon）声明 landscape
+             会让窗口"生来横屏"，竖屏模式下每页切换都横→竖闪一次（display=2061x1080 实锤）。
+             M6k25：单 Activity 化根除该问题——settings/caricon/hotspot 全部收编为 MainActivity
+             内部 page 路由（SettingsPage/CarIconPage/HotspotPage），不再有子页窗口，
+             Manifest 仅保留 MainActivity 一个 activity 声明。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:screenOrientation="landscape"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|fontScale|density|layoutDirection|locale"
-            android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|fontScale|density|layoutDirection|locale">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- 1.0.20（3e EMUI 实测）：图库会抢先认领 iPhone（PTP 接口）并发起 USB 权限请求，
+                 与本应用抢设备造成授权竞态/重枚举。声明设备意图过滤后，插上 iPhone 系统
+                 会主动弹出「用 DiPlay 打开」，用户勾选默认后图库不再抢先。vendor 0x05ac=1452。 -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
         </activity>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <service
             android:name=".LiteSessionService"
             android:exported="false" />
+
+        <!-- U4 USB 有线：WiredVpnService（shared 模块）只负责建立 fe80:: TUN 供 NCM 桥使用；
+             BIND_VPN_SERVICE + android.net.VpnService action 是系统 VpnService 的清单约定 -->
+        <service
+            android:name="com.shilapi.xcertplay.network.WiredVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>
