@@ -89,7 +89,7 @@ internal object LiteSteeringKeys {
             val callback = synchronized(lock) { learningCallback?.takeIf { learningOwner === owner } }
             stopLearning(owner)
             callback?.invoke(null)
-        }.also { mainHandler.postDelayed(it, 25_000L) }
+        }.also { mainHandler.postDelayed(it, 20_000L) }
         restartMonitorLocked(discovering = true)
         startMediaSessionLocked()
         LiteLog.log(TAG, "方控学习开始")
@@ -201,6 +201,23 @@ internal object LiteSteeringKeys {
             "next" -> send(CarPlayMediaButton.NEXT, source)
             "previous" -> send(CarPlayMediaButton.PREVIOUS, source)
             "siri" -> requestSiri(source)
+            // 1.0.29：音量键本地执行（调车机媒体音量流），不发 CarPlay 按钮。
+            "volume_up" -> setLocalVolume(+1, source)
+            "volume_down" -> setLocalVolume(-1, source)
+        }
+    }
+
+    /** 1.0.29：方控音量键的本地执行 —— 调 STREAM_MUSIC（CarPlay 媒体音频所在流）±1 步。 */
+    private fun setLocalVolume(delta: Int, source: String) {
+        val context = appContext ?: return
+        try {
+            val audio = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val target = (audio.getStreamVolume(AudioManager.STREAM_MUSIC) + delta).coerceIn(0, max)
+            audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+            LiteLog.log(TAG, "方控音量 delta=$delta target=$target/$max source=$source")
+        } catch (error: Exception) {
+            LiteLog.log(TAG, "方控音量失败 delta=$delta ${error.message}")
         }
     }
 

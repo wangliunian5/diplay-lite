@@ -29,6 +29,7 @@ class Iap2WiredControlClient(
         locationProvider: Iap2LocationProvider? = null,
         onIncoming: (Iap2Frame) -> Unit = {},
         onProgress: (String) -> Unit = {},
+        onStage: (Iap2WiredControlStage) -> Unit = {},
     ): Iap2WiredControlResult {
         require(availableCurrentMilliAmps in 0..0xffff) {
             "availableCurrentMilliAmps must be in 0..65535"
@@ -99,6 +100,7 @@ class Iap2WiredControlClient(
                         // the phone's advertised availability boolean.
                         send(carPlayStartSession(endpoint), deadlineNanos)
                         stage = Iap2WiredControlStage.CARPLAY_START_SENT
+                        onStage(stage)
                         carPlayStartSessions++
                         onProgress("iap2 tx=0x4301 carplay-start-session")
                     }

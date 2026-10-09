@@ -150,6 +150,15 @@ class Iap2Session private constructor(
         ): Iap2Session =
             Iap2Session(Iap2CsmChannel.openWireless(underlying), traceContext, onTrace)
 
+        /** [BT-PROBE] t3 蓝牙兼容实验：按 probeMode 轮换无线握手策略（0=现行 1=静默 2=主动）。 */
+        fun openWirelessProbe(
+            underlying: BlockingDuplexByteStream,
+            probeMode: Int,
+            traceContext: String = "wireless",
+            onTrace: (String) -> Unit = {},
+        ): Iap2Session =
+            Iap2Session(Iap2CsmChannel.openWirelessProbe(underlying, probeMode), traceContext, onTrace)
+
         fun openTunnel(
             underlying: BlockingDuplexByteStream,
             traceContext: String = "wireless-tunnel",

@@ -23,11 +23,11 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
         val config = LiteConfig.load(context)
-        if (!config.bootAutostart && !config.bootAutoBluetooth && !config.bootAutoHotspot) return
+        if (!config.bootAutostart && !config.bootAutoBluetooth && !config.bootAutoHotspot && !config.bootAutoWifi) return
         LiteLog.log(
             "boot",
             "BOOT_COMPLETED autostart=${config.bootAutostart} autoBt=${config.bootAutoBluetooth} " +
-                "autoAp=${config.bootAutoHotspot} autoConnect=${config.autoConnect}",
+                "autoAp=${config.bootAutoHotspot} autoWifi=${config.bootAutoWifi} autoConnect=${config.autoConnect}",
         )
         // enable()/setWifiApEnabled() + 轮询等待耗时超过 onReceive 上限，投后台线程 + goAsync。
         // 1.0.16（方案四②）：主页先拉起并弹「等待勾选项启动」弹窗（等待/滤波/超时都在 UI 层），
@@ -44,6 +44,8 @@ class BootReceiver : BroadcastReceiver() {
                     LiteLog.log("boot", "开机自启：拉起主页（自启等待弹窗由主页接管）")
                 }
                 if (config.bootAutoBluetooth) ensureBluetoothOn()
+                // STA/AP 互斥：勾了热点自启时热点流程会先关 Wi-Fi，Wi-Fi 自启让位。
+                if (config.bootAutoWifi && !config.bootAutoHotspot) ensureWifiOn(context)
                 if (config.bootAutoHotspot) ensureHotspotOn(context)
                 LiteLog.log("boot", "开机自启流程完成")
             } catch (error: Throwable) {
@@ -90,6 +92,39 @@ class BootReceiver : BroadcastReceiver() {
             waited += 1_000
         }
         LiteLog.log("boot", "蓝牙开启${if (adapter.isEnabled) "就绪" else "超时"} waited=${waited}ms")
+    }
+
+    /**
+     * 开启 Wi-Fi（STA 模式）并等待就绪（最长 15 秒）。setWifiEnabled 为公开 API（API16-26 有效，
+     * 27+ 对后台调用收窄——Lite 目标机型 api16-23 不受影响）。
+     */
+    private fun ensureWifiOn(context: Context) {
+        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        if (wifi == null) {
+            LiteLog.log("boot", "WifiManager 不可用，跳过 Wi-Fi 自启")
+            return
+        }
+        if (wifi.isWifiEnabled) {
+            LiteLog.log("boot", "Wi-Fi 已开启")
+            return
+        }
+        val started = runCatching {
+            wifi.setWifiEnabled(true)
+        }.getOrDefault(false)
+        if (!started) {
+            LiteLog.log("boot", "Wi-Fi setWifiEnabled(true) 被拒绝（ROM 策略），跳过等待")
+            return
+        }
+        var waited = 0
+        while (waited < 15_000 && !wifi.isWifiEnabled) {
+            try {
+                Thread.sleep(1_000)
+            } catch (_: InterruptedException) {
+                break
+            }
+            waited += 1_000
+        }
+        LiteLog.log("boot", "Wi-Fi 开启${if (wifi.isWifiEnabled) "就绪" else "超时"} waited=${waited}ms")
     }
 
     /**

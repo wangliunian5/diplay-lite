@@ -39,9 +39,11 @@ import com.shilapi.xcertplay.network.Ipv6NcmBridge
 import com.shilapi.xcertplay.network.ManualHotspotManager
 import com.shilapi.xcertplay.network.RelayClientManager
 import com.shilapi.xcertplay.network.WiredVpnService
+import com.shilapi.xcertplay.network.WirelessHotspotBackend
 import com.shilapi.xcertplay.network.WirelessHotspotInfo
 import com.shilapi.xcertplay.network.WirelessHotspotManager
 import com.shilapi.xcertplay.network.diagnosticSummary
+import com.shilapi.xcertplay.network.wifiFrequencyMhzToChannel
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 import com.shilapi.xcertplay.transport.BluetoothRfcommDuplexStream
 import com.shilapi.xcertplay.transport.Iap2IdentificationConfig
@@ -54,6 +56,7 @@ import com.shilapi.xcertplay.transport.Iap2WirelessControlTerminal
 import com.shilapi.xcertplay.transport.Iap2WirelessIdentification
 import com.shilapi.xcertplay.transport.Iap2WiredCarPlayEndpoint
 import com.shilapi.xcertplay.transport.Iap2WiredControlClient
+import com.shilapi.xcertplay.transport.Iap2WiredControlStage
 import com.shilapi.xcertplay.transport.IphoneCarPlayConfiguration
 import com.shilapi.xcertplay.transport.IphoneUsbException
 import com.shilapi.xcertplay.transport.IphoneUsbHost
@@ -240,6 +243,12 @@ class CarPlayController(
     @Volatile private var wirelessZombieMode = false
     // M6k11 hotfix：分类结果缓存（teardown 前算好，scheduleWirelessRetry 消费后清空）。
     @Volatile private var lastWirelessFailureClass: String? = null
+
+    // 1.0.29（3e 222838 建立期楔死）：wired 0x4301 发出后 8s 内 iPhone 未发起任何流帧
+    // → 关 CSM 触发控制环退出，走楔死类长退避全量重建（此前会话死在 pair-setup 阶段，
+    // 流中看门狗因 armed 判据要 NCM 帧率而接不住）。
+    @Volatile private var wiredEstablishWatchdogFired = false
+    @Volatile private var wiredControlReturned = true
 
     // M6k23：未建流阶段（无 SETUP/未激活）控制流 peer EOF 连续计数。8815 实测：
     // pair-verify 通过、加密开启后 iPhone 立即 EOF，每 ~5s 重连 TCP 循环、gen 恒定，
@@ -766,7 +775,19 @@ class CarPlayController(
             // 热点+监听口就绪后，若 FIRST_TCP_TIMEOUT_MILLIS 内 iPhone 从未发起任何 TCP
             // 连接（陈旧 mDNS 缓存、Wi-Fi 未入网、AP 隔离），显性失败并走重连状态机，
             // 而不是挂到 45s handoff 超时（旧路径 bootstrap 超时不触发重连，等于死等）。
-            armFirstTcpWatchdog(generation)
+            // [RELAY-TEST] 实验模式下看门狗须让位：三阶段总时长 ~134s（60 重发+2+10+60 恢复），
+            // 30s 默认值会在假凭证发出前把会话判死（00:28 日志实证 phase2 从未触达）。
+            armFirstTcpWatchdog(
+                generation,
+                timeoutMillis = if (
+                    Iap2WirelessControlClient.RELAY_TEST_ENABLED &&
+                    config.wirelessHotspotMode == WirelessHotspotMode.RELAY
+                ) {
+                    RELAY_TEST_FIRST_TCP_TIMEOUT_MILLIS
+                } else {
+                    FIRST_TCP_TIMEOUT_MILLIS
+                },
+            )
             if (isStaleWirelessRun(generation)) {
                 closeWirelessStack()
                 return
@@ -814,8 +835,18 @@ class CarPlayController(
                 return
             }
             val stream = BluetoothRfcommDuplexStream(socket).also { bluetoothStream = it }
-            val channel = Iap2Session.openWireless(
+            // [BT-PROBE] t3 蓝牙兼容实验：每代连接轮换一次握手策略，一轮重试拿满三种模式的现场。
+            // mode 0 = 现行（发 Marker，等 iPhone 回 Marker 后协商）
+            // mode 1 = 静默等待（不发 Marker，纯等 iPhone 先发 Marker）
+            // mode 2 = 主动协商（发 Marker 后立即发 Sync，同 USB 有线时序）
+            val btProbeMode = (generation - 1) % 3
+            debugLog(
+                "[BT-PROBE] mode=$btProbeMode " +
+                    "(0=marker+wait 1=silent-wait 2=marker+initiate) gen=$generation",
+            )
+            val channel = Iap2Session.openWirelessProbe(
                 stream,
+                probeMode = btProbeMode,
                 traceContext = "wireless-rfcomm",
                 onTrace = ::debugLog,
             )
@@ -843,6 +874,17 @@ class CarPlayController(
             wirelessAirPlayEndpoint = endpoint
             media.setIapTunnelHandler(::startWirelessTunnelControl)
 
+            // [RELAY-TEST] 1.0.28-中继test：中继模式下从扫描缓存选一个附近真实 SSID 作假凭证
+            // 目标（诱导 iPhone 切出当前 AP）；缓存为空则用不存在的 SSID（测「扫不到是否切出」分支）。
+            val relayTestFakeCredential = if (
+                Iap2WirelessControlClient.RELAY_TEST_ENABLED &&
+                config.wirelessHotspotMode == WirelessHotspotMode.RELAY
+            ) {
+                selectRelayTestFakeCredential(hotspotInfo.ssid)
+            } else {
+                null
+            }
+
             onStatus(CarPlayStatus.RunningWireless)
             debugLog("wireless Bluetooth iAP2 control starting")
             val result = Iap2WirelessControlClient(
@@ -857,6 +899,7 @@ class CarPlayController(
                 onProgress = ::debugLog,
                 // M6k24（A 方案）：iPhone 一旦发起过 AirPlay TCP 连接就停止凭证重发。
                 phoneOnAirPlay = { (airPlayServer?.acceptedConnectionCount() ?: 0) > 0 },
+                relayTestFakeCredential = relayTestFakeCredential,
             )
             if (isStaleWirelessRun(generation)) {
                 closeWirelessStack()
@@ -897,6 +940,13 @@ class CarPlayController(
                     // wirelessActiveReported 抑制；两者都没发生（iAP2 建链就没起来）才如实上报。
                     if (!wirelessActiveReported.get() && !wirelessDegradedActive.get()) {
                         onStatus(CarPlayStatus.ControlEnded)
+                    }
+                // 1.0.29（AC8227 倒车闪屏，移植上游 #229 FirstTcpWatchdog 精神）：
+                // 会话激活后 AirPlay TCP 断流超时（iPhone 端会话死、RFCOMM 还活着）——
+                // 无线模式下音视频就是 AirPlay，断流即会话实质死亡，按链路掉线整代重启。
+                Iap2WirelessControlTerminal.AIRPLAY_STALLED ->
+                    if (wirelessActiveReported.get()) {
+                        throw IOException("wireless AirPlay stalled: no TCP after active session")
                     }
             }
         } catch (error: Throwable) {
@@ -1075,6 +1125,9 @@ class CarPlayController(
                             onStatus(CarPlayStatus.ControlEnded)
                         Iap2WirelessControlTerminal.CHANNEL_CLOSED ->
                             onStatus(CarPlayStatus.Failed("Wireless iAP2 tunnel closed"))
+                        // 1.0.29：tunnel 路径未传 phoneOnAirPlay，看门狗不会触发；穷尽分支兜底。
+                        Iap2WirelessControlTerminal.AIRPLAY_STALLED ->
+                            onStatus(CarPlayStatus.Failed("Wireless iAP2 tunnel stalled"))
                     }
                 } catch (error: Throwable) {
                     if (!closed && generation == wirelessGeneration.get()) {
@@ -1280,7 +1333,10 @@ class CarPlayController(
     }
 
     /** M6k20：first-TCP 看门狗。触发条件与 handoff 看门狗同代次护栏；TCP 已有连接或已激活则静默过期。 */
-    private fun armFirstTcpWatchdog(generation: Int) {
+    private fun armFirstTcpWatchdog(
+        generation: Int,
+        timeoutMillis: Long = FIRST_TCP_TIMEOUT_MILLIS,
+    ) {
         mainHandler.postDelayed(
             {
                 if (
@@ -1298,15 +1354,29 @@ class CarPlayController(
                 if (accepted > 0) return@postDelayed
                 debugLog(
                     "first TCP watchdog: no iPhone connection within " +
-                        "${FIRST_TCP_TIMEOUT_MILLIS}ms; failing generation=$generation",
+                        "${timeoutMillis}ms; failing generation=$generation",
                 )
-                // 1.0.0-demo：中继模式（形态B）单独标记——iPhone 收到凭证却零 TCP，
-                // 首要嫌疑是路由器 AP 隔离/访客隔离，与热点模式的自查指引不同。
+                // 1.0.0-demo：中继模式（形态B）单独标记——iPhone 收到凭证却零 TCP。
                 val relaySuspect =
                     config.transport == CarPlayTransport.WIRELESS &&
                         config.wirelessHotspotMode == WirelessHotspotMode.RELAY
+                // 1.0.29（011741 三样本结论）：0x5703 已发 + 0 TCP 的首要嫌疑 = iPhone WLAN
+                // 开关关闭（iOS 保护性放弃后表现为 Wi-Fi 图标变白）或 join 未发生，AP 隔离降为
+                // 次要嫌疑——主动给用户可操作的一步提示，替代盲等。
+                onStatus(
+                    CarPlayStatus.RecoveryHint(
+                        if (relaySuspect) {
+                            "连接停滞：请打开 iPhone 的 WLAN 开关（若已开请关闭再打开），正在自动重试"
+                        } else {
+                            "连接停滞：请确认 iPhone 的 WLAN 已连接车机热点，或忽略此网络后重新连接"
+                        },
+                    ),
+                )
                 if (relaySuspect) {
-                    debugLog("backend=relay isolation-suspect: credential accepted but 0 TCP within window")
+                    debugLog(
+                        "backend=relay join-stagnation: credential sent but 0 TCP within window " +
+                            "(top suspect: iPhone WLAN off / join not happened)",
+                    )
                 }
                 Thread(
                     {
@@ -1316,7 +1386,7 @@ class CarPlayController(
                             IOException(
                                 (if (relaySuspect) {
                                     "First TCP timeout (relay): iPhone never connected over the relay Wi-Fi " +
-                                        "(AP/client isolation on the router is the top suspect)"
+                                        "(iPhone WLAN off / join not happened; AP isolation secondary)"
                                 } else {
                                     "First TCP timeout: iPhone never connected to the car network " +
                                         "(stale mDNS cache / Wi-Fi not joined / AP isolation)"
@@ -1330,7 +1400,7 @@ class CarPlayController(
                     start()
                 }
             },
-            FIRST_TCP_TIMEOUT_MILLIS,
+            timeoutMillis,
         )
     }
 
@@ -1394,7 +1464,30 @@ class CarPlayController(
         }
         hotspot = manager
         return try {
-            val info = manager.start(HOTSPOT_START_TIMEOUT_MILLIS)
+            var info = manager.start(HOTSPOT_START_TIMEOUT_MILLIS)
+            // 1.0.29：凭证下发热稳定窗——RELAY 场景（车机为 STA）在 0x5703 下发前对关联信道
+            // 二次复核：manager.start() 内已观测一次，这里再读一次，两次一致才信观测值；
+            // 抖动 → 信道改 0 让 iPhone 全频段扫描（宁全扫不定向错）。
+            // MANUAL（车机自建热点）观测对象是本机 AP，不存在漂移，跳过复核。
+            val rememberedChannel = ConfirmedChannelMemory.recall(
+                appContext,
+                if (hotspotMode == WirelessHotspotMode.RELAY) {
+                    ConfirmedChannelMemory.ROLE_RELAY
+                } else {
+                    ConfirmedChannelMemory.ROLE_CAR
+                },
+            )
+            if (info.backend == WirelessHotspotBackend.RELAY_CLIENT && info.channel > 0) {
+                val rechecked = recheckRelayChannelOnce()
+                val stable = rechecked == 0 || rechecked == info.channel
+                debugLog(
+                    "credential channel=${info.channel} mem=$rememberedChannel " +
+                        "observed=$rechecked stable=$stable",
+                )
+                if (!stable) info = relabelHotspotChannel(info, 0)
+            } else {
+                debugLog("credential channel=${info.channel} mem=$rememberedChannel observed=n/a")
+            }
             lastHotspotInfo = info
             info
         } catch (failure: Exception) {
@@ -1411,6 +1504,63 @@ class CarPlayController(
 
     private fun isStaleWirelessRun(generation: Int): Boolean =
         closed || phase != Phase.WIRELESS || generation != wirelessGeneration.get()
+
+    /** 1.0.29：二次复核当前 STA 关联信道（API21+；低版本 ROM 读不到 → 0=无法复核不否决）。 */
+    private fun recheckRelayChannelOnce(): Int = runCatching {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return 0
+        val wm = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return 0
+        @Suppress("DEPRECATION")
+        val frequency = wm.connectionInfo?.frequency ?: 0
+        wifiFrequencyMhzToChannel(frequency) ?: 0
+    }.getOrDefault(0)
+
+    /** 1.0.29：把观测抖动的信道改为指定值（0=全扫兜底），其余字段原样保留。 */
+    private fun relabelHotspotChannel(info: WirelessHotspotInfo, channel: Int): WirelessHotspotInfo =
+        WirelessHotspotInfo(
+            ssid = info.ssid,
+            passphrase = info.passphrase,
+            security = info.security,
+            channel = channel,
+            frequencyMHz = null,
+            bssid = info.bssid,
+            interfaceName = info.interfaceName,
+            hostAddress = info.hostAddress,
+            bandLabel = info.bandLabel,
+            backend = info.backend,
+        )
+
+    /** [RELAY-TEST] 从扫描缓存选一个非当前中继 SSID 的假凭证目标（读缓存不阻塞建链）。 */
+    private fun selectRelayTestFakeCredential(currentSsid: String): Pair<String, String> {
+        val fakePassphrase = randomTestPassphrase()
+        val wifiManager = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val candidates = wifiManager?.scanResults
+            .orEmpty()
+            .mapNotNull { it.SSID?.takeIf(String::isNotBlank) }
+            .filter { it != currentSsid }
+            .distinct()
+        return if (candidates.isNotEmpty()) {
+            debugLog(
+                "[RELAY-TEST] fake ssid from scan cache: $candidates -> ${candidates.first()}",
+            )
+            candidates.first() to fakePassphrase
+        } else {
+            // 附近无其他 SSID：用不存在的 SSID，验证「扫不到目标时 iPhone 是否仍切出当前 AP」
+            val fallback = "DiPlayTest-" + (1000 + java.util.Random().nextInt(9000))
+            debugLog(
+                "[RELAY-TEST] scan cache empty -> nonexistent fake ssid=$fallback " +
+                    "(branch: scan-miss)",
+            )
+            fallback to fakePassphrase
+        }
+    }
+
+    private fun randomTestPassphrase(): String {
+        val chars = "abcdefghjkmnpqrstuvwxyz23456789"
+        val random = java.util.Random()
+        val builder = StringBuilder(10)
+        repeat(10) { builder.append(chars[random.nextInt(chars.length)]) }
+        return builder.toString()
+    }
 
     private fun selectWirelessBluetoothDevice(adapter: BluetoothAdapter): BluetoothDevice {
         val bonded = adapter.bondedDevices.orEmpty()
@@ -2036,6 +2186,21 @@ class CarPlayController(
         return NcmUsbBridge.open(connection, function)
     }
 
+    /** 1.0.29：wired 建立期看门狗——0x4301 后 [WIRED_ESTABLISH_WATCHDOG_MILLIS] 无流帧即关桥重建。 */
+    private fun armWiredEstablishWatchdog() {
+        wiredControlReturned = false
+        wiredEstablishWatchdogFired = false
+        mainHandler.postDelayed({
+            if (closed || wiredControlReturned) return@postDelayed
+            wiredEstablishWatchdogFired = true
+            debugLog(
+                "wired establish watchdog: no stream frame within " +
+                    "${WIRED_ESTABLISH_WATCHDOG_MILLIS}ms after 0x4301; closing CSM to rebuild",
+            )
+            runCatching { wiredCsm?.close() }
+        }, WIRED_ESTABLISH_WATCHDOG_MILLIS)
+    }
+
     private fun runWiredStack(usbSession: Iap2UsbSession, ncm: NcmUsbBridge) {
         phase = Phase.CONTROL
         var ncmOwnedLocally = true
@@ -2104,6 +2269,13 @@ class CarPlayController(
                 locationProvider = locationProvider,
                 onIncoming = ::onRouteFrame,
                 onProgress = { message -> debugLog("wired $message") },
+                onStage = { stage ->
+                    debugLog("wired stage=$stage")
+                    // 1.0.29：0x4301 发出即 armed 建立期看门狗（健康路径 160ms 内 iPhone 就来 RTSP）。
+                    if (stage == Iap2WiredControlStage.CARPLAY_START_SENT) {
+                        armWiredEstablishWatchdog()
+                    }
+                },
             )
             debugLog("wired control ended terminal=${result.terminal} stage=${result.stage}")
             // 1.0.16（方案四①）：只有终态（用户已断开/controller 已关）才做网络恢复；自动重试路径不动 Wi-Fi。
@@ -2122,7 +2294,15 @@ class CarPlayController(
                 onStatus(CarPlayStatus.ControlEnded)
                 return
             }
-            val delayMs = minOf(WIRED_RETRY_DELAY_BASE_MILLIS * attempt, WIRED_RETRY_DELAY_MAX_MILLIS)
+            // 1.0.29：楔死类分流——0x4301 已发但 iPhone 零流帧（watchdog 关桥或自然断链均落到此形态）
+            // 用长退避 ≥30s：3e 实测快速连续重试会在死 USB 栈上加压加深楔死，静置才给 usbfs 自愈窗口。
+            val wedgeSuspect = result.stage == Iap2WiredControlStage.CARPLAY_START_SENT &&
+                result.forwardedFrames == 0
+            val delayMs = if (wedgeSuspect) {
+                maxOf(WIRED_RETRY_DELAY_MAX_MILLIS, WIRED_WEDGE_RETRY_DELAY_MILLIS)
+            } else {
+                minOf(WIRED_RETRY_DELAY_BASE_MILLIS * attempt, WIRED_RETRY_DELAY_MAX_MILLIS)
+            }
             if (attempt >= 3) {
                 onStatus(
                     CarPlayStatus.RecoveryHint(
@@ -2137,10 +2317,27 @@ class CarPlayController(
             }, delayMs)
         } catch (error: Throwable) {
             debugLog("wired bring-up failed", error)
+            // 1.0.29：看门狗关桥引发的底层异常（close 竞态）不做终态 fail，与 wedgeSuspect
+            // 正常路径同节奏：清栈 + 30s 长退避后 startIphone 重建。
+            if (wiredEstablishWatchdogFired && !closed) {
+                wiredEstablishWatchdogFired = false
+                closeWiredStack()
+                onStatus(
+                    CarPlayStatus.RecoveryHint("USB 连接停滞，正在重建（约 30 秒后自动重试）"),
+                )
+                debugLog("wired wedge fallback; rebuild in ${WIRED_WEDGE_RETRY_DELAY_MILLIS}ms")
+                mainHandler.postDelayed({
+                    if (closed) return@postDelayed
+                    startIphone()
+                }, WIRED_WEDGE_RETRY_DELAY_MILLIS)
+                return
+            }
             closeWiredStack()
             if (error is Error) throw error
             fail(error)
         } finally {
+            // 1.0.29：无论正常返回还是异常退出，控制权都已交还，取消未触发的看门狗。
+            wiredControlReturned = true
             if (ncmOwnedLocally) {
                 closeBestEffort("wired NCM") { ncm.close() }
             }
@@ -2570,6 +2767,8 @@ class CarPlayController(
         // 大概率是陈旧 mDNS 缓存（实测过期约 40s）或没入网，早失败早重连（4s 退避重试
         // 恰好覆盖缓存过期窗口）。
         private const val FIRST_TCP_TIMEOUT_MILLIS = 30_000L
+        /** [RELAY-TEST] 实验模式下 first-TCP 看门狗超时：须覆盖三阶段总时长（~134s）。 */
+        private const val RELAY_TEST_FIRST_TCP_TIMEOUT_MILLIS = 150_000L
 
         // 1.0.1：重枚举阶段看门狗（15s 显性失败）与轮询兜底（2s）/样本日志节拍（4s=2次一打）。
         private const val REENUMERATION_WATCHDOG_MILLIS = 15_000L
@@ -2586,6 +2785,9 @@ class CarPlayController(
         private const val MAX_WIRED_RETRIES = 5
         private const val WIRED_RETRY_DELAY_BASE_MILLIS = 4_000L
         private const val WIRED_RETRY_DELAY_MAX_MILLIS = 15_000L
+        // 1.0.29：wired 建立期看门狗——0x4301 后 8s 仍零流帧即关桥重建；楔死类退避 ≥30s。
+        private const val WIRED_ESTABLISH_WATCHDOG_MILLIS = 8_000L
+        private const val WIRED_WEDGE_RETRY_DELAY_MILLIS = 30_000L
         // M6k11：CSM 打开后 <500ms 被 iPhone 关流 → IPHONE_ZOMBIE（重试治不了）。
         // 僵尸策略：快试 2 次（4s）→ 第 3 次起长退避 30s/60s 并提示用户关开 iPhone 蓝牙；
         // 第 3 次重试前顺带 reset 本机蓝牙适配器（清车机侧 RFCOMM 服务状态）。
@@ -2610,6 +2812,8 @@ class CarPlayController(
             // 1.0.13：handoff（画面握手）超时同归可重试族——MX6DQ 实测 TCP 已通、A/V 未出帧，
             // 弹「画面握手未完成」终态躺平；换新一代重连实测可自愈（重试 8 次后 gen=3 成功）。
             "handoff timed out",
+            // 1.0.29：AirPlay 断流看门狗（倒车/离网后会话死亡）——整代重启可自愈。
+            "airplay stalled",
         )
         private const val RFCOMM_CONNECT_TIMEOUT_MILLIS = 15_000L
         private const val RFCOMM_FALLBACK_DELAY_MILLIS = 150L

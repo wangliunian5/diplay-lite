@@ -31,6 +31,13 @@ data class LiteConfig(
     val avPathMode: String = "full",
     // M6k19：音乐缓存毫秒数（10-4000，默认 300 = MediaAudioBuffer.DEFAULT_MILLIS）。
     val mediaBufferMillis: Int = 300,
+    // 1.0.29：分辨率设定三选一。fit=自动（保持纵横比，等比 letterbox）/
+    // stretch=自动（拉伸铺满）/ manual=手动指定宽高。
+    val resolutionMode: String = "fit",
+    // 1.0.29：手动分辨率（横×纵，320-4096）。回报给 iPhone = 该值 × videoScalePercent，
+    // 强制竖屏时自动交换横纵（长边为高）。
+    val manualWidth: Int = 1024,
+    val manualHeight: Int = 600,
     // M6k21（参考 fork carlito12345 版）：媒体/导航音频各自的音频流编号覆盖，独立生效。
     // 0=自动路由（usage 构建，默认立体声）；1~20=传统音频流编号（旧 AudioTrack 构造，
     // 含车机厂商扩展流；ROM 拒绝时播放层自动回退 usage 路由）。
@@ -42,6 +49,8 @@ data class LiteConfig(
     val bootAutoBluetooth: Boolean = false,
     // 1.0.11：开机自动开启热点（蓝牙就绪后反射 setWifiApEnabled，STA/AP 互斥先关 Wi-Fi）。
     val bootAutoHotspot: Boolean = false,
+    // 1.0.29：开机自动开启 Wi-Fi（setWifiEnabled(true) 静默执行；与热点互斥，勾了热点则跳过）。
+    val bootAutoWifi: Boolean = false,
     // M6k-UI：启动后自动连接（主页 onResume 读它发起）。
     val autoConnect: Boolean = false,
     // M6k14：默认自动连接通道，三选一互斥（主页 toggle）。car=车机热点 / relay=中继热点 / usb=USB。
@@ -72,6 +81,10 @@ data class LiteConfig(
         // M6k19：音乐缓存输入范围（ms）
         const val MIN_MEDIA_BUFFER_MILLIS = 10
         const val MAX_MEDIA_BUFFER_MILLIS = 4000
+
+        // 1.0.29：手动分辨率输入范围（横/纵各自限制）。
+        const val MIN_MANUAL_RESOLUTION = 320
+        const val MAX_MANUAL_RESOLUTION = 4096
 
         /** M6d：视频参数是否与"上次连接时生效的值"一致（不一致 = 必须先断开重连）。 */
         fun videoKeyOf(scalePercent: Int, limit30Fps: Boolean): String = "$scalePercent/$limit30Fps"
@@ -117,11 +130,17 @@ data class LiteConfig(
                 orientationMode = prefs.getString("orientation_mode", "auto") ?: "auto",
                 avPathMode = prefs.getString("av_path_mode", "full") ?: "full",
                 mediaBufferMillis = prefs.getInt("media_buffer_millis", 300),
+                resolutionMode = prefs.getString("video_resolution_mode", "fit") ?: "fit",
+                manualWidth = prefs.getInt("manual_resolution_w", 1024)
+                    .coerceIn(MIN_MANUAL_RESOLUTION, MAX_MANUAL_RESOLUTION),
+                manualHeight = prefs.getInt("manual_resolution_h", 600)
+                    .coerceIn(MIN_MANUAL_RESOLUTION, MAX_MANUAL_RESOLUTION),
                 mediaAudioStream = prefs.getInt("media_audio_stream", 0).let { if (it in 0..20) it else 0 },
                 navAudioStream = prefs.getInt("nav_audio_stream", 0).let { if (it in 0..20) it else 0 },
                 bootAutostart = prefs.getBoolean("boot_autostart", false),
                 bootAutoBluetooth = prefs.getBoolean("boot_auto_bluetooth", false),
                 bootAutoHotspot = prefs.getBoolean("boot_auto_hotspot", false),
+                bootAutoWifi = prefs.getBoolean("boot_auto_wifi", false),
                 autoConnect = prefs.getBoolean("auto_connect", false),
                 activeChannel = prefs.getString("active_channel", "car") ?: "car",
                 relaySsid = prefs.getString("relay_ssid", "").orEmpty(),
@@ -155,6 +174,7 @@ data class LiteConfig(
                 .putBoolean("boot_autostart", config.bootAutostart)
                 .putBoolean("boot_auto_bluetooth", config.bootAutoBluetooth)
                 .putBoolean("boot_auto_hotspot", config.bootAutoHotspot)
+                .putBoolean("boot_auto_wifi", config.bootAutoWifi)
                 .putBoolean("auto_connect", config.autoConnect)
                 .putString("active_channel", config.activeChannel)
                 .putString("relay_ssid", config.relaySsid)

@@ -2,15 +2,20 @@ package com.shilapi.diplay.lite
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Dialog
 import android.content.pm.ActivityInfo
+import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.text.InputType
 import android.util.Base64
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
+import android.view.Window
 import android.widget.Button
+import android.view.ViewGroup
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -94,6 +99,14 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var rbOrientPortrait: RadioButton
     private lateinit var rbAvFull: RadioButton
     private lateinit var rbAvBt: RadioButton
+    // 1.0.29：分辨率设定（fit/stretch/manual 三选一 + 手动宽高输入行）。
+    private lateinit var rgResolution: RadioGroup
+    private lateinit var rbResFit: RadioButton
+    private lateinit var rbResStretch: RadioButton
+    private lateinit var rbResManual: RadioButton
+    private lateinit var manualResRow: android.view.View
+    private lateinit var inputResW: EditText
+    private lateinit var inputResH: EditText
     // M6k21：音频流编号当前值（弹窗选定时先存内存，点保存才落盘）
     private var mediaAudioStreamValue = 0
     private var navAudioStreamValue = 0
@@ -102,6 +115,7 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var cbBoot: CheckBox
     private lateinit var cbBootBluetooth: CheckBox
     private lateinit var cbBootHotspot: CheckBox
+    private lateinit var cbBootWifi: CheckBox
     private lateinit var cbAutoConnect: CheckBox
     private lateinit var cbSoftDecode: CheckBox
     private lateinit var cbFps30: CheckBox
@@ -114,21 +128,8 @@ class SettingsPage(private val activity: MainActivity) {
     /** 页面离开时调用（原 onPause + 向导 dismiss 复位，M6k25 收口为一个清理点）。 */
     fun cleanup() {
         runCatching { persistFromForm() }
-        // 学习向导若在开：dismiss 触发 setOnDismissListener（复位抑制/钩子/stopLearning）
-        steeringWizardDialog?.dismiss()
-        steeringWizardDialog = null
         AudioChannelPreview.close()
         AudioChannelPreview.currentActivity = null
-    }
-
-    /** 本地 KeyEvent 捕获（原 SettingsActivity.onKeyDown）：仅向导监听/验证态消费。 */
-    fun consumeKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        val hook = steeringLocalKeyHook
-        if (hook != null && event != null && event.repeatCount == 0 && keyCode in steeringLocalLearnableKeys) {
-            hook(keyCode, event.action)
-            return true
-        }
-        return false
     }
 
     /** 进入设置页：构建根视图（含悬浮球）并完成表单回显。由 MainActivity.render() 调用。 */
@@ -166,6 +167,81 @@ class SettingsPage(private val activity: MainActivity) {
         inputDuck = buildValueRow(column, "导航音频触发音量降低", "${LiteConfig.MIN_DUCK_PERCENT}% - ${LiteConfig.MAX_DUCK_PERCENT}%") { applyDuck(it) }
         // M6k19：音乐缓存毫秒数（跟随导航音量降低之后），范围 10-4000ms。
         inputBuffer = buildValueRow(column, "音乐缓存", "${LiteConfig.MIN_MEDIA_BUFFER_MILLIS} - ${LiteConfig.MAX_MEDIA_BUFFER_MILLIS} (ms)") { applyBuffer(it) }
+        // 生效说明：起播阈值跟随设置值；缓冲池深度有 1500ms 下限（T29 防抖动），设置 >1300ms 才会加深。
+        column.addView(
+            TextView(activity).apply {
+                text = "影响音乐起播速度。更改在重新连接后生效。缓冲池固定不低于 1500ms 防网络卡顿，设置高于 1300 才会加深缓冲池。"
+                setTextColor(Ui.SUB)
+                textSize = 12f
+            },
+            block(top = dip(2), bottom = dip(8)),
+        )
+
+        // 1.0.29：分辨率设定 —— 自动（保持纵横比，等比 letterbox）/ 自动（拉伸铺满）/
+        // 手动指定（回报给 iPhone = 手动宽高 ×「分辨率自定义」百分比，重启后生效）。
+        column.addView(sectionLabel("分辨率设定"), block(top = dip(12), bottom = dip(4)))
+        rgResolution = RadioGroup(activity).apply { orientation = LinearLayout.VERTICAL }
+        rbResFit = radio("自动（保持纵横比）")
+        rbResStretch = radio("自动（拉伸）")
+        rbResManual = radio("手动指定")
+        rgResolution.addView(rbResFit)
+        rgResolution.addView(rbResStretch)
+        rgResolution.addView(rbResManual)
+        rgResolution.setOnCheckedChangeListener { _, _ ->
+            if (isLoading) return@setOnCheckedChangeListener
+            refreshRadioDrawables(rgResolution)
+            manualResRow.visibility = if (rbResManual.isChecked) android.view.View.VISIBLE else android.view.View.GONE
+            persistFromForm()
+        }
+        column.addView(rgResolution, block())
+        // 手动输入行：横 [框] × 纵 [框] [应用]（选中「手动指定」才显示）。
+        // 局部变量构建，避免 lateinit 属性的 smart cast 限制。
+        val resRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            visibility = android.view.View.GONE
+            setPadding(0, dip(4), 0, 0)
+        }
+        fun manualLabel(text: String): TextView = TextView(activity).apply {
+            this.text = text
+            setTextColor(Ui.SUB)
+            textSize = 14f
+        }
+        fun manualField(hint: String): EditText = EditText(activity).apply {
+            this.hint = hint
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            textSize = 14f
+            setSingleLine(true)
+        }
+        inputResW = manualField("宽 320-4096")
+        inputResH = manualField("高 320-4096")
+        resRow.addView(manualLabel("横"), rowStretch(0))
+        resRow.addView(
+            inputResW,
+            LinearLayout.LayoutParams(dip(78), ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        resRow.addView(manualLabel("×"), rowStretch(0))
+        resRow.addView(
+            inputResH,
+            LinearLayout.LayoutParams(dip(78), ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        val applyResButton = Button(activity).apply {
+            text = "应用"
+            textSize = 13f
+            setOnClickListener { applyManualResolution() }
+        }
+        resRow.addView(applyResButton, rowStretch(dip(8)))
+        manualResRow = resRow
+        column.addView(resRow, block())
+        // 计算说明：与「分辨率自定义」百分比联动。
+        column.addView(
+            TextView(activity).apply {
+                text = "回报给 iPhone 的实际分辨率 = 手动值 ×「分辨率自定义」百分比。重新连接后生效。"
+                setTextColor(Ui.SUB)
+                textSize = 12f
+            },
+            block(top = dip(2), bottom = dip(8)),
+        )
 
         // M6k21：连接配置（从主页通道卡迁入）——车机热点/中继热点的网络配置入口。
         column.addView(sectionLabel("连接配置"), block(top = dip(12), bottom = dip(4)))
@@ -256,9 +332,11 @@ class SettingsPage(private val activity: MainActivity) {
         // 体验优化：渲染图画了 3 项，30帧/扬声器两项既有功能保留（图未画出）
         column.addView(sectionLabel("体验优化"), block(top = dip(12), bottom = dip(4)))
         cbBoot = checkbox("开机自启")
-        // 1.0.11：开机自动开启蓝牙/热点（独立于"开机自启"，任一勾选 BootReceiver 即工作）
+        // 1.0.11：开机自动开启蓝牙/热点/Wi-Fi（独立于"开机自启"，任一勾选 BootReceiver 即工作；
+        // 1.0.29 Wi-Fi 与热点互斥——勾了热点则 Wi-Fi 自启跳过，STA/AP 不能同开）
         cbBootBluetooth = checkbox("开机自动开启蓝牙")
         cbBootHotspot = checkbox("开机自动开启热点")
+        cbBootWifi = checkbox("开机自动开启 Wi-Fi")
         cbAutoConnect = checkbox("启动后自动连接")
         cbSoftDecode = checkbox("强制软解")
         cbFps30 = checkbox("限制 30 帧")
@@ -266,6 +344,7 @@ class SettingsPage(private val activity: MainActivity) {
         column.addView(cbBoot, block(bottom = dip(2)))
         column.addView(cbBootBluetooth, block(bottom = dip(2)))
         column.addView(cbBootHotspot, block(bottom = dip(2)))
+        column.addView(cbBootWifi, block(bottom = dip(2)))
         column.addView(cbAutoConnect, block(bottom = dip(2)))
         column.addView(cbSoftDecode, block(bottom = dip(2)))
         column.addView(cbFps30, block(bottom = dip(2)))
@@ -273,8 +352,10 @@ class SettingsPage(private val activity: MainActivity) {
 
         // M6k23：自定义返回图标页（选图→裁剪→确认保存）。
         column.addView(entryRow("自定义返回图标") { activity.setPage("caricon") }, block(top = dip(14)))
-        // 功能入口行
-        column.addView(entryRow("方向盘按键学习") { showSteeringLearningDialog() }, block(top = dip(8)))
+        // 功能入口行（M6k26：方控学习改为独立页面跳转，替代原全屏 Dialog —— 部分 ROM Dialog 内容区不渲染）
+        column.addView(entryRow("方向盘按键学习") { activity.setPage("steering") }, block(top = dip(8)))
+        // 1.0.29 系统诊断：蓝牙栈状态/getprop/进程/root 探测（t3-p1 等无 ADB 车机的排查通道）
+        column.addView(entryRow("系统诊断（蓝牙/ADB/root）") { Diagnostics.run(activity) }, block(top = dip(8), bottom = dip(8)))
 
         // 运行日志：预览（对话框）+ 导出（文件快照）+ Gitee 上传配置/上传（M6k25）
         val logRow = LinearLayout(activity).apply {
@@ -344,6 +425,7 @@ class SettingsPage(private val activity: MainActivity) {
         if (value in LiteConfig.MIN_MEDIA_BUFFER_MILLIS..LiteConfig.MAX_MEDIA_BUFFER_MILLIS) {
             persistFromForm()
             LiteLog.log("ui", "设置：音乐缓存 ${value}ms")
+            Toast.makeText(activity, "已保存：音乐缓存 ${value}ms，重新连接后生效", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -536,6 +618,12 @@ class SettingsPage(private val activity: MainActivity) {
             bottomMargin = bottom
         }
 
+    /** 1.0.29：手动分辨率输入行的子项参数（WRAP 内容 + 左边距）。 */
+    private fun rowStretch(left: Int): LinearLayout.LayoutParams =
+        LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = left
+        }
+
     private fun refreshRadioDrawables(group: RadioGroup) {
         for (i in 0 until group.childCount) {
             val rb = group.getChildAt(i) as RadioButton
@@ -548,6 +636,8 @@ class SettingsPage(private val activity: MainActivity) {
         (rbOrientLand.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
         (rbAutoCar.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
         (rbAvFull.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
+        // 1.0.29：分辨率设定组。
+        (rbResFit.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
     }
 
     // ---------- 表单读写 ----------
@@ -570,12 +660,22 @@ class SettingsPage(private val activity: MainActivity) {
         }
         rbAvFull.isChecked = config.avPathMode != "bt_audio"
         rbAvBt.isChecked = config.avPathMode == "bt_audio"
+        // 1.0.29：分辨率设定回显（手动行只在 manual 模式显示）。
+        when (config.resolutionMode) {
+            "stretch" -> rbResStretch.isChecked = true
+            "manual" -> rbResManual.isChecked = true
+            else -> rbResFit.isChecked = true
+        }
+        inputResW.setText(config.manualWidth.toString())
+        inputResH.setText(config.manualHeight.toString())
+        manualResRow.visibility = if (config.resolutionMode == "manual") View.VISIBLE else View.GONE
         mediaAudioStreamValue = config.mediaAudioStream
         navAudioStreamValue = config.navAudioStream
         updateStreamValueTexts()
         cbBoot.isChecked = config.bootAutostart
         cbBootBluetooth.isChecked = config.bootAutoBluetooth
         cbBootHotspot.isChecked = config.bootAutoHotspot
+        cbBootWifi.isChecked = config.bootAutoWifi
         cbAutoConnect.isChecked = config.autoConnect
         cbSoftDecode.isChecked = config.softwareVideoDecoder
         cbFps30.isChecked = config.limit30Fps
@@ -595,12 +695,22 @@ class SettingsPage(private val activity: MainActivity) {
         val buffer = inputBuffer.text.toString().trim().toIntOrNull()
             ?.coerceIn(LiteConfig.MIN_MEDIA_BUFFER_MILLIS, LiteConfig.MAX_MEDIA_BUFFER_MILLIS)
             ?: current.mediaBufferMillis
+        // 1.0.29：手动宽高非数字时保留原值（显式校验在 applyManualResolution 里做）。
+        val manualW = inputResW.text.toString().trim().toIntOrNull()
+            ?.coerceIn(LiteConfig.MIN_MANUAL_RESOLUTION, LiteConfig.MAX_MANUAL_RESOLUTION)
+            ?: current.manualWidth
+        val manualH = inputResH.text.toString().trim().toIntOrNull()
+            ?.coerceIn(LiteConfig.MIN_MANUAL_RESOLUTION, LiteConfig.MAX_MANUAL_RESOLUTION)
+            ?: current.manualHeight
         LiteConfig.save(
             activity,
             current.copy(
                 videoScalePercent = scale,
                 navDuckPercent = duck,
                 mediaBufferMillis = buffer,
+                resolutionMode = currentResolutionMode(),
+                manualWidth = manualW,
+                manualHeight = manualH,
                 activeChannel = when {
                     rbAutoRelay.isChecked -> "relay"
                     rbAutoUsb.isChecked -> "usb"
@@ -616,6 +726,7 @@ class SettingsPage(private val activity: MainActivity) {
                 bootAutostart = cbBoot.isChecked,
                 bootAutoBluetooth = cbBootBluetooth.isChecked,
                 bootAutoHotspot = cbBootHotspot.isChecked,
+                bootAutoWifi = cbBootWifi.isChecked,
                 autoConnect = cbAutoConnect.isChecked,
             ),
         )
@@ -624,6 +735,51 @@ class SettingsPage(private val activity: MainActivity) {
     private fun currentOrientationMode(): String = when {
         rbOrientPortrait.isChecked -> "portrait"
         else -> "land"
+    }
+
+    /** 1.0.29：分辨率设定当前选项（fit=自动保持纵横比 / stretch=自动拉伸 / manual=手动）。 */
+    private fun currentResolutionMode(): String = when {
+        rbResStretch.isChecked -> "stretch"
+        rbResManual.isChecked -> "manual"
+        else -> "fit"
+    }
+
+    /** 1.0.29：手动分辨率显式提交：320-4096 整数校验，确认后与分辨率自定义同款流程（重启生效）。 */
+    private fun applyManualResolution() {
+        val w = inputResW.text.toString().trim().toIntOrNull()
+        val h = inputResH.text.toString().trim().toIntOrNull()
+        val range = "${LiteConfig.MIN_MANUAL_RESOLUTION} - ${LiteConfig.MAX_MANUAL_RESOLUTION}"
+        if (w == null || h == null ||
+            w < LiteConfig.MIN_MANUAL_RESOLUTION || w > LiteConfig.MAX_MANUAL_RESOLUTION ||
+            h < LiteConfig.MIN_MANUAL_RESOLUTION || h > LiteConfig.MAX_MANUAL_RESOLUTION
+        ) {
+            toast("请输入 $range 的整数（横、纵各一个）")
+            return
+        }
+        val current = LiteConfig.load(activity)
+        if (w == current.manualWidth && h == current.manualHeight) {
+            toast("分辨率未变化：${w}×$h")
+            return
+        }
+        inputResW.setText(w.toString())
+        inputResH.setText(h.toString())
+        AlertDialog.Builder(activity)
+            .setTitle("确认修改分辨率")
+            .setMessage(
+                "原分辨率：${current.manualWidth}×${current.manualHeight}，确认修改为 ${w}×$h 吗？\n\n" +
+                    "回报给 iPhone 的实际分辨率 = 该值 ×「分辨率自定义」百分比。\n\n" +
+                    "点击「应用」后将自动重启软件，重启后生效。",
+            )
+            .setNegativeButton("取消") { _, _ ->
+                inputResW.setText(current.manualWidth.toString())
+                inputResH.setText(current.manualHeight.toString())
+            }
+            .setPositiveButton("应用并重启") { _, _ ->
+                persistFromForm()
+                toast("分辨率已应用：${w}×$h，软件即将重启")
+                activity.restartAppForVideoChange()
+            }
+            .show()
     }
 
     /** 分辨率显式提交：10-150 钳位；与当前值不同时弹确认（含 >100 超采样警告），确认后重启软件生效。 */
@@ -909,328 +1065,6 @@ class SettingsPage(private val activity: MainActivity) {
             context.init(null, null, null)
             connection.sslSocketFactory = context.socketFactory
         } catch (_: Exception) {
-        }
-    }
-
-    // ---------- M6k25：方向盘按键学习向导（逐键学习 + 冲突覆盖 + 验证，替代旧的顺序流程） ----------
-
-    private val steeringLearningOwner = Any()
-    private var steeringWizardDialog: AlertDialog? = null
-    private var steeringWizardBody: LinearLayout? = null
-    /** home / listening / success / verify / verify_result */
-    private var steeringWizardState = "home"
-    private var steeringWizardOperation = ""
-    /** 本地 KeyEvent 捕获钩子（仅监听/验证态非空），MainActivity.onKeyDown 经 consumeKeyDown 消费 */
-    private var steeringLocalKeyHook: ((keyCode: Int, action: Int) -> Unit)? = null
-    // 本地 KeyEvent 学习范围：媒体 播放/暂停(86)/播放(126)/暂停(127)/下一曲(87)/上一曲(88)
-    // + 语音助手（API21 常量，编译期内联，运行时不涉新 API）
-    private val steeringLocalLearnableKeys = setOf(
-        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-        KeyEvent.KEYCODE_MEDIA_PLAY,
-        KeyEvent.KEYCODE_MEDIA_PAUSE,
-        KeyEvent.KEYCODE_MEDIA_NEXT,
-        KeyEvent.KEYCODE_MEDIA_PREVIOUS,
-        KeyEvent.KEYCODE_VOICE_ASSIST,
-    )
-    private val steeringOpLabels = listOf(
-        "play_pause" to "播放/暂停",
-        "previous" to "上一曲",
-        "next" to "下一曲",
-        "siri" to "语音助手(Siri)",
-    )
-
-    private fun steeringLabelOf(operation: String): String =
-        steeringOpLabels.firstOrNull { it.first == operation }?.second ?: operation
-
-    /** 已绑定键位的来源/键值摘要（首页状态展示用）。 */
-    private fun steeringBindingSummary(binding: SteeringBinding): String = when (binding.source) {
-        "key_event" -> "本地按键 · 键值 ${binding.keyCode}"
-        "broadcast" -> "广播 ${binding.broadcastAction} · 键值 ${binding.keyCode}"
-        "session" -> "媒体会话 · 键值 ${binding.keyCode}"
-        else -> "日志 tag=${binding.logTag} · 键值 ${binding.keyCode}"
-    }
-
-    private fun showSteeringLearningDialog() {
-        if (steeringWizardDialog != null) return
-        // 向导打开期间整体抑制方控动作（避免误触发媒体操作），关闭时复位
-        LiteSteeringKeys.setUiSuppressed(true)
-        val body = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dip(20), dip(12), dip(20), dip(8))
-        }
-        steeringWizardBody = body
-        val dialog = AlertDialog.Builder(activity)
-            .setTitle("方向盘按键学习")
-            .setView(body)
-            .setNegativeButton("关闭", null)
-            .create()
-        dialog.setOnDismissListener {
-            // 注销全部临时监听：本地按键钩子 + 学习管线（monitor/receiver 一并关闭）
-            steeringWizardDialog = null
-            steeringWizardBody = null
-            steeringWizardState = "home"
-            steeringLocalKeyHook = null
-            LiteSteeringKeys.stopLearning(steeringLearningOwner)
-            LiteSteeringKeys.setUiSuppressed(false)
-        }
-        steeringWizardDialog = dialog
-        renderSteeringHome(body)
-        dialog.show()
-    }
-
-    /** 首页：列出 4 个可学键位与当前绑定状态。 */
-    private fun renderSteeringHome(body: LinearLayout) {
-        if (steeringWizardBody !== body) return
-        steeringWizardState = "home"
-        steeringLocalKeyHook = null
-        LiteSteeringKeys.stopLearning(steeringLearningOwner)
-        body.removeAllViews()
-        body.addView(
-            TextView(activity).apply {
-                text = "点按键位开始学习：进入监听后按一次方向盘按键即可。学习期间方控不会触发实际操作，保存后重新连接 CarPlay 生效。"
-                setTextColor(Ui.SUB)
-                textSize = 12f
-            },
-            block(bottom = dip(6)),
-        )
-        val bindings = SteeringStore.loadEnabled(activity)?.bindings.orEmpty()
-        steeringOpLabels.forEachIndexed { index, (operation, label) ->
-            val binding = bindings.firstOrNull { it.operation == operation }
-            val row = LinearLayout(activity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dip(10), 0, dip(10))
-                setOnClickListener { beginSteeringListen(operation, label) }
-                addView(
-                    LinearLayout(activity).apply {
-                        orientation = LinearLayout.VERTICAL
-                        addView(
-                            TextView(activity).apply {
-                                text = label
-                                setTextColor(Ui.TEXT)
-                                textSize = 15f
-                            },
-                        )
-                        addView(
-                            TextView(activity).apply {
-                                text = binding?.let { "已绑定 · ${steeringBindingSummary(it)}" } ?: "未学习"
-                                setTextColor(Ui.SUB)
-                                textSize = 12f
-                            },
-                        )
-                    },
-                    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
-                )
-                addView(smallOutlineButton(if (binding == null) "学习" else "重学") { beginSteeringListen(operation, label) })
-            }
-            body.addView(row)
-            if (index != steeringOpLabels.lastIndex) body.addView(divider(), block(bottom = dip(2)))
-        }
-        body.addView(
-            smallOutlineButton("清除全部已学配置") { confirmClearSteeringConfig(body) },
-            block(top = dip(14)),
-        )
-    }
-
-    private fun confirmClearSteeringConfig(body: LinearLayout) {
-        AlertDialog.Builder(activity)
-            .setTitle("清除已学配置")
-            .setMessage("将清除全部已学习的方控按键绑定，确定吗？")
-            .setNegativeButton("取消", null)
-            .setPositiveButton("清除") { _, _ ->
-                SteeringStore.clear(activity)
-                LiteSteeringKeys.reloadProfile(activity)
-                LiteLog.log("steering", "方控配置已清除（学习向导）")
-                toast("已清除")
-                renderSteeringHome(body)
-            }
-            .show()
-    }
-
-    /** 监听态：SteeringKeyMonitor 管线 + 本地 KeyEvent 两路并行抓取，先到先得。 */
-    private fun beginSteeringListen(operation: String, label: String) {
-        if (steeringWizardBody == null || steeringWizardDialog == null) return
-        steeringWizardState = "listening"
-        steeringWizardOperation = operation
-        val body = steeringWizardBody ?: return
-        body.removeAllViews()
-        body.addView(
-            TextView(activity).apply {
-                text = "监听中，请按方向盘上的按键…\n\n正在学习：【$label】\n25 秒内按下即可；也可按本机的媒体键/语音键学习。"
-                setTextColor(Ui.TEXT)
-                textSize = 14f
-            },
-            block(bottom = dip(12)),
-        )
-        body.addView(smallOutlineButton("取消") { renderSteeringHome(body) })
-        // 路径 b：本地 KeyEvent（MainActivity.onKeyDown 捕获 ACTION_DOWN）
-        steeringLocalKeyHook = { keyCode, action ->
-            if (action == KeyEvent.ACTION_DOWN) {
-                onSteeringCaptured(SteeringObservedKey(keyCode, action, "key_event"))
-            }
-        }
-        // 路径 a：车机按键管线（logcat/广播/MediaSession 观测，DiPlay- 自环 tag 已在管线内排除）
-        LiteSteeringKeys.startLearning(activity, steeringLearningOwner) { key ->
-            activity.runOnUiThread {
-                if (steeringWizardState != "listening" || steeringWizardDialog == null) return@runOnUiThread
-                if (key == null) {
-                    toast("学习超时，请重试")
-                    renderSteeringHome(body)
-                    return@runOnUiThread
-                }
-                onSteeringCaptured(key)
-            }
-        }
-    }
-
-    /** 捕获到按键（两路先到先得）；keyCode=0 是广播订阅提示不算按键。 */
-    private fun onSteeringCaptured(key: SteeringObservedKey) {
-        if (key.keyCode == 0) return
-        if (steeringWizardState != "listening") return
-        val body = steeringWizardBody ?: return
-        val operation = steeringWizardOperation
-        LiteSteeringKeys.stopLearning(steeringLearningOwner)
-        steeringLocalKeyHook = null
-        steeringWizardState = "success"
-        val candidate = SteeringBinding(
-            operation, key.keyCode, key.event, key.source,
-            key.logTag, key.broadcastAction, key.keyExtra, key.eventExtra, key.logContains,
-        )
-        val conflict = SteeringStore.loadEnabled(activity)?.bindings
-            ?.firstOrNull { it.inputId == candidate.inputId && it.operation != operation }
-        if (conflict != null) {
-            renderSteeringHome(body)
-            AlertDialog.Builder(activity)
-                .setTitle("按键冲突")
-                .setMessage("该按键已绑定到【${steeringLabelOf(conflict.operation)}】，覆盖吗？")
-                .setNegativeButton("取消") { _, _ -> beginSteeringListen(operation, steeringLabelOf(operation)) }
-                .setPositiveButton("覆盖") { _, _ ->
-                    applySteeringBinding(candidate, conflict.operation)
-                    showSteeringSuccess(operation)
-                }
-                .show()
-            return
-        }
-        applySteeringBinding(candidate, operation)
-        showSteeringSuccess(operation)
-    }
-
-    /** 落盘：替换同键位旧绑定（冲突覆盖时另删被冲突键位），JSON 结构与上游同构。 */
-    private fun applySteeringBinding(candidate: SteeringBinding, removeOperation: String) {
-        val kept = SteeringStore.loadEnabled(activity)?.bindings
-            ?.filter { it.operation != removeOperation && it.operation != candidate.operation }
-            .orEmpty()
-        val model = Build.MODEL.orEmpty().ifBlank { "unknown" }
-        try {
-            SteeringStore.save(
-                activity,
-                SteeringProfile(carModel = model, headUnitModel = model, bindings = kept + candidate),
-            )
-            LiteSteeringKeys.reloadProfile(activity)
-            LiteLog.log(
-                "steering",
-                "学习保存 op=${candidate.operation} key=${candidate.keyCode} event=${candidate.event} source=${candidate.source}",
-            )
-        } catch (error: Exception) {
-            toast("保存失败：${error.message}")
-        }
-    }
-
-    private fun showSteeringSuccess(operation: String) {
-        val body = steeringWizardBody ?: return
-        if (steeringWizardDialog == null) return
-        steeringWizardState = "success"
-        steeringWizardOperation = operation
-        val label = steeringLabelOf(operation)
-        body.removeAllViews()
-        body.addView(
-            TextView(activity).apply {
-                text = "学习成功：$label"
-                setTextColor(Ui.TEXT)
-                textSize = 16f
-                setTypeface(typeface, Typeface.BOLD)
-            },
-            block(bottom = dip(6)),
-        )
-        body.addView(
-            TextView(activity).apply {
-                text = "建议再按一次同一物理键验证能否命中；验证不通过也可重新学习或直接返回列表。"
-                setTextColor(Ui.SUB)
-                textSize = 12f
-            },
-            block(bottom = dip(12)),
-        )
-        body.addView(smallOutlineButton("再试一次验证") { beginSteeringVerify(operation) }, block(bottom = dip(8)))
-        body.addView(smallOutlineButton("返回列表") { renderSteeringHome(body) })
-    }
-
-    /** 验证态：再按一次同一物理键，回显命中结果。 */
-    private fun beginSteeringVerify(operation: String) {
-        if (steeringWizardBody == null || steeringWizardDialog == null) return
-        steeringWizardState = "verify"
-        steeringWizardOperation = operation
-        val body = steeringWizardBody ?: return
-        val label = steeringLabelOf(operation)
-        body.removeAllViews()
-        body.addView(
-            TextView(activity).apply {
-                text = "验证中：请再按一次【$label】对应的按键…\n（25 秒内）"
-                setTextColor(Ui.TEXT)
-                textSize = 14f
-            },
-            block(bottom = dip(12)),
-        )
-        body.addView(smallOutlineButton("取消") { showSteeringSuccess(operation) })
-        steeringLocalKeyHook = { keyCode, action ->
-            if (action == KeyEvent.ACTION_DOWN) onSteeringVerified(keyCode, "key_event")
-        }
-        LiteSteeringKeys.startLearning(activity, steeringLearningOwner) { key ->
-            activity.runOnUiThread {
-                if (steeringWizardState != "verify" || steeringWizardDialog == null) return@runOnUiThread
-                if (key == null) {
-                    toast("验证超时，请重试")
-                    showSteeringSuccess(operation)
-                    return@runOnUiThread
-                }
-                if (key.keyCode != 0) onSteeringVerified(key.keyCode, key.source)
-            }
-        }
-    }
-
-    private fun onSteeringVerified(keyCode: Int, source: String) {
-        if (steeringWizardState != "verify") return
-        val body = steeringWizardBody ?: return
-        val operation = steeringWizardOperation
-        LiteSteeringKeys.stopLearning(steeringLearningOwner)
-        steeringLocalKeyHook = null
-        steeringWizardState = "verify_result"
-        val label = steeringLabelOf(operation)
-        val binding = SteeringStore.loadEnabled(activity)?.bindings?.firstOrNull { it.operation == operation }
-        val hit = binding != null && binding.keyCode == keyCode
-        body.removeAllViews()
-        if (hit) {
-            LiteLog.log("steering", "学习验证通过 op=$operation key=$keyCode source=$source")
-            body.addView(
-                TextView(activity).apply {
-                    text = "验证通过：$label\n\n命中键值 $keyCode"
-                    setTextColor(Ui.TEXT)
-                    textSize = 15f
-                },
-                block(bottom = dip(12)),
-            )
-            body.addView(smallOutlineButton("完成") { steeringWizardDialog?.dismiss() }, block(bottom = dip(8)))
-            body.addView(smallOutlineButton("返回列表") { renderSteeringHome(body) })
-        } else {
-            body.addView(
-                TextView(activity).apply {
-                    text = "验证未命中：本次抓到键值 $keyCode，与已学的【$label】（键值 ${binding?.keyCode ?: "-"}）不一致。\n\n请确认按的是同一个物理键，或重新学习。"
-                    setTextColor(Ui.TEXT)
-                    textSize = 14f
-                },
-                block(bottom = dip(12)),
-            )
-            body.addView(smallOutlineButton("再试一次验证") { beginSteeringVerify(operation) }, block(bottom = dip(8)))
-            body.addView(smallOutlineButton("返回列表") { renderSteeringHome(body) })
         }
     }
 

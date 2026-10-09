@@ -320,6 +320,9 @@ private class VideoDecoder(
     private val referenceChain = VideoReferenceChain()
     // M6k：最近一次喂入的帧是不是随机访问帧（IDR）。解码失败时落盘，用于判读"是否从 P 帧续解"。
     @Volatile private var lastFrameKeyFrame = true
+    // 1.0.29（AC8227 倒车闪屏）：恢复看门狗计数——关键帧连发无渲染 = control 通道疑似死亡。
+    private var keyframeRequestsWithoutRender = 0
+    private var keyframeStallReported = false
     private var lastKeyFrameRequestNs = 0L
     // The main screen keeps the historical log format; other screens are labelled.
     private val stats = VideoStats(if (streamType == 110) "" else " stream=$streamType")
@@ -580,6 +583,9 @@ private class VideoDecoder(
                 try {
                     codec.setOutputSurface(surface)
                     Log.i(TAG, "video decoder output surface updated")
+                    // 1.0.29（AC8227 倒车闪屏）：surface 重新接线立即请求关键帧，
+                    // 不等首帧 P 帧被拒才触发 —— 缩短倒车结束后的黑屏恢复期。
+                    forceKeyFrameRequest("surface reattached")
                     return
                 } catch (error: Exception) {
                     Log.w(TAG, "video decoder output surface update failed; reconfiguring", error)
@@ -588,6 +594,17 @@ private class VideoDecoder(
         }
         releaseDecoder()
         lastConfig?.let(::configureDecoder)
+        if (decoder != null) forceKeyFrameRequest("surface reattached after reconfigure")
+    }
+
+    /**
+     * 1.0.29（AC8227 倒车闪屏）：绕过 1s 节流的关键帧请求——resume 是明确的新起点，
+     * 每次 surface 重接都应立即要 IDR，而不是沿用上一轮的节流窗口。
+     */
+    private fun forceKeyFrameRequest(reason: String) {
+        Log.i(TAG, "video keyframe requested early ($reason)")
+        lastKeyFrameRequestNs = System.nanoTime()
+        requestKeyFrame()
     }
 
     private fun feed(nalus: ByteArray) {
@@ -704,6 +721,17 @@ private class VideoDecoder(
         val now = System.nanoTime()
         if (lastKeyFrameRequestNs != 0L && now - lastKeyFrameRequestNs < 1_000_000_000L) return
         lastKeyFrameRequestNs = now
+        // 1.0.29（AC8227 倒车闪屏）：恢复看门狗——关键帧连发 3 次仍无渲染帧，
+        // 大概率不是解码问题而是 control 通道已死（forceKeyFrame 发不达）。
+        // 落一条诊断日志，供会话级恢复逻辑定位（AC8227 实测：发到第 8 秒才暴露 Socket closed）。
+        keyframeRequestsWithoutRender++
+        if (keyframeRequestsWithoutRender == KEYFRAME_STALL_REPORT_AFTER && !keyframeStallReported) {
+            keyframeStallReported = true
+            report(
+                "recovery stalled: keyframe requested $keyframeRequestsWithoutRender times " +
+                    "with no rendered frame; control channel may be dead",
+            )
+        }
         requestKeyFrame()
     }
 
@@ -718,6 +746,11 @@ private class VideoDecoder(
                     val render = outputSurface != null
                     codec.releaseOutputBuffer(index, render)
                     if (render) stats.onRendered()
+                    if (render) {
+                        // 1.0.29：恢复看门狗复位——有画面了，通道健康。
+                        keyframeRequestsWithoutRender = 0
+                        keyframeStallReported = false
+                    }
                     if (render && !renderedFrameLogged) {
                         renderedFrameLogged = true
                         report("first frame rendered")
@@ -788,6 +821,8 @@ private class VideoDecoder(
         const val INPUT_TIMEOUT_US = 10_000L
         // M6j：解码失败首次落盘时附带的堆栈帧数（够定位"是哪一步抛的"即可）。
         const val ERROR_STACK_FRAMES = 4
+        // 1.0.29：恢复看门狗阈值——关键帧请求达此次数仍无渲染帧，报通道疑似死亡（只报一次）。
+        const val KEYFRAME_STALL_REPORT_AFTER = 3
         // 可容忍的最大排队延迟：帧从到达到被解码超过它，就判为"积压"——丢队列 + 等关键帧。
         // M6b：250ms → 350ms。C8815 上解码偶发被抢占（processMaxUs 峰值 111ms/包），250ms 会被
         // 误判成积压而频繁 forceKeyFrame（每次触发画面冻结到关键帧到达，主观上更卡）；

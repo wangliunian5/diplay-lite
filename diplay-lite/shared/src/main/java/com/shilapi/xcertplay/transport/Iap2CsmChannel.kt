@@ -233,6 +233,10 @@ class Iap2CsmChannel private constructor(
         fun openWireless(underlying: BlockingDuplexByteStream): Iap2CsmChannel =
             Iap2CsmChannel(Iap2LinkChannel.openWireless(underlying))
 
+        /** [BT-PROBE] t3 蓝牙兼容实验：按 probeMode 轮换无线握手策略（0=现行 1=静默 2=主动）。 */
+        fun openWirelessProbe(underlying: BlockingDuplexByteStream, probeMode: Int): Iap2CsmChannel =
+            Iap2CsmChannel(Iap2LinkChannel.openWirelessProbe(underlying, probeMode))
+
         /** Opens the owned iAP2 link over an AirPlay type-130 tunnel. */
         fun openTunnel(underlying: BlockingDuplexByteStream): Iap2CsmChannel =
             Iap2CsmChannel(Iap2LinkChannel.openTunnel(underlying))

@@ -42,16 +42,29 @@ class RelayClientManager(
         val netId = attachNetwork(wifi)
         onDiagnostic("relay: enableNetwork id=$netId ssid='$ssid', waiting for DHCP")
         val deadline = System.currentTimeMillis() + timeoutMillis
+        // 1.0.29（at8317 排查）：DHCP 卡住时旧日志只有「waiting for DHCP」一条，分不清
+        // 「没关联上 AP」还是「关联了但没拿到 IP」；加一次性中间态日志区分两态，
+        // joined 日志补网关字段，便于和 iPhone 侧网段对账。
+        var loggedAssociated = false
         while (System.currentTimeMillis() < deadline) {
             if (closed) throw IOException("Relay client closed while connecting")
             val info = wifi.connectionInfo
-            if (isConnectedTo(info, ssid) && info?.ipAddress != 0) {
-                val dhcp = wifi.dhcpInfo
-                val hostAddress = dhcp?.let { intToInetAddress(it.ipAddress) }
-                if (hostAddress != null) {
-                    onDiagnostic("relay: joined ssid='$ssid' host=$hostAddress")
-                    verifyGatewayReachable(dhcp.gateway)
-                    return buildInfo(wifi, info, hostAddress)
+            if (isConnectedTo(info, ssid)) {
+                if (info?.ipAddress == 0) {
+                    // 已关联到 AP 但 DHCP 还没出地址：只报一次，避免刷屏。
+                    if (!loggedAssociated) {
+                        loggedAssociated = true
+                        onDiagnostic("relay: associated ssid='$ssid', waiting for IP address (DHCP)")
+                    }
+                } else {
+                    val dhcp = wifi.dhcpInfo
+                    val hostAddress = dhcp?.let { intToInetAddress(it.ipAddress) }
+                    if (dhcp != null && hostAddress != null) {
+                        val gw = intToInetAddress(dhcp.gateway)?.hostAddress ?: "none"
+                        onDiagnostic("relay: joined ssid='$ssid' host=$hostAddress gw=$gw")
+                        verifyGatewayReachable(dhcp.gateway)
+                        return buildInfo(wifi, info, hostAddress)
+                    }
                 }
             }
             try {
@@ -126,8 +139,10 @@ class RelayClientManager(
                 Thread.currentThread().interrupt()
             }
         }
+        // 1.0.29（at8317 排查）：InetAddress.toString() 带 '/' 前缀（弹窗显示成 /192.168.200.1），
+        // 会污染 localizeFailure 的 gateway 正则提取；改用 hostAddress 纯地址格式，英文原文照旧进日志。
         throw IOException(
-            "RELAY_UNREACHABLE: gateway $gatewayAddress did not answer; " +
+            "RELAY_UNREACHABLE: gateway ${gatewayAddress.hostAddress} did not answer; " +
                 "the relay router may block this device (AP isolation) or the iPhone is on another network",
         )
     }

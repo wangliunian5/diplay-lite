@@ -38,7 +38,7 @@ import kotlin.math.abs
  *
  * 结构（原版式）：page 字符串路由 + render() 整页重建，构建代码收敛为原版式辅助函数
  * （dip/label/button/card/column/row/space/matchButton/rounded）。M6k25 单 Activity 化：
- * page = "home" | "settings" | "caricon" | "hotspot-car" | "hotspot-relay"，原
+ * page = "home" | "settings" | "caricon" | "hotspot-car" | "hotspot-relay" | "steering"，原
  * SettingsActivity/CarIconActivity/HotspotConfigActivity 收编为同包页面对象
  * （SettingsPage/CarIconPage/HotspotPage），根除子 Activity 新窗口出生方向闪转问题。
  *
@@ -72,9 +72,14 @@ class MainActivity : Activity() {
     private var settingsPage: SettingsPage? = null
     private var carIconPage: CarIconPage? = null
     private var hotspotPage: HotspotPage? = null
+    private var steeringPage: SteeringPage? = null
 
     // 视图引用：render()/homePanel() 程序化构建并在其中完成全部监听挂接与引用赋值
     private lateinit var video: SurfaceView
+
+    // 1.0.29：分辨率设定=自动（拉伸）时，视频不做等比 letterbox，直接铺满容器。
+    // onCreate 初始化、onResume 刷新（设置页可能改过）。
+    private var videoStretchMode = false
     private lateinit var panel: View
     private lateinit var ballRoot: View
     private lateinit var statusDot: View
@@ -165,6 +170,7 @@ class MainActivity : Activity() {
         // M4l：车机屏绝不能休眠（API16 无 setOutputSurface，Surface 重建 = 解码器重配）。
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         applyOrientationMode(this, LiteConfig.load(this).orientationMode)
+        videoStretchMode = LiteConfig.load(this).resolutionMode == "stretch"
         render()
         // 1.0.16（方案四②）：开机自启拉起（BootReceiver 带 EXTRA_AUTOSTART）→ 等待弹窗。
         if (intent?.getBooleanExtra(EXTRA_AUTOSTART, false) == true) {
@@ -182,6 +188,8 @@ class MainActivity : Activity() {
         LiteLog.log("ui", "onResume")
         // M6k24：设置页可能改过横竖屏 —— 回主页立即按最新设置强制窗口方向。
         applyOrientationMode(this, LiteConfig.load(this).orientationMode)
+        // 1.0.29：设置页可能改过分辨率设定 —— 回主页刷新拉伸模式标志。
+        videoStretchMode = LiteConfig.load(this).resolutionMode == "stretch"
         handler.post(refreshTask)
         maybeAutoConnect()
     }
@@ -206,6 +214,18 @@ class MainActivity : Activity() {
      */
     private fun applyVideoFit(width: Int, height: Int) {
         val parent = video.parent as? android.view.ViewGroup ?: return
+        // 1.0.29：分辨率设定=自动（拉伸）时跳过等比 letterbox，恢复铺满容器。
+        if (videoStretchMode) {
+            val lp = video.layoutParams
+            if (lp.width == FrameLayout.LayoutParams.MATCH_PARENT &&
+                lp.height == FrameLayout.LayoutParams.MATCH_PARENT
+            ) return
+            lp.width = FrameLayout.LayoutParams.MATCH_PARENT
+            lp.height = FrameLayout.LayoutParams.MATCH_PARENT
+            video.layoutParams = lp
+            video.requestLayout()
+            return
+        }
         if (width <= 0 || height <= 0) {
             val lp = video.layoutParams
             if (lp.width == FrameLayout.LayoutParams.MATCH_PARENT &&
@@ -257,10 +277,12 @@ class MainActivity : Activity() {
             "settings" -> settingsPage?.cleanup()
             "caricon" -> carIconPage?.cleanup()
             "hotspot-car", "hotspot-relay" -> hotspotPage?.cleanup()
+            "steering" -> steeringPage?.cleanup()
         }
         settingsPage = null
         carIconPage = null
         hotspotPage = null
+        steeringPage = null
     }
 
     /**
@@ -280,14 +302,27 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 方向盘学习向导的本地 KeyEvent 捕获（原 SettingsActivity.onKeyDown）：
-     * 仅设置页且向导监听/验证态（钩子非空）时消费。
+     * 方向盘学习页的本地 KeyEvent 捕获（原 SettingsActivity.onKeyDown）：
+     * 仅学习页且监听态（钩子非空）时消费。
      */
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (page == "settings") {
-            settingsPage?.let { if (it.consumeKeyDown(keyCode, event)) return true }
+        if (page == "steering") {
+            steeringPage?.let { if (it.consumeKeyDown(keyCode, event)) return true }
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    /**
+     * 返回键：学习页 → 设置页（学习态下 cleanup 由 setPage 自动触发，等效取消学习）。
+     * 其余子页维持系统默认行为（finish 退出）不变。
+     */
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (page == "steering") {
+            setPage("settings")
+            return
+        }
+        super.onBackPressed()
     }
 
     /**
@@ -440,6 +475,12 @@ class MainActivity : Activity() {
             "hotspot-car", "hotspot-relay" -> {
                 val newPage = HotspotPage(this, page.removePrefix("hotspot-"))
                 hotspotPage = newPage
+                newPage.buildRoot()
+            }
+            "steering" -> {
+                // M6k26：方控学习页（原全屏 Dialog 在部分 ROM 内容区不渲染，改页面跳转）。
+                val newPage = SteeringPage(this)
+                steeringPage = newPage
                 newPage.buildRoot()
             }
             else -> homePanel()

@@ -30,6 +30,8 @@ class Iap2WirelessControlClient(
         onIncoming: (Iap2Frame) -> Unit = {},
         onProgress: (String) -> Unit = {},
         phoneOnAirPlay: () -> Boolean = { false },
+        // [RELAY-TEST] 1.0.28-中继test 实验参数：(假SSID, 随机密码)。null = 实验关闭。
+        relayTestFakeCredential: Pair<String, String>? = null,
     ): Iap2WirelessControlResult {
         require(identification.wireless != null) {
             "Wireless control requires an Iap2IdentificationConfig with wireless transport"
@@ -79,6 +81,18 @@ class Iap2WirelessControlClient(
         // 用户只能手动断链重连来"再发一次"。这里在 iPhone 接入前周期性重发凭据 + 启动会话。
         var nextCredentialResendNanos: Long? = null
         var credentialResendsSent = 0
+        // 1.0.29（AC8227 倒车闪屏，移植上游 #229 FirstTcpWatchdog 精神）：
+        // 稳态下（onReady 后 deadline=∞）控制环 recv(∞) 阻塞，若 iPhone 端会话死亡
+        // （倒车 teardown / 离网后不再回来）而 RFCOMM 仍活着，这里会永远挂住、永不收敛。
+        // 看门狗：曾有 AirPlay TCP 连接 → 断流超过 WATCHDOG 时长 → 返回 AIRPLAY_STALLED，
+        // 让上层走整代重启（scheduleWirelessRetry），而不是用户手点重连。
+        var everOnAirPlay = false
+        var airPlayLostAtNanos: Long? = null
+        // [RELAY-TEST] 实验状态机：0=阶段1(真凭证重发60s) 1=待发假凭证 2=假凭证已发待恢复 3=已恢复真凭证 -1=实验取消/关闭。
+        // 实验链：时序倒挂（iPhone 先连中继 AP）时 iOS 不产生 join 事件、状态机死锁 →
+        // 阶段1 重发用尽后发假凭证（真实存在 SSID+随机密码）诱导 iPhone 切出当前 AP →
+        // 10s 后恢复真凭证，使「真凭证落在 iPhone 离网窗口内」，回连即产生 join 事件。
+        var relayTestPhase = if (relayTestFakeCredential != null) 0 else -1
         while (true) {
                 val remaining = remainingMillis(deadlineNanos)
                 if (remaining == 0L) {
@@ -101,9 +115,37 @@ class Iap2WirelessControlClient(
                     locationActive -> min(remaining, LOCATION_POLL_INTERVAL_MILLIS)
                     nextCredentialResendNanos != null ->
                         min(remaining, CREDENTIAL_RESEND_POLL_MILLIS)
-                    else -> remaining
+                    // 1.0.29：稳态下也周期醒来检查 AirPlay 连接存在性（看门狗），不再 recv(∞)。
+                    else -> min(remaining, AIRPLAY_PRESENCE_POLL_MILLIS)
                 }
                 val incoming = session.recv(pollTimeout)
+                // 1.0.29：AirPlay 断流看门狗——每轮迭代都检查（含有消息的迭代），
+                // 仅在会话曾激活后生效：AirPlay TCP 断流超过 WATCHDOG 即判停滞。
+                val onAirPlayNow = phoneOnAirPlay()
+                if (onAirPlayNow) {
+                    everOnAirPlay = true
+                    airPlayLostAtNanos = null
+                } else if (everOnAirPlay) {
+                    val lostAt = airPlayLostAtNanos
+                        ?: System.nanoTime().also { airPlayLostAtNanos = it }
+                    val stalledMs = (System.nanoTime() - lostAt) / 1_000_000L
+                    if (stalledMs >= AIRPLAY_STALL_WATCHDOG_MILLIS) {
+                        onProgress(
+                            "iap2 watchdog: AirPlay TCP absent for ${stalledMs}ms " +
+                                "after an active session; declaring wireless stall",
+                        )
+                        return Iap2WirelessControlResult(
+                            Iap2WirelessControlTerminal.AIRPLAY_STALLED,
+                            stage,
+                            forwardedFrames,
+                            wifiConfigurationsSent,
+                            carPlayStartSessionsSent,
+                            transportNotificationSeen,
+                            postTransportWiFiConfigurationsSent,
+                            wirelessCarPlayAvailableSeen,
+                        )
+                    }
+                }
                 if (incoming == null) {
                     if (session.isClosed) {
                         return Iap2WirelessControlResult(
@@ -130,6 +172,50 @@ class Iap2WirelessControlClient(
                         )
                     }
                     val resendAt = nextCredentialResendNanos
+                    // [RELAY-TEST] 诱导切出实验分支（只在 phase 1/2 生效，优先于普通重发判定）：
+                    // phase1 到点 → 只发假 0x5703（不带 0x4301，避免真假参数混发）；
+                    // phase2 到点 → 恢复真 0x5703+0x4301，重开一轮普通重发窗口。
+                    if (
+                        (relayTestPhase == 1 || relayTestPhase == 2) &&
+                        resendAt != null &&
+                        System.nanoTime() >= resendAt &&
+                        !phoneOnAirPlay()
+                    ) {
+                        if (relayTestPhase == 1) {
+                            val fake = relayTestFakeCredential!!
+                            val fakeEndpoint = Iap2WirelessCarPlayEndpoint(
+                                ssid = fake.first,
+                                passphrase = fake.second,
+                                channel = 1,
+                                security = Iap2WirelessSecurity.WPA_WPA2,
+                                ipAddresses = endpoint.ipAddresses,
+                                airPlayPort = endpoint.airPlayPort,
+                                deviceIdentifier = endpoint.deviceIdentifier,
+                                publicKey = endpoint.publicKey,
+                                sourceVersion = endpoint.sourceVersion,
+                            )
+                            send(accessoryWiFiConfiguration(fakeEndpoint), deadlineNanos)
+                            relayTestPhase = 2
+                            nextCredentialResendNanos =
+                                System.nanoTime() + RELAY_TEST_RESTORE_DELAY_NANOS
+                            onProgress(
+                                "[RELAY-TEST] phase2 fake 0x5703 sent ssid=${fake.first} " +
+                                    "(expect iPhone to leave current AP)",
+                            )
+                        } else {
+                            send(accessoryWiFiConfiguration(endpoint), deadlineNanos)
+                            send(carPlayStartSession(endpoint), deadlineNanos)
+                            relayTestPhase = 3
+                            credentialResendsSent = 0
+                            nextCredentialResendNanos =
+                                System.nanoTime() + CREDENTIAL_RESEND_INTERVAL_NANOS
+                            onProgress(
+                                "[RELAY-TEST] phase3 true credential restored; " +
+                                    "normal resend window restarted",
+                            )
+                        }
+                        continue
+                    }
                     // M6k24 凭证重发闸门（A 方案）：iPhone 只要已经发起过任何 AirPlay TCP 连接，
                     // 就绝不再重发 0x5703/0x4301 —— 8815 实测（11:52 日志）：会话已建到 SETUP
                     // （cseq=6）后 100ms 又收到重发，iPhone 随即弃连。重发只服务于
@@ -147,7 +233,14 @@ class Iap2WirelessControlClient(
                         credentialResendsSent++
                         nextCredentialResendNanos =
                             if (credentialResendsSent >= MAX_CREDENTIAL_RESENDS) {
-                                null
+                                if (relayTestPhase == 0) {
+                                    // [RELAY-TEST] 阶段1 真凭证重发用尽且 iPhone 未上 AirPlay：
+                                    // 2s 后进入 phase1（假凭证诱导），保持 1s 轮询节奏
+                                    relayTestPhase = 1
+                                    System.nanoTime() + RELAY_TEST_PHASE2_DELAY_NANOS
+                                } else {
+                                    null
+                                }
                             } else {
                                 System.nanoTime() + CREDENTIAL_RESEND_INTERVAL_NANOS
                             }
@@ -161,6 +254,11 @@ class Iap2WirelessControlClient(
 
                 when (incoming.messageId) {
                     REQUEST_ACCESSORY_WIFI_CONFIGURATION -> {
+                        // [RELAY-TEST] iPhone 侧状态机动了 → 取消诱导实验，走正常流程
+                        if (relayTestPhase in 1..2) {
+                            relayTestPhase = -1
+                            onProgress("[RELAY-TEST] cancelled: iPhone sent 0x5702")
+                        }
                         onProgress("iap2 rx=0x5702 request-wifi-configuration")
                         val postTransport = transportNotificationSeen
                         val sentCount = if (postTransport) {
@@ -198,6 +296,11 @@ class Iap2WirelessControlClient(
                     }
 
                     CARPLAY_AVAILABILITY -> {
+                        // [RELAY-TEST] iPhone 侧状态机动了 → 取消诱导实验，走正常流程
+                        if (relayTestPhase in 1..2) {
+                            relayTestPhase = -1
+                            onProgress("[RELAY-TEST] cancelled: iPhone sent 0x4300")
+                        }
                         onProgress("iap2 rx=0x4300 carplay-availability")
                         send(carPlayStartSession(endpoint), deadlineNanos)
                         stage = later(stage, Iap2WirelessControlStage.CARPLAY_START_SENT)
@@ -217,6 +320,11 @@ class Iap2WirelessControlClient(
                     }
 
                     DEVICE_TRANSPORT_IDENTIFIER_NOTIFICATION -> {
+                        // [RELAY-TEST] iPhone 侧状态机动了 → 取消诱导实验，走正常流程
+                        if (relayTestPhase in 1..2) {
+                            relayTestPhase = -1
+                            onProgress("[RELAY-TEST] cancelled: iPhone sent 0x4E0E")
+                        }
                         transportNotificationSeen = true
                         val identifiers = Iap2WirelessMessages.deviceTransportIdentifier(incoming)
                         stage = later(stage, Iap2WirelessControlStage.TRANSPORT_NOTIFIED)
@@ -316,8 +424,16 @@ class Iap2WirelessControlClient(
         /** iPhone 未入网时重发凭据的间隔与上限（12 × 5s ≈ 1 分钟）。 */
         private const val CREDENTIAL_RESEND_INTERVAL_MILLIS = 5_000L
         private const val CREDENTIAL_RESEND_INTERVAL_NANOS = 5_000L * 1_000_000L
+        // 1.0.29：AirPlay 断流看门狗——稳态轮询间隔与停滞判定阈值。
+        // 30s 的取值：足够容忍 iPhone 短暂断网重连（正常 <5s），又不至于让黑屏挂太久。
+        private const val AIRPLAY_PRESENCE_POLL_MILLIS = 5_000L
+        private const val AIRPLAY_STALL_WATCHDOG_MILLIS = 30_000L
         private const val CREDENTIAL_RESEND_POLL_MILLIS = 1_000L
         private const val MAX_CREDENTIAL_RESENDS = 12
+        /** [RELAY-TEST] 1.0.28-中继test 实验总开关（CarPlayController 侧据此决定是否扫描选假 SSID）。正式包必须为 false。 */
+        const val RELAY_TEST_ENABLED = false
+        private const val RELAY_TEST_PHASE2_DELAY_NANOS = 2_000L * 1_000_000L
+        private const val RELAY_TEST_RESTORE_DELAY_NANOS = 10_000L * 1_000_000L
         const val NO_TIMEOUT_MILLIS = Long.MAX_VALUE
         private const val DEFAULT_TIMEOUT_MILLIS = 60_000L
         private const val MAX_TIMEOUT_MILLIS = 24 * 60 * 60 * 1_000L
@@ -447,7 +563,7 @@ enum class Iap2WirelessControlStage {
     POST_TRANSPORT_WIFI_CONFIG_SENT,
 }
 
-enum class Iap2WirelessControlTerminal { CHANNEL_CLOSED, TIMED_OUT }
+enum class Iap2WirelessControlTerminal { CHANNEL_CLOSED, TIMED_OUT, AIRPLAY_STALLED }
 
 /** End state of the control loop only; it is not evidence of a live Wi-Fi or AirPlay session. */
 data class Iap2WirelessControlResult(

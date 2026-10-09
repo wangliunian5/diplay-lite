@@ -33,7 +33,8 @@ internal data class SteeringBinding(
         .joinToString("\u0000") + "\u0000" + logContains.sorted().joinToString("\u0000")
 
     companion object {
-        val operations = listOf("play_pause", "next", "previous", "siri")
+        // 1.0.29：音量+/- 走本地 AudioManager（车机媒体音量流），不经 CarPlay 协议。
+        val operations = listOf("volume_up", "volume_down", "play_pause", "previous", "next", "siri")
 
         fun fromJson(json: JSONObject) = SteeringBinding(
             json.getString("operation"), json.getInt("keyCode"), json.getInt("event"),

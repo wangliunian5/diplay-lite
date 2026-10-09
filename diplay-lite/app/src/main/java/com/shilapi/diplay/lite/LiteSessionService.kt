@@ -191,7 +191,8 @@ class LiteSessionService : Service() {
         val btMac = localBluetoothAddress() ?: deviceId
         // M6b：/info 的 maxFPS 与分辨率都由 LiteConfig 控制（弱机省算力）。
         // fps 30/60 二选一；分辨率 = 车机屏 × 百分比（长宽等比、各自取偶）。
-        val full = screenMetrics()
+        // 1.0.29：分辨率设定=手动指定时，基准值改用用户填的宽×高（强制竖屏时交换横纵）。
+        val full = if (config.resolutionMode == "manual") manualMetrics(config) else screenMetrics()
         val fps = if (config.limit30Fps) AirPlayDisplaySettings.MIN_FPS else AirPlayDisplaySettings.DEFAULT_FPS
         val size = scaleDisplay(full, config.videoScalePercent)
         LiteLog.log(
@@ -431,6 +432,11 @@ class LiteSessionService : Service() {
                 "无法切换 iPhone USB 配置：请拔插数据线或重启 iPhone 后重试"
             "could not claim usbmux" in m ->
                 "USB 控制通道被占用：请拔插数据线后重试，若反复出现请重启车机"
+            // 1.0.29（at8317 排查）：4.2.2 白牌 ROM 内核 cdc_ncm 驱动在枚举时抢占 iPhone NCM
+            // 网卡接口，用户态 force claim 无法收回（usbmux 接口正常、仅 NCM 失败可确证），
+            // 该类车机有线结构性不可用——给明确改道指引，原文完整保留在日志。
+            "could not claim the ncm" in m ->
+                "车机系统占用了iPhone的网络接口，有线模式在此车机不可用：请改用无线中继连接"
             // 1.0.20（3e EMUI）：图库抢 USB——弹出「USB 连接方式/相册」时选仅充电，回本应用授权。
             "permission has not been granted" in m || "permission was not granted" in m ->
                 "iPhone USB 授权未生效：请弹出「USB 连接方式/相册」选择时勿选传输照片，回本应用点允许后重试"
@@ -658,12 +664,25 @@ class LiteSessionService : Service() {
     }
 
     /**
+     * 1.0.29：手动分辨率模式下的基准值 —— 用户填的横×纵按「横竖屏切换」排布
+     * （强制竖屏 = 短边为宽；强制横屏 = 长边为宽），与 screenMetrics 的方向语义一致。
+     */
+    private fun manualMetrics(config: LiteConfig): Pair<Int, Int> {
+        val longSide = maxOf(config.manualWidth, config.manualHeight)
+        val shortSide = minOf(config.manualWidth, config.manualHeight)
+        return if (config.orientationMode == "portrait") shortSide to longSide else longSide to shortSide
+    }
+
+    /**
      * M6b：把 /info 声明的显示分辨率按百分比缩小（M6k 起 10~100，100 = 原样返回）。
      * 长宽同比例缩小、各自取偶（H.264 要求偶数）；渲染仍铺满物理屏，故不会出现黑边。
      */
     private fun scaleDisplay(full: Pair<Int, Int>, percent: Int): Pair<Int, Int> {
         val value = percent.coerceIn(LiteConfig.MIN_SCALE_PERCENT, LiteConfig.MAX_SCALE_PERCENT)
-        if (value >= LiteConfig.MAX_SCALE_PERCENT) return full
+        if (value >= LiteConfig.MAX_SCALE_PERCENT) {
+            // 1.0.29：手动值可能是奇数，即使 150% 不缩放也强制取偶（H.264 要求）。
+            return scaleEven(full.first, 100) to scaleEven(full.second, 100)
+        }
         return scaleEven(full.first, value) to scaleEven(full.second, value)
     }
 

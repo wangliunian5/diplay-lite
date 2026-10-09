@@ -20,6 +20,7 @@ class Iap2LinkChannel private constructor(
     private val underlying: BlockingDuplexByteStream,
     private val linkConfig: Iap2LinkConfig,
     private val initiateNegotiation: Boolean,
+    private val sendMarkerOnStart: Boolean = true,
 ) : Closeable {
     private data class Command(val control: ByteArray)
 
@@ -167,8 +168,12 @@ class Iap2LinkChannel private constructor(
         val engine = Iap2LinkEngine(linkConfig)
         try {
             workerStartNanos = System.nanoTime()
-            noteLink("start initiator=$initiateNegotiation")
-            engine.start(wiredInitiator = initiateNegotiation, nowMillis = nowMillis())
+            noteLink("start initiator=$initiateNegotiation marker=$sendMarkerOnStart")
+            engine.start(
+                wiredInitiator = initiateNegotiation,
+                nowMillis = nowMillis(),
+                sendMarker = sendMarkerOnStart,
+            )
             while (!isClosing()) {
                 drainCommands(engine)
                 engine.advanceTime(nowMillis())
@@ -401,6 +406,24 @@ class Iap2LinkChannel private constructor(
         fun openWireless(underlying: BlockingDuplexByteStream): Iap2LinkChannel =
             Iap2LinkChannel(underlying, WIRELESS_LINK_CONFIG, initiateNegotiation = false)
                 .also { it.worker.start() }
+
+        /**
+         * [BT-PROBE] t3 蓝牙兼容实验：按 probeMode 轮换握手策略。
+         * mode 0 = 现行（发 Marker 并周期重发，等 iPhone 回 Marker 后协商）
+         * mode 1 = 静默等待（不发 Marker，纯等 iPhone 先发 Marker）
+         * mode 2 = 主动协商（发 Marker 后立即发 Sync，同 USB 有线时序）
+         */
+        fun openWirelessProbe(underlying: BlockingDuplexByteStream, probeMode: Int): Iap2LinkChannel =
+            when (probeMode) {
+                1 -> Iap2LinkChannel(
+                    underlying,
+                    WIRELESS_LINK_CONFIG,
+                    initiateNegotiation = false,
+                    sendMarkerOnStart = false,
+                )
+                2 -> Iap2LinkChannel(underlying, WIRELESS_LINK_CONFIG, initiateNegotiation = true)
+                else -> Iap2LinkChannel(underlying, WIRELESS_LINK_CONFIG, initiateNegotiation = false)
+            }.also { it.worker.start() }
 
         /**
          * Opens the iAP2 link carried by an AirPlay type-130 tunnel. The accessory initiates

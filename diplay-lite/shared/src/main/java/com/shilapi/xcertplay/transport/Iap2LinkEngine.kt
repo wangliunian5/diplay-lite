@@ -164,11 +164,13 @@ class Iap2LinkEngine(
     ).minOrNull()
 
     /** Starts a link attempt. Wired CarKit uses [wiredInitiator] = true. */
-    fun start(wiredInitiator: Boolean, nowMillis: Long) {
+    fun start(wiredInitiator: Boolean, nowMillis: Long, sendMarker: Boolean = true) {
         if (state != State.IDLE) return
         state = State.DETECTING
-        if (!appendOutput(IAP2_MARKER)) return
-        markerDeadlineMillis = nowMillis + MARKER_RESEND_MILLIS
+        if (sendMarker) {
+            if (!appendOutput(IAP2_MARKER)) return
+            markerDeadlineMillis = nowMillis + MARKER_RESEND_MILLIS
+        }
         if (wiredInitiator && state != State.DEAD) enterNegotiating(nowMillis)
     }
 
