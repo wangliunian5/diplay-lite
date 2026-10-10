@@ -143,7 +143,7 @@ class CarIconPage(private val activity: MainActivity) {
             setSingleLine(true)
             textSize = 15f
             setTextColor(Ui.TEXT)
-            hint = "DiPlay"
+            hint = "BEI JING"
             background = Ui.pillOutline(activity, Ui.OUTLINE)
             setPadding(Ui.dip(activity, 14), Ui.dip(activity, 10), Ui.dip(activity, 14), Ui.dip(activity, 10))
         }
@@ -151,7 +151,7 @@ class CarIconPage(private val activity: MainActivity) {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
         ))
         column.addView(outlineButton("保存名称") {
-            val name = nameInput.text.toString().trim().ifBlank { "DiPlay" }
+            val name = nameInput.text.toString().trim().ifBlank { "BEI JING" }
             val cfg = LiteConfig.load(activity)
             LiteConfig.save(activity, cfg.copy(carIconName = name))
             nameInput.setText(name)

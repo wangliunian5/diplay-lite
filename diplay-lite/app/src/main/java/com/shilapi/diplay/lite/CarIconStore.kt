@@ -87,16 +87,38 @@ object CarIconStore {
 
     /**
      * 会话接线：读取已保存图标 → AirPlayIcon（统一 256×256）。
-     * 文件缺失/签名不合法时返回 null，AirPlayConfig.icons 保持空列表 → /info 走内置默认。
+     * 文件缺失/签名不合法时回落内置 BEIJING 车标（1.1.1，用户指定默认图标+名 BEI JING），
+     * 保证 iPhone CarPlay 桌面始终有 OEM 图标。
      */
     fun loadIcon(context: Context): AirPlayIcon? {
         val f = file(context)
-        if (!f.isFile) return null
-        return try {
-            val bytes = f.readBytes()
-            if (!isPng(bytes)) null else AirPlayIcon(widthPixels = SIZE, heightPixels = SIZE, data = bytes)
-        } catch (_: Exception) {
-            null
+        if (f.isFile) {
+            try {
+                val bytes = f.readBytes()
+                if (isPng(bytes)) {
+                    return AirPlayIcon(widthPixels = SIZE, heightPixels = SIZE, data = bytes)
+                }
+            } catch (_: Exception) {
+                // 落到内置回落
+            }
         }
+        return builtinIcon(context)
     }
+
+    /** 内置默认：res/drawable-nodpi/car_icon_beijing.png（256×256，随包编译）。 */
+    private fun builtinIcon(context: Context): AirPlayIcon? = try {
+        val res = context.resources
+        val id = res.getIdentifier("car_icon_beijing", "drawable", context.packageName)
+        if (id == 0) {
+            null
+        } else {
+            val bytes = readResBytes(res, id)
+            if (isPng(bytes)) AirPlayIcon(widthPixels = SIZE, heightPixels = SIZE, data = bytes) else null
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun readResBytes(res: android.content.res.Resources, id: Int): ByteArray =
+        res.openRawResource(id).use { it.readBytes() }
 }

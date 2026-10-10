@@ -65,8 +65,9 @@ data class LiteConfig(
     val relayIpv6Channel: Int = 0,
     val relayIpv4Channel: Int = 0,
     // 1.0.17：CarPlay 显示名称（/info name + Bonjour 服务名）。自定义返回图标页可改，
-    // 选厂家预置图标时自动替换为厂家名；空串回落 "DiPlay"。
-    val carIconName: String = "DiPlay",
+    // 选厂家预置图标时自动替换为厂家名；空串回落默认。
+    // 1.1.1：默认改 "BEI JING"（用户指定，配合内置 BEIJING 车标图标）。
+    val carIconName: String = "BEI JING",
 ) {
     companion object {
         private const val PREFS = "diplay_lite"
@@ -149,7 +150,7 @@ data class LiteConfig(
                 carIpv4Channel = prefs.getInt("car_ipv4_channel", 0),
                 relayIpv6Channel = prefs.getInt("relay_ipv6_channel", 0),
                 relayIpv4Channel = prefs.getInt("relay_ipv4_channel", 0),
-                carIconName = prefs.getString("car_icon_name", "DiPlay").orEmpty().ifBlank { "DiPlay" },
+                carIconName = prefs.getString("car_icon_name", "BEI JING").orEmpty().ifBlank { "BEI JING" },
             )
         }
 
