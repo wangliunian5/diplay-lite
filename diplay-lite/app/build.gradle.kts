@@ -11,12 +11,13 @@ android {
         applicationId = "com.shilapi.diplay.lite"
         minSdk = 16
         targetSdk = 19
-        versionCode = 44
+        versionCode = 45
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
         // 版本迭代规则（1.0.x 起）：每次出包 patch +1（1.0.1、1.0.2…）。
         // 1.0.29：中继时序倒挂 UI 引导 + 热稳定窗三信道日志 + mic INPUT 密钥修复 +
-        // 音乐缓存 Toast/说明 + wired 建立期看门狗 + 楔死长退避。
+        // 音乐缓存 Toast/说明 + wired 建立期看门狗 + 楔死长退避 +
+        // 方控学习页 v3 + 系统诊断包 + AC8227 闪屏修复（恢复提速 + AirPlay 断流看门狗）。
         versionName = "1.0.29"
     }
 
@@ -46,10 +47,10 @@ android {
 
     buildTypes {
         release {
-            // 正式包：混淆 + 资源压缩开启（1.0.28-中继test 实验包曾临时关闭）。
-            // [BT-PROBE] t3 蓝牙兼容实验包：临时关闭混淆，排查完恢复 true。
-            isMinifyEnabled = false
-            isShrinkResources = false
+            // 正式包：混淆 + 资源压缩开启（1.0.28-中继test 实验包曾临时关闭；
+            // [BT-PROBE] 临时关闭已随 1.0.29 正式包恢复）。
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
