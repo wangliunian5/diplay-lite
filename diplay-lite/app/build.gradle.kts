@@ -11,11 +11,12 @@ android {
         applicationId = "com.shilapi.diplay.lite"
         minSdk = 16
         targetSdk = 19
-        versionCode = 47
+        versionCode = 48
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
         // 版本迭代规则：1.0.x 系列止于 1.0.29，自 1.1.x 重新起排（每次出包 patch +1）。
-        // 1.1.1：麦克风上行初始化兜底矩阵（EU5 实测 HAL 拒开协商参数导致 Siri/通话收音全无）。
+        // 1.1.1：麦克风上行初始化兜底矩阵（EU5 实测 HAL 拒开协商参数导致 Siri/通话收音全无）+
+        // 厂家预置图标新增 BEIJING 车标（仅预置可选，非默认）。
         versionName = "1.1.1"
     }
 

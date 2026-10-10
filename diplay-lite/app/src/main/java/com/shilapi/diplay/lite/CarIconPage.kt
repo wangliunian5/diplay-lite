@@ -143,7 +143,7 @@ class CarIconPage(private val activity: MainActivity) {
             setSingleLine(true)
             textSize = 15f
             setTextColor(Ui.TEXT)
-            hint = "BEI JING"
+            hint = "DiPlay"
             background = Ui.pillOutline(activity, Ui.OUTLINE)
             setPadding(Ui.dip(activity, 14), Ui.dip(activity, 10), Ui.dip(activity, 14), Ui.dip(activity, 10))
         }
@@ -151,7 +151,7 @@ class CarIconPage(private val activity: MainActivity) {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
         ))
         column.addView(outlineButton("保存名称") {
-            val name = nameInput.text.toString().trim().ifBlank { "BEI JING" }
+            val name = nameInput.text.toString().trim().ifBlank { "DiPlay" }
             val cfg = LiteConfig.load(activity)
             LiteConfig.save(activity, cfg.copy(carIconName = name))
             nameInput.setText(name)
@@ -170,7 +170,9 @@ class CarIconPage(private val activity: MainActivity) {
         })
         val brandRow = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
         // 1.0.17：预置图标与厂家名成对 —— 选中即替换显示名称（原缺陷：只换图不换名）。
+        // 1.1.1：新增 BEIJING 车标（北汽 EU5 用户请求，仅预置可选，非默认）。
         val brands = listOf(
+            R.raw.logo_beijing to "BEI JING",
             R.raw.logo_bmw to "BMW",
             R.raw.logo_byd to "BYD",
             R.raw.logo_ford to "Ford",
