@@ -249,6 +249,12 @@ class CarPlayController(
     // 流中看门狗因 armed 判据要 NCM 帧率而接不住）。
     @Volatile private var wiredEstablishWatchdogFired = false
     @Volatile private var wiredControlReturned = true
+    // 1.0.29（EU5 C40DB 094001 修复）：看门狗解除信号——RTSP 会话激活或首帧渲染即视为
+    // CarPlay 已真正开始，撤销建立期看门狗。此前唯一解除条件是控制环退出（wiredControlReturned
+    // 只在 runWiredStack finally 置位），控制环 NO_TIMEOUT 常驻 → 健康会话也会在 0x4301+8s
+    // 被看门狗误杀（EU5 实测每轮均 +8.0s 精确触发，RTSP/首帧已正常），拆完 iPhone 停留
+    // config 6 不再重枚举 → 死循环。
+    @Volatile private var wiredStreamSeen = false
 
     // M6k23：未建流阶段（无 SETUP/未激活）控制流 peer EOF 连续计数。8815 实测：
     // pair-verify 通过、加密开启后 iPhone 立即 EOF，每 ~5s 重连 TCP 循环、gen 恒定，
@@ -1169,6 +1175,20 @@ class CarPlayController(
             override fun onVideoFrameRendered(session: AirPlaySession) {
                 if (isStaleWirelessRun(generation) || activeSession !== session) return
                 wirelessConnectionProof.rendered(generation, session)
+            }
+        }
+
+    /** 1.0.29（EU5 修复）：wired 建立期看门狗的解除信号——RTSP 激活或首帧渲染即撤销看门狗。 */
+    private fun wiredSessionListener(): AirPlaySessionListener =
+        object : AirPlaySessionListener by sessionListener {
+            override fun onSessionActive(session: AirPlaySession) {
+                wiredStreamSeen = true
+                sessionListener.onSessionActive(session)
+            }
+
+            override fun onVideoFrameRendered(session: AirPlaySession) {
+                wiredStreamSeen = true
+                sessionListener.onVideoFrameRendered(session)
             }
         }
 
@@ -2190,8 +2210,9 @@ class CarPlayController(
     private fun armWiredEstablishWatchdog() {
         wiredControlReturned = false
         wiredEstablishWatchdogFired = false
+        wiredStreamSeen = false
         mainHandler.postDelayed({
-            if (closed || wiredControlReturned) return@postDelayed
+            if (closed || wiredControlReturned || wiredStreamSeen) return@postDelayed
             wiredEstablishWatchdogFired = true
             debugLog(
                 "wired establish watchdog: no stream frame within " +
@@ -2375,7 +2396,7 @@ class CarPlayController(
             identity = identity,
             pairings = pairings,
             mfi = mfiSession?.client,
-            listener = sessionListener,
+            listener = wiredSessionListener(),
             media = media,
         )) {
             AirPlayTcpServer.AttachResult.Started -> airPlayServer = server
