@@ -20,6 +20,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
 
 /**
  * Captures one PCM microphone stream and sends it back to the phone as sealed CarPlay RTP.
@@ -42,6 +43,15 @@ internal class MicrophoneUplink(
     private var echoCanceler: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
     private var thread: Thread? = null
+    // 1.1.1（EU5 C40DB 104759 修复）：录音初始化兜底矩阵的胜出参数与转换状态。
+    // EU5 实测：HAL audio_policy.conf 声明 24k/mono 可用，但 phone 协商的 24k+源6/1
+    // 全部 STATE_UNINITIALIZED（PATEO HAL 疑似拒开或输入被自家语音服务占用）。
+    // 策略：源×采样率×声道全矩阵试开，胜出参数≠协商参数时走线性重采样/声道变换，
+    // 编码器与 RTP 打包仍按协商参数走，对正常车机零行为变化。
+    private var nativeRate = 0
+    private var nativeChannels = 0
+    private var resamplePos = 0.0
+    private var resampleTail = ShortArray(0)
 
     /** Reports a start failure into the diagnostic log so field reports show why calls went silent. */
     private fun fail(message: String): Boolean {
@@ -53,20 +63,6 @@ internal class MicrophoneUplink(
 
     fun start(): Boolean {
         if (!running.compareAndSet(false, true)) return true
-
-        val channelMask = if (config.channels >= 2) {
-            AndroidAudioFormat.CHANNEL_IN_STEREO
-        } else {
-            AndroidAudioFormat.CHANNEL_IN_MONO
-        }
-        val minBuffer = AudioRecord.getMinBufferSize(
-            config.sampleRate,
-            channelMask,
-            AndroidAudioFormat.ENCODING_PCM_16BIT,
-        )
-        if (minBuffer <= 0) {
-            return fail("microphone unavailable rate=${config.sampleRate} channels=${config.channels}")
-        }
 
         // 上行编码器选择：**MediaCodec 优先、libopus 兜底**（API 29+ 行为零变化）。
         // 本分支（API16）没有 MediaCodec OPUS 编码器，改由内置 libopus 软件编码 ——
@@ -95,44 +91,29 @@ internal class MicrophoneUplink(
                     "(MediaCodec absent, libopus probe failed)",
             )
         }
-        val bufferSize = maxOf(minBuffer * 2, config.frameBytes * 4)
         // AudioRecord.Builder()/AudioFormat.Builder() are API 23+; on Android 5.x they throw
         // NoSuchMethodError (an Error the catch below cannot intercept) and crash the app.
         // The plain constructor works from API 21: bad parameters only throw from API 23,
         // earlier builds land in the state check below as STATE_UNINITIALIZED.
-        //
         // API16 适配（T36 实测）：`AudioSource.VOICE_COMMUNICATION`(7) 在 Android 4.1 上
         // AudioRecord 直接 `STATE_UNINITIALIZED`（该源要求音频模式为 MODE_IN_COMMUNICATION，
         // 4.x 的 HAL 在 MODE_NORMAL 下不给）—— 现象就是编码器已就绪却仍报
-        // `recorder failed to initialize`、收音全无。改为**按优先级逐个源尝试**，
-        // 取第一个能初始化的，并把胜出的源号写进文件日志。
-        val attemptedSources = sourcesFor(config.audioType)
-        var selection: Pair<AudioRecord, Int>? = null
-        for (source in attemptedSources) {
-            val candidate = try {
-                AudioRecord(
-                    source,
-                    config.sampleRate,
-                    channelMask,
-                    AndroidAudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize,
-                )
-            } catch (error: Exception) {
-                Log.w(TAG, "microphone recorder creation failed source=$source", error)
-                null
-            }
-            if (candidate != null && candidate.state == AudioRecord.STATE_INITIALIZED) {
-                selection = candidate to source
-                break
-            }
-            candidate?.release()
-        }
-        val nextRecorder = selection?.first
+        // `recorder failed to initialize`、收音全无。
+        //
+        // 1.1.1（EU5 实测）：24k+源6/1 也全灭而 HAL 声明支持 —— 升级为
+        // **源×采样率×声道兜底矩阵**，每次尝试都落盘诊断；胜出参数≠协商参数时由
+        // capture() 做线性重采样/声道变换，编码器与 RTP 打包不变。
+        val opened = openRecorder()
+        val nextRecorder = opened?.recorder
         if (nextRecorder == null) {
             nextEncoder?.close()
-            return fail("recorder failed to initialize (tried sources=$attemptedSources)")
+            return fail("recorder failed to initialize (all source×rate×mask candidates failed)")
         }
-        val chosenSource = selection?.second ?: -1
+        nativeRate = opened.rate
+        nativeChannels = opened.channels
+        resamplePos = 0.0
+        resampleTail = ShortArray(0)
+        val chosenSource = opened.source
 
         val nextSocket = try {
             bindAnyPort()
@@ -162,13 +143,14 @@ internal class MicrophoneUplink(
                 "microphone uplink started type=${config.audioType} codec=${config.codec} " +
                     "encoder=$encoderBackend source=$chosenSource rate=${config.sampleRate} " +
                     "channels=${config.channels} frameMs=${config.frameMillis} " +
-                    "port=${config.port} $effects",
+                    "port=${config.port} native=(${nativeRate}Hz/${nativeChannels}ch) $effects",
             )
             // 成功路径也落文件日志（此前只写 logcat，实测报告里"查无此话"，见 #30）。
             diagnostics?.invoke(
                 "Microphone uplink started type=${config.audioType} codec=${config.codec} " +
                     "encoder=$encoderBackend source=$chosenSource rate=${config.sampleRate} " +
-                    "channels=${config.channels} frameMs=${config.frameMillis} $effects",
+                    "channels=${config.channels} frameMs=${config.frameMillis} " +
+                    "native=(${nativeRate}Hz/${nativeChannels}ch) $effects",
             )
             true
         } catch (error: Exception) {
@@ -193,6 +175,72 @@ internal class MicrophoneUplink(
             MediaRecorder.AudioSource.MIC,
         )
         else -> listOf(MediaRecorder.AudioSource.MIC)
+    }
+
+    private class OpenedRecorder(
+        val recorder: AudioRecord,
+        val source: Int,
+        val rate: Int,
+        val channels: Int,
+    )
+
+    /**
+     * 1.1.1（EU5 C40DB 104759 修复）：录音初始化兜底矩阵。
+     *
+     * EU5 实测：PATEO HAL 的 audio_policy.conf 声明 primary 输入支持
+     * 8000..48000（含 24k）+ MONO/STEREO，但 phone 协商的 24k + 源6/1 全部
+     * STATE_UNINITIALIZED —— HAL 实际拒开参数或输入被自家语音服务占用。
+     * 策略：源（协商优先级）×采样率（协商值→48k→16k→8k）×声道（协商→MONO→STEREO）
+     * 全矩阵逐个试开，每次尝试（含失败原因）写进诊断。胜出参数≠协商参数时
+     * capture() 内做线性重采样与声道变换，编码器/RTP 打包完全不受影响，
+     * 对「协商参数本来就能开」的正常车机第一个候选即命中、零行为变化。
+     */
+    private fun openRecorder(): OpenedRecorder? {
+        val requestedMask = if (config.channels >= 2) {
+            AndroidAudioFormat.CHANNEL_IN_STEREO
+        } else {
+            AndroidAudioFormat.CHANNEL_IN_MONO
+        }
+        val rates = intArrayOf(config.sampleRate, 48_000, 16_000, 8_000).distinct().toIntArray()
+        val masks = intArrayOf(requestedMask, AndroidAudioFormat.CHANNEL_IN_MONO, AndroidAudioFormat.CHANNEL_IN_STEREO).distinct().toIntArray()
+        val attempts = StringBuilder()
+        val winner = tryOpen(rates, masks, attempts)
+        if (winner != null && attempts.isNotEmpty()) {
+            diagnostics?.invoke(
+                "microphone fallback matrix winner source=${winner.source} rate=${winner.rate} " +
+                    "channels=${winner.channels} (negotiated rate=${config.sampleRate} " +
+                    "channels=${config.channels}) attempts:$attempts",
+            )
+        }
+        return winner
+    }
+
+    private fun tryOpen(rates: IntArray, masks: IntArray, attempts: StringBuilder): OpenedRecorder? {
+        for (source in sourcesFor(config.audioType)) {
+            for (rate in rates) {
+                for (mask in masks) {
+                    val minBuffer = AudioRecord.getMinBufferSize(rate, mask, AndroidAudioFormat.ENCODING_PCM_16BIT)
+                    if (minBuffer <= 0) {
+                        attempts.append(" s$source/r$rate/minbuf<=0")
+                        continue
+                    }
+                    val bufferSize = maxOf(minBuffer * 2, config.frameBytes * 4)
+                    val candidate = try {
+                        AudioRecord(source, rate, mask, AndroidAudioFormat.ENCODING_PCM_16BIT, bufferSize)
+                    } catch (error: Throwable) {
+                        attempts.append(" s$source/r$rate/ex=${error.javaClass.simpleName}")
+                        continue
+                    }
+                    if (candidate.state == AudioRecord.STATE_INITIALIZED) {
+                        val channels = if (mask == AndroidAudioFormat.CHANNEL_IN_STEREO) 2 else 1
+                        return OpenedRecorder(candidate, source, rate, channels)
+                    }
+                    attempts.append(" s$source/r$rate/state${candidate.state}")
+                    runCatching { candidate.release() }
+                }
+            }
+        }
+        return null
     }
 
     /**
@@ -273,7 +321,12 @@ internal class MicrophoneUplink(
 
     private fun capture(recorder: AudioRecord, socket: DatagramSocket) {
         val frame = ByteArray(config.frameBytes)
-        val readBuffer = ByteArray(maxOf(frame.size, MIN_READ_BYTES))
+        // 1.1.1：胜出参数≠协商参数时，读入缓冲按 native 速率/声道放大，读多读少都能处理。
+        val conversionFactor = maxOf(
+            1,
+            (nativeRate.toLong() * nativeChannels / (config.sampleRate.toLong() * config.channels)).toInt(),
+        )
+        val readBuffer = ByteArray(maxOf(frame.size, MIN_READ_BYTES) * conversionFactor)
         // 1.0.19 回归上游：RTP 头 SSRC 位恒 0（上游 sealPacket 根本不写 8–11 字节）。
         // BE+SSRC=0（1.0.8）与 BE+SSRC=rand（1.0.12）在 3e 均失败 → SSRC 非主因，
         // 但基线必须与上游逐字节等价，排除变量后剩余失败才能归因到包外。
@@ -284,6 +337,8 @@ internal class MicrophoneUplink(
         var windowPeak = 0
         var windowFrames = 0
         var lastLevelLog = 0L
+        // 1.1.1：胜出参数恰好等于协商参数时走零转换快路径（对正常车机零行为变化）。
+        val passthrough = nativeRate == config.sampleRate && nativeChannels == config.channels
         try {
             while (running.get()) {
                 // API16 适配：带 mode 的 AudioRecord.read 是 API 23+；低版本用阻塞语义的 int 重载。
@@ -299,10 +354,20 @@ internal class MicrophoneUplink(
                 if (count == 0) {
                     continue
                 }
+                val data: ByteArray
+                val size: Int
+                if (passthrough) {
+                    data = readBuffer
+                    size = count
+                } else {
+                    data = convertChunk(readBuffer, count)
+                    size = data.size
+                    if (size == 0) continue
+                }
                 var offset = 0
-                while (offset < count && running.get()) {
-                    val copied = minOf(frame.size - filled, count - offset)
-                    readBuffer.copyInto(frame, filled, offset, offset + copied)
+                while (offset < size && running.get()) {
+                    val copied = minOf(frame.size - filled, size - offset)
+                    data.copyInto(frame, filled, offset, offset + copied)
                     filled += copied
                     offset += copied
                     if (filled == frame.size) {
@@ -335,6 +400,65 @@ internal class MicrophoneUplink(
             running.set(false)
             release()
         }
+    }
+
+    /**
+     * 1.1.1：native 参数（源 rate/channels）→ 协商参数（config）的 PCM 变换。
+     * 管线：native 声道 → 单声道（双声道取均值）→ 线性重采样到协商采样率 →
+     * 复制到协商声道数。仅语音上行使用，线性插值质量足够且 CPU 开销可忽略。
+     */
+    private fun convertChunk(src: ByteArray, count: Int): ByteArray {
+        val frames = count / (2 * nativeChannels)
+        if (frames <= 0) return EMPTY_BYTES
+        val mono = ShortArray(frames)
+        var idx = 0
+        for (f in 0 until frames) {
+            val l = leShort(src, idx)
+            mono[f] = if (nativeChannels >= 2) {
+                ((l + leShort(src, idx + 2)) / 2).toShort()
+            } else {
+                l
+            }
+            idx += 2 * nativeChannels
+        }
+        val resampled = if (nativeRate == config.sampleRate) mono else resampleMono(mono)
+        val out = ByteArray(resampled.size * config.channels * 2)
+        var o = 0
+        for (s in resampled) {
+            repeat(config.channels) {
+                putLeShort(out, o, s)
+                o += 2
+            }
+        }
+        return out
+    }
+
+    /** 跨读增量的线性重采样：nativeRate → config.sampleRate，插值断点由 [resampleTail] 承接。 */
+    private fun resampleMono(src: ShortArray): ShortArray {
+        val buffer = if (resampleTail.isEmpty()) src else resampleTail + src
+        val step = nativeRate.toDouble() / config.sampleRate
+        val out = ShortArray(((buffer.size - 1) / step).toInt() + 1)
+        var oi = 0
+        var p = resamplePos
+        while (p + 1 < buffer.size && oi < out.size) {
+            val i0 = p.toInt()
+            val frac = p - i0
+            val v = buffer[i0] * (1.0 - frac) + buffer[i0 + 1] * frac
+            out[oi++] = v.roundToInt().toShort()
+            p += step
+        }
+        val consumed = minOf(p.toInt(), buffer.size - 1)
+        resampleTail = buffer.copyOfRange(consumed, buffer.size)
+        resamplePos = p - consumed
+        return out.copyOf(oi)
+    }
+
+    private fun leShort(b: ByteArray, off: Int): Short =
+        ((b[off].toInt() and 0xff) or (b[off + 1].toInt() shl 8)).toShort()
+
+    private fun putLeShort(out: ByteArray, off: Int, v: Short) {
+        out[off] = (v.toInt() and 0xff).toByte()
+        out[off + 1] = ((v.toInt() shr 8) and 0xff).toByte()
     }
 
     /** Peak absolute sample of one little-endian PCM16 frame (full scale = 32767). */
@@ -485,5 +609,6 @@ internal class MicrophoneUplink(
         const val TAG = "xcertplay-usb"
         const val MIN_READ_BYTES = 2_048
         const val CLOSE_JOIN_MILLIS = 500L
+        val EMPTY_BYTES = ByteArray(0)
     }
 }
