@@ -1,4 +1,4 @@
-﻿package com.shilapi.diplay.lite
+package com.shilapi.diplay.lite
 
 import android.app.Activity
 import android.app.AlertDialog
@@ -1169,7 +1169,7 @@ class SettingsPage(private val activity: MainActivity) {
         val owner = "wangliunian"
         val repo = "display--log-collection"
         // 1.1.3（20261012 轮换）：旧 token 27a79346… 已作废（公开源码前换专用令牌）。
-        val token = ""  // 日志上传令牌不随源码公开，自行替换为你自己的 gitee token
+        val token = "420ad33fe308814dfef2a91ea569b853"
         var attemptName = name
         var lastCode = 0
         var lastBody = ""
