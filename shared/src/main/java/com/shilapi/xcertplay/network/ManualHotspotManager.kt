@@ -1,0 +1,581 @@
+package com.shilapi.xcertplay.network
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.Context
+import android.content.pm.PackageManager
+import android.location.LocationManager
+import android.net.ConnectivityManager
+import android.net.wifi.ScanResult
+import android.net.wifi.SoftApConfiguration
+import android.net.wifi.WifiConfiguration
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.Looper
+import android.util.Log
+import com.shilapi.xcertplay.orchestration.ManualHotspotBand
+import com.shilapi.xcertplay.orchestration.ManualHotspotSecurity
+import com.shilapi.xcertplay.transport.Iap2WirelessSecurity
+import java.io.IOException
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
+import java.net.NetworkInterface
+import java.net.SocketException
+import java.util.Collections
+import java.util.concurrent.TimeUnit
+
+/**
+ * Attaches to a hotspot that is already running on this device.
+ *
+ * The hotspot remains owned by the system. This manager only locates its interface and reads the
+ * channel/security data that the public Android APIs expose. Some vendors hide the current SoftAP
+ * configuration, in which case the caller-supplied credentials remain authoritative and the iAP2
+ * channel is reported as zero ("auto").
+ */
+class ManualHotspotManager(
+    context: Context,
+    ssid: String,
+    passphrase: String,
+    band: ManualHotspotBand,
+    channel: Int,
+    security: ManualHotspotSecurity,
+    private val preferIpv4: Boolean = false,
+    private val onDiagnostic: (String) -> Unit = {},
+) : WirelessHotspotManager {
+    private val appContext = context.applicationContext
+    private val connectivityManager =
+        appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private val wifiManager = appContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        ?: throw IllegalStateException("WifiManager is unavailable")
+    private val expectedSsid = ssid
+    private val passphrase = passphrase
+    private val expectedBand = band
+    private val expectedChannel = channel
+    private val expectedSecurity = security.toIap2Security()
+
+    @Volatile
+    private var closed = false
+
+    init {
+        require(expectedSsid.isNotBlank()) { "ssid must not be blank" }
+        require('\u0000' !in expectedSsid) { "ssid must not contain U+0000" }
+        require('\u0000' !in passphrase) { "passphrase must not contain U+0000" }
+        require(passphrase.isEmpty() || passphrase.length in 8..63) {
+            "passphrase must be empty or between 8 and 63 characters"
+        }
+        require(channel in 0..196) { "channel must be 0 or in 1..196" }
+        require(expectedSecurity == Iap2WirelessSecurity.NONE || passphrase.isNotEmpty()) {
+            "passphrase is required for secured manual hotspots"
+        }
+        require(expectedSecurity != Iap2WirelessSecurity.NONE || passphrase.isEmpty()) {
+            "passphrase must be empty for open manual hotspots"
+        }
+    }
+
+    override fun start(timeoutMillis: Long): WirelessHotspotInfo {
+        check(Looper.myLooper() != Looper.getMainLooper()) {
+            "ManualHotspotManager.start must not run on the main thread"
+        }
+        require(timeoutMillis > 0) { "timeoutMillis must be positive" }
+
+        val deadlineNanos = deadlineAfter(timeoutMillis)
+        val apConfiguration = readApConfiguration()
+        if (apConfiguration != null && apConfiguration.ssid != expectedSsid) {
+            throw IOException(
+                "Manual hotspot SSID does not match the active local AP configuration: " +
+                    "'${apConfiguration.ssid}'",
+            )
+        }
+        validateApConfiguration(apConfiguration)
+
+        var lastReason = "local hotspot interface was not found"
+        while (true) {
+            check(!closed) { "ManualHotspotManager is closed" }
+            val localInterface = findLocalHotspotInterface()
+            if (localInterface != null) {
+                val connectionFrequency = frequencyFromConnectionInfo()
+                val scanFrequency = frequencyFromScanResult(localInterface)
+                val observedChannel = observedManualHotspotChannel(
+                    apChannel = apConfiguration?.channel ?: 0,
+                    connectionFrequencyMHz = connectionFrequency,
+                    scanFrequencyMHz = scanFrequency,
+                    apFrequencyMHz = apConfiguration?.frequencyMHz,
+                )
+                // 实测读不到信道时（C8815/nova3e 的 4.x / 9 ROM 在 AP 模式下既拿不到
+                // scanResults、也读不到 apChannel）退回用户手填的信道——UI 的信道栏本就为
+                // 此准备（“留空自动实测，失败请手填”）；否则会永远下发 channel=0。
+                // 1.0.13：观测信道吸附到标准信道（2.4G→1/6/11，5G→36/44/149/157）；
+                // 1.0.15：观测/手填都没有时，优先复用上次会话成功确认过的信道
+                // （ConfirmedChannelMemory），最后才兜底猜 6。
+                val channel = when {
+                    observedChannel > 0 -> snapHotspotChannel(observedChannel)
+                    expectedChannel > 0 -> snapHotspotChannel(expectedChannel)
+                    else ->
+                        ConfirmedChannelMemory.recall(appContext, ConfirmedChannelMemory.ROLE_CAR)
+                            .takeIf { it > 0 }
+                            ?: 6
+                }
+                val frequencyMHz = when {
+                    apConfiguration?.frequencyMHz != null -> apConfiguration.frequencyMHz
+                    connectionFrequency != null -> connectionFrequency
+                    scanFrequency != null -> scanFrequency
+                    else -> null
+                }
+                val security = apConfiguration?.security ?: expectedSecurity
+                onDiagnostic("Manual hotspot configReadable=${apConfiguration != null} " +
+                    "security=$security channelKnown=${observedChannel > 0} " +
+                    "observed=$observedChannel advertised=$channel " +
+                    "hardwareAddressKnown=${localInterface.hardwareAddress != null} iface=${localInterface.name} " +
+                    "ipv4Preferred=$preferIpv4 " +
+                    "family=${if (localInterface.hostAddress is Inet6Address) "IPv6" else "IPv4"}")
+                if (security != Iap2WirelessSecurity.NONE && passphrase.isEmpty()) {
+                    throw IOException("Manual hotspot is secured but no passphrase was provided")
+                }
+
+                // 1.0.22（S7 实测）：非 ASCII SSID（如误输入的中文句号）会进 0x5703 凭证，
+                // iPhone 扫描结果与凭证的编码比对易失配导致拒绝自动加入——留下诊断证据。
+                if (expectedSsid.any { it.code > 126 }) {
+                    onDiagnostic(
+                        "Manual hotspot ssid contains non-ASCII characters " +
+                            "(iPhone auto-join may fail): \"$expectedSsid\"",
+                    )
+                }
+
+                if (observedChannel == 0) {
+                    Log.w(
+                        TAG,
+                        "Could not read the active hotspot channel from Android public APIs; " +
+                            "advertising $channel" +
+                            if (channel > 0) " (best guess)" else " (auto)",
+                    )
+                }
+                val observedBandLabel = wifiBandLabel(apConfiguration?.band)
+                return WirelessHotspotInfo(
+                    ssid = expectedSsid,
+                    passphrase = passphrase,
+                    security = security,
+                    channel = channel,
+                    frequencyMHz = frequencyMHz,
+                    bssid = localInterface.hardwareAddress,
+                    interfaceName = localInterface.name,
+                    hostAddress = localInterface.hostAddress,
+                    bandLabel = when (expectedBand) {
+                        ManualHotspotBand.GHZ_2_4 -> "2.4 GHz"
+                        ManualHotspotBand.GHZ_5 -> "5 GHz"
+                        ManualHotspotBand.AUTO ->
+                            frequencyMHz?.let(::bandLabel) ?: observedBandLabel ?: "Auto"
+                    },
+                    backend = WirelessHotspotBackend.MANUAL_HOTSPOT,
+                )
+            }
+
+            val remainingNanos = remainingNanos(deadlineNanos)
+            if (remainingNanos <= 0) {
+                throw IOException(
+                    "Timed out after ${timeoutMillis}ms waiting for the manual hotspot: " +
+                        lastReason,
+                )
+            }
+            sleep(minOf(remainingNanos, INTERFACE_POLL_NANOS))
+        }
+    }
+
+    override fun close() {
+        closed = true
+    }
+
+    private fun validateApConfiguration(configuration: ManualApConfiguration?) {
+        configuration ?: return
+        if (expectedChannel > 0 && configuration.channel > 0 &&
+            configuration.channel != expectedChannel
+        ) {
+            throw IOException(
+                "Manual hotspot channel ${configuration.channel} does not match configured " +
+                "channel $expectedChannel",
+            )
+        }
+        val actualBand = when (configuration.band) {
+            1 -> ManualHotspotBand.GHZ_2_4
+            2 -> ManualHotspotBand.GHZ_5
+            else -> null
+        }
+        if (actualBand != null && expectedBand != ManualHotspotBand.AUTO &&
+            actualBand != expectedBand
+        ) {
+            throw IOException(
+                "Manual hotspot band ${wifiBandLabel(configuration.band)} does not match " +
+                    "configured band ${wifiBandLabel(if (expectedBand == ManualHotspotBand.GHZ_2_4) 1 else 2)}",
+            )
+        }
+        // WPA2 vs WPA3 variants are fine: the live security is what the iPhone is told (see start()).
+        // Only an open/secured mismatch means the saved password cannot be right.
+        if ((configuration.security == Iap2WirelessSecurity.NONE) != (expectedSecurity == Iap2WirelessSecurity.NONE)) {
+            throw IOException(
+                "Manual hotspot security ${configuration.security} does not match configured " +
+                    "security $expectedSecurity",
+            )
+        }
+        val frequency = configuration.frequencyMHz ?: return
+        when (expectedBand) {
+            ManualHotspotBand.GHZ_2_4 -> if (frequency !in 2_400..2_500) {
+                throw IOException("Manual hotspot is not running on 2.4 GHz")
+            }
+            ManualHotspotBand.GHZ_5 -> if (frequency !in 5_150..5_895) {
+                throw IOException("Manual hotspot is not running on 5 GHz")
+            }
+            ManualHotspotBand.AUTO -> Unit
+        }
+    }
+
+    private fun findLocalHotspotInterface(): LocalHotspotInterface? {
+        val interfaces = try {
+            NetworkInterface.getNetworkInterfaces()
+        } catch (_: SocketException) {
+            null
+        } ?: return null
+        // API16 适配：ConnectivityManager.getActiveNetwork() 是 API 23+，
+        // getLinkProperties(Network) 是 API 21+，低版本无"当前主网卡"概念，直接跳过
+        // （仅影响 interface 评分里的主网卡排除项，不影响热点识别）。
+        val primaryInterface =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                connectivityManager?.activeNetwork
+                    ?.let { connectivityManager.getLinkProperties(it)?.interfaceName }
+            } else {
+                null
+            }
+        return Collections.list(interfaces)
+            .asSequence()
+            .filter { isUsableInterface(it, primaryInterface) }
+            .mapNotNull { networkInterface ->
+                networkInterface.hotspotAddress()?.let { address ->
+                    LocalHotspotInterface(
+                        name = networkInterface.name,
+                        hostAddress = address,
+                        hardwareAddress = runCatching { networkInterface.hardwareAddress?.toMacAddressString() }
+                            .getOrNull()?.takeUnless { it == "02:00:00:00:00:00" || it == "00:00:00:00:00:00" }
+                            ?: HotspotInterfaceBssid.read(networkInterface.name),
+                        score = interfaceScore(networkInterface.name, address),
+                    )
+                }
+            }
+            .maxByOrNull(LocalHotspotInterface::score)
+    }
+
+    private fun isUsableInterface(
+        networkInterface: NetworkInterface,
+        primaryInterface: String?,
+    ): Boolean = try {
+        networkInterface.name != primaryInterface &&
+            !networkInterface.isLoopback &&
+            networkInterface.isUp &&
+            EXCLUDED_INTERFACE_PREFIXES.none { networkInterface.name.startsWith(it) }
+    } catch (_: SocketException) {
+        false
+    }
+
+    private fun interfaceScore(name: String, address: InetAddress): Int {
+        var score = when {
+            name.startsWith("ap") || name.contains("softap", ignoreCase = true) -> 100
+            name.startsWith("p2p") -> 80
+            name.startsWith("wlan") -> 70
+            else -> 0
+        }
+        if (address is Inet4Address) {
+            val bytes = address.address
+            when {
+                bytes[0] == 192.toByte() && bytes[1] == 168.toByte() -> score += 30
+                address.isSiteLocalAddress -> score += 20
+            }
+        }
+        if (address is Inet6Address && address.isLinkLocalAddress) score += 15
+        return score
+    }
+
+    private fun NetworkInterface.hotspotAddress(): InetAddress? =
+        wirelessHostAddress(Collections.list(inetAddresses), interfaceIndexCompat(), preferIpv4)
+
+    /** API16 适配：NetworkInterface.getIndex 是 API 19+；低版本回退 0（仅影响 IPv6 scope id）。 */
+    private fun NetworkInterface.interfaceIndexCompat(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) index else 0
+
+    private fun frequencyFromConnectionInfo(): Int? {
+        val connectionInfo = try {
+            wifiManager.connectionInfo
+        } catch (_: SecurityException) {
+            null
+        } ?: return null
+        if (unquote(connectionInfo.ssid) != expectedSsid) return null
+        // API16 适配：WifiInfo.getFrequency() 公开于 API 21；低版本经反射读取
+        // （字段在 4.x 运行时实际存在，仅未进入公开 SDK，且 4.x 无隐藏 API 限制）。
+        val frequency = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            connectionInfo.frequency
+        } else {
+            try {
+                WifiInfo::class.java.getMethod("getFrequency").invoke(connectionInfo) as? Int
+            } catch (_: Throwable) {
+                null
+            }
+        }
+        return frequency?.takeIf { it > 0 }
+    }
+
+    private fun frequencyFromScanResult(localInterface: LocalHotspotInterface): Int? {
+        val localBssid = localInterface.hardwareAddress ?: return null
+        var scanResults = try {
+            wifiManager.scanResults
+        } catch (_: SecurityException) {
+            null
+        } ?: return null
+        // 1.0.22（S7/SM-G9650 排查）：AP 模式下 STA 常不主动扫描，缓存列表里可能没有
+        // 本机 AP——主动触发一次扫描并短暂等待后重读（best effort，失败不阻塞）。
+        if (scanResults.none { it.BSSID.equals(localBssid, ignoreCase = true) }) {
+            // 1.0.27（S7 实测 observed=0/frequency=unknown）：observed=0 时无法区分
+            // 「扫描能力缺失」与「本机 AP 不可见」，落判别证据——Android 6+ 扫描结果
+            // 需要定位权限 + 定位服务开启，缺任一则 scanResults 恒空、观测永远失败。
+            diagnoseScanObservationMiss(scanResults.size, localBssid)
+            try {
+                wifiManager.startScan()
+            } catch (_: Throwable) {
+                // 权限/频控失败不致命
+            }
+            sleep(900_000_000L)
+            scanResults = try {
+                wifiManager.scanResults
+            } catch (_: SecurityException) {
+                null
+            } ?: return null
+        }
+        for (result in scanResults) {
+            if (!result.BSSID.equals(localBssid, ignoreCase = true)) continue
+            // 1.0.22：BSSID 命中即为本机 AP，不再要求 SSID 字符串相等——非 ASCII SSID
+            // （如带中文句号）在 ScanResult.SSID 里的转义可能与配置串不一致，曾导致
+            // BSSID 命中仍被 SSID 比对拦下、observed=0 退回猜测信道（S7 实测）。
+            val frequency = scanResultFrequency(result)
+            if (frequency != null && frequency > 0) {
+                onDiagnostic(
+                    "Manual hotspot scan hit own AP bssid=$localBssid frequency=$frequency " +
+                        "ssidObserved=${result.SSID}",
+                )
+                return frequency
+            }
+        }
+        return null
+    }
+
+    /**
+     * 1.0.27（S7 实测 observed=0/frequency=unknownMHz，iPhone 按猜测信道扫描自然不 join）：
+     * 扫描观测失败时落判别证据。Android 6+ 的 scanResults 需要「定位权限已授予 + 定位服务
+     * 开启」，缺任一则列表恒空；权限齐全仍扫不到则记列表规模供下轮比对。
+     */
+    private fun diagnoseScanObservationMiss(cachedCount: Int, localBssid: String) {
+        val locationPermission = if (Build.VERSION.SDK_INT >= 23) {
+            val coarse = appContext.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+            val fine = appContext.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+            coarse || fine
+        } else {
+            true
+        }
+        val locationEnabled = try {
+            val lm = appContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            lm.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+                lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+        } catch (_: Throwable) {
+            false
+        }
+        onDiagnostic(
+            "Manual hotspot scan observation miss: cachedResults=$cachedCount ownBssid=$localBssid " +
+                "locationPermission=$locationPermission locationEnabled=$locationEnabled " +
+                "(Android 6+ needs location permission + location service ON for scan results)",
+        )
+    }
+
+    /** SSID 与 frequency 在 API 21 才转正，4.x 运行时存在同名字段，反射读取兜底。 */
+    private fun scanResultFrequency(result: ScanResult): Int? {
+        val frequency = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            result.frequency
+        } else {
+            try {
+                ScanResult::class.java.getField("frequency").getInt(result)
+            } catch (_: Throwable) {
+                0
+            }
+        }
+        if (frequency <= 0) return null
+        // 1.0.22：SSID 只做证据记录、不再做相等门槛（BSSID 命中已足以确认是本机 AP）。
+        return frequency
+    }
+
+    @SuppressLint("PrivateApi")
+    private fun readApConfiguration(): ManualApConfiguration? =
+        readSoftApConfiguration() ?: readLegacyApConfiguration()
+
+    @SuppressLint("PrivateApi")
+    private fun readSoftApConfiguration(): ManualApConfiguration? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        return try {
+            val method = WifiManager::class.java.getMethod("getSoftApConfiguration")
+            val configuration = method.invoke(wifiManager) as? SoftApConfiguration
+                ?: return null
+            val ssid = configuration.ssid ?: return null
+            // Lite: compileSdk 34 无 SoftApConfiguration.channels(API 36)，删除 >=36 分支。
+            // 本项目 targetSdk 19，运行时永远走不到 SDK>=30 反射，分支仅为新系统兜底。
+            val bandAndChannel = run {
+                val band = (
+                    SoftApConfiguration::class.java
+                        .getMethod("getBand")
+                        .invoke(configuration) as? Number
+                    )?.toInt()
+                val channel = SoftApConfiguration::class.java
+                    .getMethod("getChannel")
+                    .invoke(configuration) as? Number
+                if (band == null || channel == null) null else band to channel.toInt()
+            }
+            val band = bandAndChannel?.first
+            val channel = bandAndChannel?.second ?: 0
+            ManualApConfiguration(
+                ssid = ssid,
+                band = band,
+                channel = channel,
+                frequencyMHz = wifiChannelToFrequencyMhz(channel, band),
+                security = mapSoftApSecurity(configuration.securityType),
+            )
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    @SuppressLint("PrivateApi")
+    private fun readLegacyApConfiguration(): ManualApConfiguration? {
+        return try {
+            val method = WifiManager::class.java.getMethod("getWifiApConfiguration")
+            val configuration = method.invoke(wifiManager) as? WifiConfiguration
+                ?: return null
+            val ssid = unquote(configuration.SSID) ?: return null
+            val channel = try {
+                WifiConfiguration::class.java.getField("apChannel").getInt(configuration)
+            } catch (_: Exception) {
+                // API16 适配：ReflectiveOperationException 是 API 19+，统一按 Exception 捕获。
+                0
+            }
+            val band = try {
+                legacyHotspotBandToSoftApBand(WifiConfiguration::class.java.getField("apBand").getInt(configuration))
+            } catch (_: Exception) {
+                null
+            }
+            ManualApConfiguration(
+                ssid = ssid,
+                band = band,
+                channel = channel,
+                frequencyMHz = wifiChannelToFrequencyMhz(channel, band),
+                security = mapWifiConfigurationSecurity(configuration),
+            )
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun mapSoftApSecurity(securityType: Int): Iap2WirelessSecurity = when (securityType) {
+        SoftApConfiguration.SECURITY_TYPE_OPEN -> Iap2WirelessSecurity.NONE
+        SoftApConfiguration.SECURITY_TYPE_WPA2_PSK -> Iap2WirelessSecurity.WPA_WPA2
+        SoftApConfiguration.SECURITY_TYPE_WPA3_SAE_TRANSITION ->
+            Iap2WirelessSecurity.WPA3_TRANSITION
+        SoftApConfiguration.SECURITY_TYPE_WPA3_SAE -> Iap2WirelessSecurity.WPA3_ONLY
+        else -> Iap2WirelessSecurity.WPA_WPA2
+    }
+
+    private fun mapWifiConfigurationSecurity(
+        configuration: WifiConfiguration,
+    ): Iap2WirelessSecurity {
+        val keyManagement = configuration.allowedKeyManagement ?: return Iap2WirelessSecurity.NONE
+        val open = keyManagement.get(WifiConfiguration.KeyMgmt.NONE)
+        val wpa2 = keyManagement.get(WifiConfiguration.KeyMgmt.WPA2_PSK)
+        val sae = keyManagement.get(WifiConfiguration.KeyMgmt.SAE)
+        return when {
+            open && !wpa2 && !sae -> Iap2WirelessSecurity.NONE
+            wpa2 && sae -> Iap2WirelessSecurity.WPA3_TRANSITION
+            wpa2 -> Iap2WirelessSecurity.WPA_WPA2
+            sae -> Iap2WirelessSecurity.WPA3_ONLY
+            else -> Iap2WirelessSecurity.WPA_WPA2
+        }
+    }
+
+    private fun bandLabel(frequencyMHz: Int): String = when (frequencyMHz) {
+        in 2400..2500 -> "2.4 GHz"
+        in 5150..5895 -> "5 GHz"
+        in 5925..7125 -> "6 GHz"
+        else -> "Unknown band"
+    }
+
+    private fun unquote(value: String?): String? {
+        if (value == null) return null
+        return if (value.length >= 2 && value.first() == '"' && value.last() == '"') {
+            value.substring(1, value.length - 1)
+        } else {
+            value
+        }
+    }
+
+    private fun ByteArray.toMacAddressString(): String =
+        joinToString(":") { byte -> "%02x".format(byte.toInt() and 0xff) }
+
+    private fun sleep(nanos: Long) {
+        try {
+            TimeUnit.NANOSECONDS.sleep(nanos)
+        } catch (interrupted: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw IOException("Interrupted while waiting for the manual hotspot", interrupted)
+        }
+    }
+
+    private fun deadlineAfter(timeoutMillis: Long): Long {
+        val now = System.nanoTime()
+        val delta = timeoutMillis * NANOS_PER_MILLISECOND
+        return if (Long.MAX_VALUE - now < delta) Long.MAX_VALUE else now + delta
+    }
+
+    private fun remainingNanos(deadlineNanos: Long): Long =
+        (deadlineNanos - System.nanoTime()).coerceAtLeast(0L)
+
+    private class ManualApConfiguration(
+        val ssid: String,
+        val band: Int?,
+        val channel: Int,
+        val frequencyMHz: Int?,
+        val security: Iap2WirelessSecurity,
+    )
+
+    private class LocalHotspotInterface(
+        val name: String,
+        val hostAddress: InetAddress,
+        val hardwareAddress: String?,
+        val score: Int,
+    )
+
+    private companion object {
+        const val TAG = "xcertplay-usb"
+        const val NANOS_PER_MILLISECOND = 1_000_000L
+        val INTERFACE_POLL_NANOS: Long = TimeUnit.MILLISECONDS.toNanos(250)
+        val EXCLUDED_INTERFACE_PREFIXES = listOf(
+            "lo",
+            "dummy",
+            "rmnet",
+            "r_rmnet",
+            "tun",
+            "ppp",
+            "sit",
+            "ip6",
+            "bond",
+        )
+    }
+}
+
+private fun ManualHotspotSecurity.toIap2Security(): Iap2WirelessSecurity = when (this) {
+    ManualHotspotSecurity.OPEN -> Iap2WirelessSecurity.NONE
+    ManualHotspotSecurity.WPA2 -> Iap2WirelessSecurity.WPA_WPA2
+    ManualHotspotSecurity.WPA3_TRANSITION -> Iap2WirelessSecurity.WPA3_TRANSITION
+    ManualHotspotSecurity.WPA3 -> Iap2WirelessSecurity.WPA3_ONLY
+}

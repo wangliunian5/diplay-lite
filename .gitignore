@@ -1,0 +1,26 @@
+# Gradle
+.gradle/
+build/
+app/build/
+shared/build/
+.cxx/
+
+# IDE
+.idea/
+*.iml
+
+# 本地环境
+local.properties
+
+# 工作产物
+apks/
+attic/
+build-*.log
+*.apk
+*.idsig
+
+# 内部文档
+M6k*.md
+
+# MFi 认证身份资产（不随源码公开，构建时自备）
+app/src/main/assets/offline-mfi/

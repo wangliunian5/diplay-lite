@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 无线链路所需权限（4.1 均为安装即授予；与 app manifest 合并，library 声明
+         使 lint 的 MissingPermission 检查可见这些权限） -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- mDNS 组播存活的关键（难点 B1） -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- B3 信道读取：4.1 的 WifiManager.getScanResults 需要定位权限 -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- 麦克风上行（CarPlay 语音） -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Android 12+ 蓝牙 API 标注要求的权限；4.x 上权限名不存在，安装时自动忽略 -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+</manifest>
