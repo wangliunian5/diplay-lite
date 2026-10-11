@@ -11,7 +11,7 @@ android {
         applicationId = "com.shilapi.diplay.lite"
         minSdk = 16
         targetSdk = 19
-        versionCode = 54
+        versionCode = 55
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
         // 版本迭代规则：1.0.x 系列止于 1.0.29，自 1.1.x 重新起排（每次出包 patch +1）。
