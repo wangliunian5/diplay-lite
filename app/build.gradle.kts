@@ -11,7 +11,7 @@ android {
         applicationId = "com.shilapi.diplay.lite"
         minSdk = 16
         targetSdk = 19
-        versionCode = 52
+        versionCode = 53
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
         // 版本迭代规则：1.0.x 系列止于 1.0.29，自 1.1.x 重新起排（每次出包 patch +1）。
@@ -24,7 +24,11 @@ android {
         // keep_formats），攻 iOS 16+ 零音频声明不建屏幕流。
         // 1.1.2-root-test：root 抢回试验包——claim NCM 失败且 su 可用时，sysfs unbind 内核
         // cdc_ncm + rmmod 后自动重试 claim 一次，攻「内核 CDC-NCM 抢占 NCM 数据接口」。
-        versionName = "1.1.2-root-test"
+        // 1.1.3：蓝底图标 + 设置 UI 字号/小标题/弹窗确认重构 + 诊断弹窗与 USB 取证段
+        //（usb-uevent/usb-devices/net-dev/ps-all/usb-holder）+ 8815 SDP 连续失败用户指引与
+        // SDP 服务列表取证 + StandardCharsets→Charset.forName（API19 前车机 Lockdown 不再挂）
+        // + 硬解渲染只渲最新帧/renderHold 恢复抑制（绿线+burst 节流）+ 开源声明弹窗 + 日志 token 轮换。
+        versionName = "1.1.3"
     }
 
     compileOptions {

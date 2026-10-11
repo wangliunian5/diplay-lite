@@ -1,4 +1,4 @@
-package com.shilapi.diplay.lite
+﻿package com.shilapi.diplay.lite
 
 import android.app.Activity
 import android.app.AlertDialog
@@ -479,6 +479,24 @@ class SettingsPage(private val activity: MainActivity) {
             textSize = 13f
         }
         column.addView(tvVersion, block())
+        // 1.1.3（GPLv3 合规）：开源声明入口——上游署名 + 许可证 + 源码地址 + 商标免责。
+        column.addView(
+            TextView(activity).apply {
+                text = "本软件基于开源项目 DiPlay（GPL-3.0）修改"
+                setTextColor(Ui.SUB)
+                textSize = 11f
+            },
+            block(top = dip(4)),
+        )
+        column.addView(
+            TextView(activity).apply {
+                text = "查看开源许可与声明 ▸"
+                setTextColor(Ui.PRIMARY)
+                textSize = 13f
+                setOnClickListener { showLicenseNotice() }
+            },
+            block(top = dip(2)),
+        )
         return ScrollView(activity).apply {
             addView(column, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
         }
@@ -504,6 +522,43 @@ class SettingsPage(private val activity: MainActivity) {
             },
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
         )
+    }
+
+    /**
+     * 1.1.3（GPLv3 合规）：开源许可与声明弹窗——许可证、上游署名、商标免责、数据说明。
+     * 内容与公开仓 README 同步维护：源码 https://github.com/wangliunian5/diplay-lite
+     */
+    private fun showLicenseNotice() {
+        val body = TextView(activity).apply {
+            setTextColor(Ui.TEXT)
+            textSize = 12f
+            setPadding(dip(20), dip(12), dip(20), dip(8))
+            text = buildString {
+                appendLine("【许可】")
+                appendLine("本软件是自由软件，基于 GNU GPL-3.0 授权分发，不提供任何担保。")
+                appendLine("你可以在 GPL-3.0 条款下自由使用、学习、修改和再分发本软件；再分发（含修改版）须同样以 GPL-3.0 提供完整对应源码。")
+                appendLine()
+                appendLine("【上游致谢】")
+                appendLine("本软件基于开源项目 DiPlay（© shihabal3amri）修改：")
+                appendLine("https://github.com/shihabal3amri/DiPlay")
+                appendLine("本分支（DiPlay Lite）为社区维护的非官方版本，修改内容包括：老车机兼容适配（API16+）、设置界面重构、系统诊断取证增强、低配设备性能优化。")
+                appendLine("本分支源码：")
+                appendLine("https://github.com/wangliunian5/diplay-lite")
+                appendLine()
+                appendLine("【商标声明】")
+                appendLine("应用内可选择的各汽车品牌标志（BEIJING、BMW、BYD、Ford、Honda、Hyundai、Nissan、Stellantis、Toyota、Volkswagen）版权归各自权利人，仅供车主个性化识别使用；本应用与上述各汽车厂家无关联，未获其授权或背书。")
+                appendLine("CarPlay 为 Apple Inc. 的商标；本应用与 Apple Inc. 无关联，未经 MFi 认证。")
+                appendLine()
+                appendLine("【数据说明】")
+                appendLine("运行日志仅在你主动点击「上传」时发送至维护者的日志仓库，用于问题排查；应用不会在后台收集或上传任何数据。")
+            }
+        }
+        val scroll = ScrollView(activity).apply { addView(body) }
+        AlertDialog.Builder(activity)
+            .setTitle("开源许可与声明")
+            .setView(scroll)
+            .setPositiveButton("关闭", null)
+            .show()
     }
 
     /** 音乐缓存毫秒应用：范围内才落盘（10-4000ms），越界忽略本次输入。 */
@@ -1113,7 +1168,8 @@ class SettingsPage(private val activity: MainActivity) {
     private fun uploadLogToGitee(name: String, stamp: String, encoded: String) {
         val owner = "wangliunian"
         val repo = "display--log-collection"
-        val token = "27a79346e0946691779eaee5647d86e4"
+        // 1.1.3（20261012 轮换）：旧 token 27a79346… 已作废（公开源码前换专用令牌）。
+        val token = ""  // 日志上传令牌不随源码公开，自行替换为你自己的 gitee token
         var attemptName = name
         var lastCode = 0
         var lastBody = ""
