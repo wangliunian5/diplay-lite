@@ -11,13 +11,35 @@ android {
         applicationId = "com.shilapi.diplay.lite"
         minSdk = 16
         targetSdk = 19
-        versionCode = 48
+        versionCode = 56
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
         // 版本迭代规则：1.0.x 系列止于 1.0.29，自 1.1.x 重新起排（每次出包 patch +1）。
-        // 1.1.1：麦克风上行初始化兜底矩阵（EU5 实测 HAL 拒开协商参数导致 Siri/通话收音全无）+
-        // 厂家预置图标新增 BEIJING 车标（仅预置可选，非默认）。
-        versionName = "1.1.1"
+        // 1.1.2：7100 端口 SO_REUSEADDR/显式关闭 + USBMUX 重置纳入重试 + NCM 桥死亡联动关
+        // wiredCsm + 「Siri/语音提示走媒体音量」开关。
+        // 1.1.2-test：bt_audio 排查探针包（/info 声明探针进 LiteLog + A2DP/HFP 状态广播 +
+        // RTSP rx 入口打点），专供「carplay+蓝牙」外测取证。
+        // 1.1.2-btaudio-test：bt_audio 试验包——移植上游 BluetoothAudioHandoff（A2DP 监听，
+        // 仅 bt_audio 模式挂载）+ /info 声明变体（长按「蓝牙音频+CarPlay」切换 no_audio/
+        // keep_formats），攻 iOS 16+ 零音频声明不建屏幕流。
+        // 1.1.2-root-test：root 抢回试验包——claim NCM 失败且 su 可用时，sysfs unbind 内核
+        // cdc_ncm + rmmod 后自动重试 claim 一次，攻「内核 CDC-NCM 抢占 NCM 数据接口」。
+        // 1.1.3：蓝底图标 + 设置 UI 字号/小标题/弹窗确认重构 + 诊断弹窗与 USB 取证段
+        //（usb-uevent/usb-devices/net-dev/ps-all/usb-holder）+ 8815 SDP 连续失败用户指引与
+        // SDP 服务列表取证 + StandardCharsets→Charset.forName（API19 前车机 Lockdown 不再挂）
+        // + 硬解渲染只渲最新帧/renderHold 恢复抑制（绿线+burst 节流）+ 开源声明弹窗 + 日志 token 轮换。
+        // 1.1.3(vc54)：修复 drainOutput 忙死循环（TRY_AGAIN 未无条件退出，解码线程卡死致全黑屏，
+        // 8815 010252 定案）+ 设置页复选框字号统一 13f（实机反馈）。
+        // 1.1.3(vc56)：运动噪块修复——MAX_FRAME_AGE 350ms→1100ms 消 900ms radio gap 引发的
+        // flush churn + API<21 fps 协商压 30（Adreno 203 档峰值负载静默纠错噪块）。
+        // 1.1.3(vc57)：系统诊断重做（中文检测报告）——首启快检（新装自动触发可跳过）+ 设置页
+        // 复测逐项检测（ROOT/ADB/蓝牙 A2DP sink 探测/Wi-Fi 热点实测含恢复原状/USB 静态+动态
+        // 人工步骤）+ 连接建议矩阵 + 「蓝牙音频+CarPlay」改操作指引弹窗（底层恒走全量 CarPlay）
+        // + 主页面 hero 文案删除与右列对齐；取证数据只写日志不上屏。
+        // 1.1.3(vc58)：诊断过程弹窗按钮被挤出可视区修复——ScrollView 加 weight=1，
+        // 「下一步/跳过」恒定钉在弹窗底部（8815 横屏 540px 实测）。
+        versionName = "1.1.3"
+        versionCode = 58
     }
 
     compileOptions {

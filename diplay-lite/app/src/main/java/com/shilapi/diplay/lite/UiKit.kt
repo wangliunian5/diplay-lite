@@ -71,12 +71,13 @@ object Ui {
         cornerRadius = dip(context, 8).toFloat()
     }
 
-    /** RadioButton 圆圈：选中实心主蓝，未选中灰描边。自绘必须有显式尺寸，否则无 intrinsic 不可见。 */
+    /** RadioButton 圆圈：选中实心主蓝，未选中灰描边。自绘必须有显式尺寸，否则无 intrinsic 不可见。
+     *  1.1.1 UI：18dp → 23dp（×1.3），描边同步 2→3dp，配合全局字体 1.2 倍。 */
     fun radio(context: Context, checked: Boolean): GradientDrawable = GradientDrawable().apply {
         shape = GradientDrawable.OVAL
         setColor(if (checked) PRIMARY else Color.TRANSPARENT)
-        setStroke(dip(context, 2), if (checked) PRIMARY else SUB)
-        setSize(dip(context, 18), dip(context, 18))
+        setStroke(dip(context, 3), if (checked) PRIMARY else SUB)
+        setSize(dip(context, 23), dip(context, 23))
     }
 
     /** CheckBox 方框：选中实心主蓝，未选中灰描边。 */

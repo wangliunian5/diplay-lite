@@ -67,6 +67,16 @@ class CarIconPage(private val activity: MainActivity) {
         enterCrop(data.data!!)
     }
 
+    /**
+     * 系统返回键（1.1.1）：裁剪态先回图标主页（消费事件），主页态返回 false 交由
+     * MainActivity 走「三级页 → 设置页」层级。
+     */
+    fun onBackKey(): Boolean {
+        if (!cropping) return false
+        backToMain()
+        return true
+    }
+
     // ---------- 主页（预览 + 选图 + 品牌 + 默认） ----------
 
     private fun buildMainRoot(): View {
@@ -84,14 +94,16 @@ class CarIconPage(private val activity: MainActivity) {
             setPadding(Ui.dip(activity, 16), Ui.dip(activity, 16), Ui.dip(activity, 16), Ui.dip(activity, 32))
         }
         // M6k24：左上角返回按钮（回设置页）+ 标题同行。
+        // 1.1.1 UI：顶栏样式与设置页统一（白色返回图标 + 同字号标题），替换原 accent「‹ 返回」。
         val backRow = LinearLayout(activity).apply { gravity = Gravity.CENTER_VERTICAL }
-        backRow.addView(TextView(activity).apply {
-            text = "‹ 返回"
-            setTextColor(Ui.ACCENT)
-            textSize = 15f
-            setPadding(0, Ui.dip(activity, 8), Ui.dip(activity, 14), Ui.dip(activity, 8))
-            setOnClickListener { activity.setPage("settings") }
-        })
+        backRow.addView(
+            ImageView(activity).apply {
+                setImageDrawable(IconPainter.back(activity, 22, Ui.TEXT))
+                setPadding(0, Ui.dip(activity, 8), Ui.dip(activity, 12), Ui.dip(activity, 8))
+                setOnClickListener { activity.setPage("settings") }
+            },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+        )
         backRow.addView(TextView(activity).apply {
             text = "自定义返回图标"
             setTextColor(Ui.TEXT)

@@ -66,6 +66,7 @@ import com.shilapi.xcertplay.transport.LockdownPairingClient
 import com.shilapi.xcertplay.transport.LockdownPairRecord
 import com.shilapi.xcertplay.transport.NcmFunctionDiscovery
 import com.shilapi.xcertplay.transport.NcmUsbBridge
+import com.shilapi.xcertplay.vehicle.BluetoothAudioHandoff
 import java.io.Closeable
 import java.io.IOException
 import java.net.Inet6Address
@@ -243,6 +244,9 @@ class CarPlayController(
     @Volatile private var wirelessZombieMode = false
     // M6k11 hotfix：分类结果缓存（teardown 前算好，scheduleWirelessRetry 消费后清空）。
     @Volatile private var lastWirelessFailureClass: String? = null
+    // 1.1.3（8815 230420 定案）：连续 SDP 发现失败计数——iPhone iAP2 服务未广播=残留会话，
+    // 重试治不了，连续达阈值即给用户「关开 iPhone 蓝牙」指引；RFCOMM 建链成功即清零。
+    @Volatile private var sdpFailureConsecutiveCount = 0
 
     // 1.0.29（3e 222838 建立期楔死）：wired 0x4301 发出后 8s 内 iPhone 未发起任何流帧
     // → 关 CSM 触发控制环退出，走楔死类长退避全量重建（此前会话死在 pair-setup 阶段，
@@ -293,11 +297,41 @@ class CarPlayController(
     @Volatile private var wiredMux: Iap2UsbMuxHost? = null
     @Volatile private var wiredCsm: Iap2Session? = null
     @Volatile private var wiredBridge: Ipv6NcmBridge? = null
+    // 1.1.3（bt_audio 协同）：蓝牙音频模式下的 A2DP 监听（跟随上游 BluetoothAudioHandoff）。
+    // 仅在 airPlayConfig.disableAudioOutput（av_path=bt_audio）时挂载；suppressed 恒 false，
+    // 不做 A2DP 断开/重连，只监听连接与播放态（isA2dpPlaying 反射 + PLAYING 广播）供日志观测。
+    @Volatile private var btAudioHandoff: BluetoothAudioHandoff? = null
+
+    private fun ensureBtAudioHandoff(session: AirPlaySession) {
+        if (closed || !airPlayConfig.disableAudioOutput) return
+        val address = session.deviceBtMac
+        if (address.isBlank()) return
+        if (btAudioHandoff != null) return
+        synchronized(this) {
+            if (btAudioHandoff != null || closed) return
+            val handoff = BluetoothAudioHandoff(
+                appContext, address,
+                report = { debugLog(it) },
+                onPlaying = { playing -> debugLog("Bluetooth A2DP playing=$playing") },
+            )
+            btAudioHandoff = handoff
+            debugLog("bt_audio handoff attached peer=$address")
+            handoff.start()
+        }
+    }
+
+    private fun closeBtAudioHandoff() {
+        val handoff = btAudioHandoff ?: return
+        btAudioHandoff = null
+        runCatching { handoff.close() }
+        debugLog("bt_audio handoff closed")
+    }
 
     private val sessionListener = object : AirPlaySessionListener {
         override fun onSessionActive(session: AirPlaySession) {
             if (activeSession !== session) BydNavigationOutputs.start(appContext)
             activeSession = session
+            ensureBtAudioHandoff(session)
             // 1.0.10：会话真建立 = wired 自动重试额度重置（对齐无线链「成功即归零」语义）。
             wiredRetryCount.set(0)
             debugLog(
@@ -311,6 +345,7 @@ class CarPlayController(
             if (activeSession === session) {
                 activeSession = null
                 BydNavigationOutputs.endNow()
+                closeBtAudioHandoff()
             }
             debugLog("AirPlay session ended peer=${session.host}")
             uiListener?.onSessionEnded(session)
@@ -326,6 +361,8 @@ class CarPlayController(
                 "AirPlay device info name=${info.name} deviceId=${info.deviceId} " +
                     "wifiMac=${info.wifiMac} model=${info.model}",
             )
+            // 1.1.3（bt_audio 协同）：deviceBtMac 在此回调前才落位，onSessionActive 可能早于它。
+            ensureBtAudioHandoff(session)
             uiListener?.onDeviceInfo(session, info)
         }
 
@@ -542,6 +579,7 @@ class CarPlayController(
             closed = true
         }
         BydNavigationOutputs.endNow()
+        closeBtAudioHandoff()
         closeWiredReceivers()
         // 1.0.1：整体关闭时停掉重枚举看门狗/轮询兜底，防止关闭后定时器仍触发。
         cancelReenumerationTimers()
@@ -835,6 +873,8 @@ class CarPlayController(
             onStatus(CarPlayStatus.ConnectingBluetooth)
             val socket = openWirelessRfcommSocket(device)
             wirelessLinkOpenedAtMs = SystemClock.elapsedRealtime()
+            // 1.1.3：建链成功= SDP 恢复可见，清掉连续失败计数。
+            sdpFailureConsecutiveCount = 0
             debugLog("wireless RFCOMM connected address=${device.address}")
             if (isStaleWirelessRun(generation)) {
                 closeWirelessStack()
@@ -1043,6 +1083,18 @@ class CarPlayController(
         }
         val failureClass = lastWirelessFailureClass ?: wirelessFailureClass(error)
         lastWirelessFailureClass = null
+        // 1.1.3（8815 230420 定案）：SDP 发现失败族 = iPhone iAP2 服务未在广播（残留会话），
+        // 自动重试治不了；连续 2 次即给用户明确指引，不再让用户盲试。
+        if (failureClass == "SERVICE_DISCOVERY_FAILED") {
+            sdpFailureConsecutiveCount++
+            if (sdpFailureConsecutiveCount == SDP_FAILURE_HINT_AFTER) {
+                onStatus(
+                    CarPlayStatus.RecoveryHint(
+                        "iPhone 蓝牙服务不可见（多为残留会话）；请关闭再打开 iPhone 蓝牙后重试",
+                    ),
+                )
+            }
+        }
         // M6k11：僵尸族分流——快试 2 次后切长退避；第 3 次起提示用户干预并标记僵尸模式
         //（restartWireless 会据此做本机蓝牙适配器 reset）。非僵尸族走原 4s×attempt 封顶 15s。
         if (failureClass == "IPHONE_ZOMBIE") {
@@ -1669,7 +1721,21 @@ class CarPlayController(
                 }
             }
         }
-        throw lastFailure ?: IOException("RFCOMM connect failed")
+        val failure = lastFailure ?: IOException("RFCOMM connect failed")
+        // 1.1.3（8815 230420 定案）：两种口都失败，多半是 iPhone SDP 上已无 iAP2 服务
+        //（残留会话）。主动拉一次 SDP 服务列表落日志——坐实「iAP2 不在广播列」而非盲猜。
+        // fetchUuidsWithSdp 异步回调后短暂等待再读 device.uuids（仅失败路径，不加正常时延）。
+        runCatching {
+            device.fetchUuidsWithSdp()
+            Thread.sleep(SDP_QUERY_SETTLE_MILLIS)
+            val advertised = device.uuids?.map { u -> u.uuid.toString() }.orEmpty()
+            debugLog(
+                "wireless RFCOMM SDP probe address=${device.address} " +
+                    "services=${advertised.size} list=$advertised " +
+                    "iap2Visible=${advertised.any { u -> u.equals(IAP2_IPHONE_UUID, ignoreCase = true) }}",
+            )
+        }.onFailure { debugLog("wireless RFCOMM SDP probe failed: ${it.message}") }
+        throw failure
     }
 
     private fun connectBluetoothSocket(socket: BluetoothSocket, address: String) {
@@ -2353,6 +2419,29 @@ class CarPlayController(
                 }, WIRED_WEDGE_RETRY_DELAY_MILLIS)
                 return
             }
+            // 1.1.2（EU5 实车「USBMUX TCP connection was reset by the peer」）：iPhone 端残留
+            // 会话/USB 栈抖动把刚建的 USBMUX 控制连接 reset——多为暂时态，拔插重试即可过。
+            // 归入自动重试（清栈 + 常规退避），不再直接打终态 Failed 让用户手点。
+            val message = error.message.orEmpty()
+            if (!closed && message.contains("reset by the peer", ignoreCase = true)) {
+                closeWiredStack()
+                val attempt = wiredRetryCount.incrementAndGet()
+                if (attempt > MAX_WIRED_RETRIES) {
+                    debugLog("wired usbmux-reset auto-retry exhausted")
+                    onStatus(CarPlayStatus.ControlEnded)
+                    return
+                }
+                val delayMs = minOf(WIRED_RETRY_DELAY_BASE_MILLIS * attempt, WIRED_RETRY_DELAY_MAX_MILLIS)
+                onStatus(
+                    CarPlayStatus.RecoveryHint("USB 连接被 iPhone 重置，正在自动重连（第 $attempt 次）"),
+                )
+                debugLog("wired usbmux reset; auto-retry $attempt/$MAX_WIRED_RETRIES backoff=${delayMs}ms")
+                mainHandler.postDelayed({
+                    if (closed) return@postDelayed
+                    startIphone()
+                }, delayMs)
+                return
+            }
             closeWiredStack()
             if (error is Error) throw error
             fail(error)
@@ -2420,6 +2509,10 @@ class CarPlayController(
             onDiagnostic = ::debugLog,
             onError = { error ->
                 debugLog("wired NCM bridge error: ${error.message ?: error.javaClass.simpleName}")
+                // 1.1.2（EU5 104759 实测）：桥在流中楔死后自杀关桥，但 USBMUX 控制面是独立
+                // 连接不受影响 → 控制环不结束 → 僵尸会话（音频 rx=0 直至拔线）。这里主动关
+                // wiredCsm 让控制环正常退出，走既有 peer 自动重试链全量重建。
+                runCatching { wiredCsm?.close() }
             },
         )
         bridge.start()
@@ -2838,6 +2931,9 @@ class CarPlayController(
         )
         private const val RFCOMM_CONNECT_TIMEOUT_MILLIS = 15_000L
         private const val RFCOMM_FALLBACK_DELAY_MILLIS = 150L
+        // 1.1.3：SDP 探测等待（fetchUuidsWithSdp 异步回调落缓存）与连续失败提示阈值。
+        private const val SDP_QUERY_SETTLE_MILLIS = 1_500L
+        private const val SDP_FAILURE_HINT_AFTER = 2
         private const val EXECUTOR_CLOSE_TIMEOUT_MILLIS = 2_000L
         private const val ADAPTER_ADDRESS_PLACEHOLDER = "02:00:00:00:00:00"
         private val BLUETOOTH_ADDRESS = Regex("^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")

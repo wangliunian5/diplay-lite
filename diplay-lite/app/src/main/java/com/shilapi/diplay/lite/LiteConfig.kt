@@ -29,6 +29,10 @@ data class LiteConfig(
     val orientationMode: String = "auto",
     // M6k-UI：音视频路径。full=全 CarPlay（音频+视频）/ bt_audio=蓝牙出音频、CarPlay 只出视频。
     val avPathMode: String = "full",
+    // 1.1.3（bt_audio 试验）：/info 声明变体。no_audio=现状（清音频位+省略音频声明键）/
+    // keep_formats=清音频位但保留声明键。仅 avPathMode=bt_audio 时生效，长按「蓝牙音频+CarPlay」
+    // 选项循环切换，无独立 UI。
+    val btAudioInfoVariant: String = "no_audio",
     // M6k19：音乐缓存毫秒数（10-4000，默认 300 = MediaAudioBuffer.DEFAULT_MILLIS）。
     val mediaBufferMillis: Int = 300,
     // 1.0.29：分辨率设定三选一。fit=自动（保持纵横比，等比 letterbox）/
@@ -43,6 +47,10 @@ data class LiteConfig(
     // 含车机厂商扩展流；ROM 拒绝时播放层自动回退 usage 路由）。
     val mediaAudioStream: Int = 0,
     val navAudioStream: Int = 0,
+    // 1.1.2（EU5 双向无声）：Siri/助手语音（speechrecognition→USAGE_ASSISTANT、type=101
+    // default→NAVIGATION）在 PATEO 等老 HAL 上不出声 —— 勾选后这两个通道改按 USAGE_MEDIA
+    // 路由（媒体音量），媒体通道已实测出声。
+    val voiceRoutedToMedia: Boolean = false,
     // M6k-UI：开机自启（BootReceiver 读它决定是否拉起主页）。
     val bootAutostart: Boolean = false,
     // 1.0.11：开机自动开启蓝牙（BootReceiver 里 BluetoothAdapter.enable() 静默执行）。
@@ -70,6 +78,12 @@ data class LiteConfig(
 ) {
     companion object {
         private const val PREFS = "diplay_lite"
+
+        // 1.1.3（bt_audio 试验）：单独更新 /info 变体（SettingsPage 长按切换入口，立即落盘）。
+        fun setBtAudioInfoVariant(context: Context, variant: String) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putString("bt_audio_info_variant", variant).apply()
+        }
         // M6k：分辨率下限由 50 放宽到 10 —— 高分辨率车机（如 1080p）可借此把码流压得更低。
         // M6k14：上限放宽到 150（渲染图 10%-150%）；>100 是放大超采样，应用时有二次确认兜底。
         const val MIN_SCALE_PERCENT = 10
@@ -129,6 +143,7 @@ data class LiteConfig(
                 softwareVideoDecoder = prefs.getBoolean("software_video_decoder", false),
                 orientationMode = prefs.getString("orientation_mode", "auto") ?: "auto",
                 avPathMode = prefs.getString("av_path_mode", "full") ?: "full",
+                btAudioInfoVariant = prefs.getString("bt_audio_info_variant", "no_audio") ?: "no_audio",
                 mediaBufferMillis = prefs.getInt("media_buffer_millis", 300),
                 resolutionMode = prefs.getString("video_resolution_mode", "fit") ?: "fit",
                 manualWidth = prefs.getInt("manual_resolution_w", 1024)
@@ -137,6 +152,7 @@ data class LiteConfig(
                     .coerceIn(MIN_MANUAL_RESOLUTION, MAX_MANUAL_RESOLUTION),
                 mediaAudioStream = prefs.getInt("media_audio_stream", 0).let { if (it in 0..20) it else 0 },
                 navAudioStream = prefs.getInt("nav_audio_stream", 0).let { if (it in 0..20) it else 0 },
+                voiceRoutedToMedia = prefs.getBoolean("voice_routed_to_media", false),
                 bootAutostart = prefs.getBoolean("boot_autostart", false),
                 bootAutoBluetooth = prefs.getBoolean("boot_auto_bluetooth", false),
                 bootAutoHotspot = prefs.getBoolean("boot_auto_hotspot", false),
@@ -168,9 +184,11 @@ data class LiteConfig(
                 .putBoolean("software_video_decoder", config.softwareVideoDecoder)
                 .putString("orientation_mode", config.orientationMode)
                 .putString("av_path_mode", config.avPathMode)
+                .putString("bt_audio_info_variant", config.btAudioInfoVariant)
                 .putInt("media_buffer_millis", config.mediaBufferMillis)
                 .putInt("media_audio_stream", config.mediaAudioStream)
                 .putInt("nav_audio_stream", config.navAudioStream)
+                .putBoolean("voice_routed_to_media", config.voiceRoutedToMedia)
                 .putBoolean("boot_autostart", config.bootAutostart)
                 .putBoolean("boot_auto_bluetooth", config.bootAutoBluetooth)
                 .putBoolean("boot_auto_hotspot", config.bootAutoHotspot)

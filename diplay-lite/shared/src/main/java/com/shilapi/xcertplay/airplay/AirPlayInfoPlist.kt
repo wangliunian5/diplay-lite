@@ -44,7 +44,9 @@ object AirPlayInfoPlist {
             "keepAliveSendStatsAsBody" to false,
             "modes" to modes(),
         )
-        if (!config.disableAudioOutput) {
+        // 1.1.3（bt_audio 试验）：keep_formats 变体在清音频位的同时保留音频声明键，
+        // 用于分辨 iOS 16+ 拒绝零音频会话的判定依据（features 位 vs 键缺失）。
+        if (!config.disableAudioOutput || config.btAudioInfoVariant == "keep_formats") {
             info["audioLatencies"] = audioLatencies()
             info["audioFormats"] = audioFormats(
                 config.entertainmentSampleRate,

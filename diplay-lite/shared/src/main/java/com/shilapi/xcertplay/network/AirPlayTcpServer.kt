@@ -69,10 +69,8 @@ class AirPlayTcpServer {
             releaseLocked()
         }
         active.set(true)
-        val generation = ++attachGeneration
         return try {
             startAirPlayServer(
-                generation,
                 AirPlayAttachment(bindAddress, config, identity, pairings, mfi, listener, media),
             )
             AttachResult.Started
@@ -91,7 +89,6 @@ class AirPlayTcpServer {
     fun isAttached(): Boolean = active.get() && attachment != null
 
     private fun startAirPlayServer(
-        generation: Int,
         replacement: AirPlayAttachment,
     ) {
         val port = replacement.config.port
@@ -104,6 +101,7 @@ class AirPlayTcpServer {
                 server.bind(InetSocketAddress(replacement.address, port))
                 attachment = replacement
                 serverSocket = server
+                val generation = ++attachGeneration
                 Thread(
                     { acceptLoop(generation, server) },
                     "airplay-accept",
@@ -116,6 +114,11 @@ class AirPlayTcpServer {
                 runCatching { server.close() }
                 lastError = error
                 Log.w(TAG, "airplay bind $port attempt=$attempt failed: ${error.message}")
+                // 1.1.2（PDYM20 130013 / EU5 实车 7100 EADDRINUSE）：bind 失败大概率是上一代
+                // listener 的 fd 释放竞态（teardown 异步线程与重建 attach 赛跑，且「占用诊断
+                // 无占用记录」即自占用特征）——每次重试前强制同步释放本对象持有的旧监听与
+                // 会话，再重试 bind。attach 持有本对象 monitor，releaseLocked 合法。
+                runCatching { releaseLocked() }
                 if (attempt < BIND_ATTEMPTS) {
                     try {
                         Thread.sleep(BIND_RETRY_MILLIS)

@@ -2,8 +2,15 @@ package com.shilapi.diplay.lite
 
 import android.app.Notification
 import android.app.Service
+import android.bluetooth.BluetoothA2dp
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothHeadset
+import android.bluetooth.BluetoothProfile
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.media.AudioManager
 import android.os.IBinder
 import android.util.Base64
@@ -49,6 +56,58 @@ import java.util.Locale
 class LiteSessionService : Service() {
 
     private var controller: CarPlayController? = null
+
+    // 探针（1.1.2-test）：蓝牙 A2DP/HFP 连接状态广播——bt_audio 模式核心观测点。
+    // 判读：CarPlay 会话建立前后若 A2DP 断开，即「无线 handoff 断蓝牙」，蓝牙出声前提不成立。
+    private var btProbeReceiver: BroadcastReceiver? = null
+
+    private fun registerBtProbe() {
+        if (btProbeReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val profile = when (intent?.action) {
+                    BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED -> "A2DP"
+                    BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED -> "HFP"
+                    else -> return
+                }
+                val state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)
+                val stateLabel = when (state) {
+                    BluetoothProfile.STATE_CONNECTED -> "CONNECTED"
+                    BluetoothProfile.STATE_CONNECTING -> "CONNECTING"
+                    BluetoothProfile.STATE_DISCONNECTED -> "DISCONNECTED"
+                    BluetoothProfile.STATE_DISCONNECTING -> "DISCONNECTING"
+                    else -> state.toString()
+                }
+                val device = runCatching {
+                    intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                }.getOrNull()
+                val name = runCatching { device?.name }.getOrNull()
+                LiteLog.log(
+                    "bt",
+                    "探针 $profile $stateLabel device=${device?.address ?: "unknown"} name=$name",
+                )
+            }
+        }
+        runCatching {
+            registerReceiver(
+                receiver,
+                IntentFilter().apply {
+                    addAction(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
+                    addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
+                },
+            )
+            btProbeReceiver = receiver
+            LiteLog.log("bt", "探针已挂（A2DP/HFP 连接状态广播）")
+        }.onFailure {
+            LiteLog.log("bt", "探针挂载失败：${it.message}")
+        }
+    }
+
+    private fun unregisterBtProbe() {
+        val receiver = btProbeReceiver ?: return
+        btProbeReceiver = null
+        runCatching { unregisterReceiver(receiver) }
+    }
 
     /** M6k16：本次会话通道（car=车机热点 MANUAL_IPV4 / relay=双 client 接随身WiFi RELAY）。 */
     private var requestedChannel = "car"
@@ -111,6 +170,7 @@ class LiteSessionService : Service() {
         LiteLog.log("service", "构建标识 version=${buildVersion()} apk=${apkStamp()}")
         // M6k16：通道由主页 Intent 带入（car/relay）；START_STICKY 自启 intent 为 null 时沿用上一轮。
         intent?.getStringExtra(EXTRA_CHANNEL)?.let { requestedChannel = it }
+        registerBtProbe()
         startController()
         return START_STICKY
     }
@@ -123,6 +183,7 @@ class LiteSessionService : Service() {
         // （stopService 后新实例启动 / 进程内重建重启后立即重连）先等它关闭 —— 否则残留的
         // 7000 监听/解码器会让新会话起不来、UI 永远停在"连接中"（10-02 EADDRINUSE 跨实例形态）。
         LiteSteeringKeys.detach()
+        unregisterBtProbe()
         controller?.let { closingController = it; it.close() }
         controller = null
         mediaSink?.close()
@@ -202,7 +263,7 @@ class LiteSessionService : Service() {
                 "fps=$fps scale=${config.videoScalePercent}% speakerForCalls=${config.speakerForCalls} " +
                 "softDecode=${config.softwareVideoDecoder} " +
                 "audioStream(media/nav)=${config.mediaAudioStream}/${config.navAudioStream} " +
-                "avPath=${config.avPathMode} " +
+                "avPath=${config.avPathMode} variant=${config.btAudioInfoVariant} " +
                 "channel=$requestedChannel ssid=$ssid security=$security",
         )
         // M3：MediaCodec 解码到 SurfaceView；SurfaceView 的 Surface 由 LiteVideoBridge 补齐。
@@ -222,6 +283,9 @@ class LiteSessionService : Service() {
             navStreamOverride = config.navAudioStream,
             // 1.0.16（P0-1）：通话走扬声器时 telephony 下行按 MEDIA（STREAM_MUSIC）路由。
             callsRoutedToMedia = { LiteConfig.load(this).speakerForCalls },
+            // 1.1.2（EU5 双向无声）：Siri/助手语音（ASSISTANT/NAVIGATION usage）在老 HAL 上
+            // 不出声，勾选后改走媒体通道（媒体已实测出声）。
+            voiceRoutedToMedia = { LiteConfig.load(this).voiceRoutedToMedia },
             // 1.0.11（FE-6 拉伸）：解码器实际尺寸 → UI 层等比适配 SurfaceView。
             onVideoOutputSizeChanged = { w, h ->
                 LiteLog.log("media", "video output size coded=${w}x${h}")
@@ -305,11 +369,14 @@ class LiteSessionService : Service() {
                     // →仍零流），故 M4i 让上下行都声明 OPUS。此字段保留备用（将来若要"仅对播放分级"）。
                     // 详见 AirPlayInfoPlist.audioFormats / 超低版本实机测试记录.md T23/T26/T27。
                     opusEncoderAvailable = false,
-                    // M6k21 方案二（音视频链路选择）：bt_audio=蓝牙音频+CarPlay —— /info 的
-                    // features 换 NO_AUDIO 位且不下发 audioOutputFormats，iPhone 认为车机无
-                    // CarPlay 音频能力、不建音流，音频留在 iPhone 走已配对的蓝牙 A2DP 出声。
-                    // full=全 CarPlay（默认，音视频都走 2.4G）。重开会话生效。
-                    disableAudioOutput = config.avPathMode == "bt_audio",
+                    // M6k21 方案二 → 20261012 定案改版：avPathMode=bt_audio 不再削减 /info 音频
+                    // 声明（disableAudioOutput 恒 false）——iOS 16+ 实测定案：no_audio 声明被
+                    // iPhone 拒建流、keep_formats 卡 handoff 隧道死锁，协议层无「自动切蓝牙」通道。
+                    // bt_audio 选项现为引导模式：底层恒走全 CarPlay 推流，音频切蓝牙由用户在
+                    // iPhone 控制中心手动完成（SettingsPage 弹窗教学）。
+                    disableAudioOutput = false,
+                    // 1.1.3（bt_audio 试验）：/info 声明变体随 disableAudioOutput 一并失效（恒 no_audio 不生效）。
+                    btAudioInfoVariant = config.btAudioInfoVariant,
                     // M6k22：自定义返回桌面图标 → /info 的 oemIcons 下发（未设置/不合规走内置默认）。
                     icons = listOfNotNull(CarIconStore.loadIcon(this@LiteSessionService)),
                 ),

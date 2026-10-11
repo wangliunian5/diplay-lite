@@ -69,6 +69,12 @@ class AndroidMediaSink(
      */
     private val callsRoutedToMedia: () -> Boolean = { false },
     /**
+     * 1.1.2（EU5 双向无声）：Siri/助手语音走媒体通道开关。ASSISTANT（speechrecognition）
+     * 与 NAVIGATION（type=101 default）usage 在 PATEO 等老 HAL 上静音——勾选后改按
+     * USAGE_MEDIA 路由（媒体音量，已实测出声）。取值函数——每次建流现读，改设置即生效。
+     */
+    private val voiceRoutedToMedia: () -> Boolean = { false },
+    /**
      * 1.0.11（FE-6 拉伸）：解码器实际输出尺寸回调（crop 优先于 KEY_WIDTH/HEIGHT）。
      * iPhone 实际编码尺寸可能与声明的流尺寸不一致（如超宽屏 + 高缩放被编码器封顶），
      * UI 层据此把 SurfaceView 等比适配，避免硬拉伸变形。
@@ -243,6 +249,8 @@ class AndroidMediaSink(
             navStreamOverride,
             // 1.0.16（P0-1）：建流瞬间现读「通话声音走扬声器」，命中则通话下行按 MEDIA 路由。
             callsRoutedToMedia(),
+            // 1.1.2：建流瞬间现读「Siri/语音提示走媒体音量」，命中则 ASSISTANT/NAVIGATION 按 MEDIA 路由。
+            voiceRoutedToMedia(),
         ).also { audioRenderers[type] = it }
     }
 
@@ -318,6 +326,14 @@ private class VideoDecoder(
     // M6j：软解探测日志只打一次（T44 里它每帧刷一次，45 条把日志淹了）。
     private var softwareProbeLogged = false
     private val referenceChain = VideoReferenceChain()
+    // 1.1.3（绿线修复②）：恢复/重建/surface 重接后抑制渲染，直到下一个 IDR 真正喂进解码器，
+    // 挡掉厂商 OMX flush 后吐出的残留脏缓冲（8815 短暂绿线的另一来源）。
+    @Volatile private var renderHold = true
+    // 1.1.3（绿线修复③·渲染节奏限流）：render-latest 只在单次 drain 内去重，burst 时解码线程
+    // 每个 feed 调一次 drain、每次渲一帧，渲染速率仍跟着解码速度走（弱机瞬间 60~100fps），
+    // 8815 实测绿线仍在。加最小渲染间隔（≈一帧显示周期）：间隔内的帧跳过不上屏，
+    // 静态画面由 Surface 保留上一帧显示。仅解码线程访问，无需 volatile。
+    private var lastRenderRequestNs = 0L
     // M6k：最近一次喂入的帧是不是随机访问帧（IDR）。解码失败时落盘，用于判读"是否从 P 帧续解"。
     @Volatile private var lastFrameKeyFrame = true
     // 1.0.29（AC8227 倒车闪屏）：恢复看门狗计数——关键帧连发无渲染 = control 通道疑似死亡。
@@ -388,6 +404,7 @@ private class VideoDecoder(
                     fallBackFromSoftwareDecoder(error)
                     releaseDecoder()
                     referenceChain.reset()
+                    renderHold = true
                     requestKeyFrameIfDue()
                 } catch (error: Throwable) {
                     // 码率/帧长突变时可能抛 Error（OutOfMemoryError 等），catch(Exception) 兜不住，
@@ -398,6 +415,7 @@ private class VideoDecoder(
                     fallBackFromSoftwareDecoder(error)
                     releaseDecoder()
                     referenceChain.reset()
+                    renderHold = true
                     requestKeyFrameIfDue()
                 }
             }
@@ -425,6 +443,7 @@ private class VideoDecoder(
         duplicateConfigLogged = false
         releaseDecoder()
         referenceChain.reset()
+        renderHold = true
         val surface = outputSurface ?: return
         val codec = config.codec
         val codecData = config.codecData
@@ -583,6 +602,8 @@ private class VideoDecoder(
                 try {
                     codec.setOutputSurface(surface)
                     Log.i(TAG, "video decoder output surface updated")
+                    // 新 surface 上首帧必须来自干净 IDR（旧 surface 的在途帧到新 surface 上就是花屏/绿线）。
+                    renderHold = true
                     // 1.0.29（AC8227 倒车闪屏）：surface 重新接线立即请求关键帧，
                     // 不等首帧 P 帧被拒才触发 —— 缩短倒车结束后的黑屏恢复期。
                     forceKeyFrameRequest("surface reattached")
@@ -645,6 +666,7 @@ private class VideoDecoder(
             )
             releaseDecoder()
             referenceChain.reset()
+            renderHold = true
             requestKeyFrameIfDue()
             return
         }
@@ -653,6 +675,8 @@ private class VideoDecoder(
             input.put(annexB)
             codec.queueInputBuffer(index, 0, annexB.size, System.nanoTime() / 1000, 0)
             referenceChain.onQueued()
+            // IDR 已入解码器：解除渲染抑制（其后输出才是干净画面）。
+            if (keyFrame) renderHold = false
         } else {
             recover("video frame exceeded codec input capacity")
             return
@@ -693,6 +717,7 @@ private class VideoDecoder(
         Log.w(TAG, "Video recovery: $reason; waiting for keyframe")
         stats.onRecovery()
         report("recovery: $reason; waiting for keyframe" + if (rebuildDecoder) "" else " (flush decoder)")
+        renderHold = true
         if (rebuildDecoder) {
             // Recreate with codec-specific data: flush can discard CSD before the first output.
             releaseDecoder()
@@ -737,28 +762,60 @@ private class VideoDecoder(
 
     private fun drainOutput(codec: MediaCodec) {
         val info = MediaCodec.BufferInfo()
+        // 1.1.3（绿线修复① + burst 节流）：原实现每个输出帧都立刻 release(render=true)，
+        // Wi-Fi 断流后突发 N 帧时，旧 MTK overlay/显示管线跟不上连续合成 → 短暂绿线，
+        // 中间帧还都是肉眼看不见的闪过（纯浪费合成算力）。
+        // 改法：只持有最新一个输出缓冲，被更新帧取代的旧帧静默归还（render=false），
+        // 等没有新帧时才真正渲染最新帧 —— burst 期间合成量 N→1，撕裂源消失。
+        var pendingIndex = -1
+        var pendingEos = false
+        fun renderPending(): Boolean {
+            if (pendingIndex >= 0) {
+                // 1.1.3 修复（8815 011235 无画面定案②）：**不得按 info.size 过滤**——Surface 输出模式下
+                // 高通 OMX 的输出 BufferInfo.size 恒为 0（数据直送 surface，size 无意义），
+                // 按 size>0 过滤会把每一帧都当"零长度填充"静默丢掉 → shown=0 全黑。
+                // 渲染判据只看 surface、renderHold 与渲染节奏间隔。
+                val nowNs = System.nanoTime()
+                val due = lastRenderRequestNs == 0L || nowNs - lastRenderRequestNs >= RENDER_MIN_INTERVAL_NS
+                val render = outputSurface != null && !renderHold && due
+                if (render) lastRenderRequestNs = nowNs
+                codec.releaseOutputBuffer(pendingIndex, render)
+                pendingIndex = -1
+                if (render) {
+                    stats.onRendered()
+                    // 1.0.29：恢复看门狗复位——有画面了，通道健康。
+                    keyframeRequestsWithoutRender = 0
+                    keyframeStallReported = false
+                    if (!renderedFrameLogged) {
+                        renderedFrameLogged = true
+                        report("first frame rendered")
+                        Log.i(TAG, "video decoder rendered first frame")
+                    }
+                }
+            }
+            pendingEos = false
+            return false
+        }
         while (running) {
             val index = codec.dequeueOutputBuffer(info, 0)
             when {
-                index == MediaCodec.INFO_TRY_AGAIN_LATER -> return
-                index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> logOutputFormat(codec.outputFormat)
-                index >= 0 -> {
-                    val render = outputSurface != null
-                    codec.releaseOutputBuffer(index, render)
-                    if (render) stats.onRendered()
-                    if (render) {
-                        // 1.0.29：恢复看门狗复位——有画面了，通道健康。
-                        keyframeRequestsWithoutRender = 0
-                        keyframeStallReported = false
-                    }
-                    if (render && !renderedFrameLogged) {
-                        renderedFrameLogged = true
-                        report("first frame rendered")
-                        Log.i(TAG, "video decoder rendered first frame bytes=${info.size}")
-                    }
-                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
+                // 1.1.3 修复（8815 010252 无画面定案①）：TRY_AGAIN 必须**无条件退出**本轮 drain。
+                // 上一版写成 `if (renderPending()) return`，无挂起帧时 renderPending 返回 false，
+                // 循环继续 → dequeue 又是 TRY_AGAIN → **忙死循环**：解码线程卡死在本函数，
+                // 队列无人消费（无 stats/无首帧/无关键帧请求），网络层视频包堆积——1.1.3 首包即中招。
+                index == MediaCodec.INFO_TRY_AGAIN_LATER -> { renderPending(); return }
+                index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    renderPending()
+                    logOutputFormat(codec.outputFormat)
                 }
-                else -> return
+                index >= 0 -> {
+                    // 上一帧被更新帧取代：静默归还，不上合成器。
+                    if (pendingIndex >= 0) codec.releaseOutputBuffer(pendingIndex, false)
+                    pendingIndex = index
+                    pendingEos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                }
+                // 负值未知码（防御）：与 TRY_AGAIN 同样必须退出，防忙循环。
+                else -> { renderPending(); return }
             }
         }
     }
@@ -827,7 +884,15 @@ private class VideoDecoder(
         // M6b：250ms → 350ms。C8815 上解码偶发被抢占（processMaxUs 峰值 111ms/包），250ms 会被
         // 误判成积压而频繁 forceKeyFrame（每次触发画面冻结到关键帧到达，主观上更卡）；
         // 350ms 留出余量，只在真积压（网络/渲染真的跟不上）时才丢帧。
-        const val MAX_FRAME_AGE_NS = 350_000_000L
+        // 1.1.3（运动噪块修复①）：8815 实测 Wi-Fi 每 ~0.9s 一次 radio gap（maxGap 普遍 830~980ms），
+        // 350ms 阈值让每个 gap 都触发「丢队列+flush+等 IDR」——运动段 backlog/flush 每 5s 窗口 1~2 次，
+        // 老 Adreno 203 档解码器在频繁 mid-GOP flush + 突发灌帧下会静默输出纠错噪块（不报错）。
+        // 解码实测 60~100fps 远超流速率，积压可自排空：阈值抬到 1100ms（>gap 周期），gap 后的
+        // 突发帧直接续解，不再清解码器——既消 flush churn，也消每次恢复的冻结等待。
+        const val MAX_FRAME_AGE_NS = 1_100_000_000L
+        // 1.1.3（绿线修复③）：最小渲染间隔 ≈ 一帧显示周期（60Hz→16.7ms）。
+        // burst 期间解码速度可到 60~100fps，超频渲染在老显示管线上出 scanout 异常（绿线）。
+        const val RENDER_MIN_INTERVAL_NS = 16_000_000L
         val START_CODE = byteArrayOf(0x00, 0x00, 0x00, 0x01)
     }
 }
@@ -859,6 +924,11 @@ private class AudioRenderer(
      * 不再走 VOICE_COMMUNICATION+IN_COMMUNICATION（华为等 ROM 无真实通话时该 DSP 路径静默）。
      */
     private val callsRoutedToMedia: Boolean = false,
+    /**
+     * 1.1.2（EU5 双向无声）：true 时 ASSISTANT（speechrecognition）与 NAVIGATION（type=101
+     * default）通道按 USAGE_MEDIA 路由——PATEO 等老 HAL 对这两个 usage 静音。
+     */
+    private val voiceRoutedToMedia: Boolean = false,
 ) : Closeable {
     private data class AudioPacket(val rtp: ByteArray, val sample: Int)
 
@@ -1277,8 +1347,14 @@ private class AudioRenderer(
         AudioChannel.PHONE ->
             if (callsRoutedToMedia) AudioAttributes.USAGE_MEDIA
             else AudioAttributes.USAGE_VOICE_COMMUNICATION
-        AudioChannel.ASSISTANT -> AudioAttributes.USAGE_ASSISTANT
-        AudioChannel.NAVIGATION -> AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
+        AudioChannel.ASSISTANT ->
+            // 1.1.2：助手/Siri 语音在老 HAL 上静音 → 开关打开时走媒体通道（媒体音量）。
+            if (voiceRoutedToMedia) AudioAttributes.USAGE_MEDIA
+            else AudioAttributes.USAGE_ASSISTANT
+        AudioChannel.NAVIGATION ->
+            // 1.1.2：导航/Siri 提示音同受开关控制（NAVIGATION usage 同样存在老 HAL 静音场景）。
+            if (voiceRoutedToMedia) AudioAttributes.USAGE_MEDIA
+            else AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
     }
 
     private fun contentTypeFor(contentType: AudioContentType): Int = when (contentType) {

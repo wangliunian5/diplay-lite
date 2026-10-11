@@ -81,20 +81,21 @@ class HotspotPage(private val activity: MainActivity, private val mode: String) 
         column.addView(sectionLabel("配置参数"), block(top = dip(8), bottom = dip(4)))
         column.addView(buildCredentialRow(), block())
         column.addView(
-            buttonRow(
-                pillButton("保存", STYLE_OUTLINE) {
-                    saveFromForm()
-                    toast("已保存")
-                },
-                // M6k19：中继页跳系统 Wi-Fi（随身WiFi也在此页连接）；车机页维持热点跳转。
-                if (isCar) {
-                    jumpButton("系统WiFi跳转") { openWifiSettings() }
-                } else {
-                    jumpButton("系统热点跳转") { openHotspotSettings() }
-                },
-            ),
-            block(top = dip(10)),
-        )
+                buttonRow(
+                    pillButton("保存", STYLE_OUTLINE) {
+                        saveFromForm()
+                        toast("已保存")
+                    },
+                    // 1.1.1 UI 修正：车机页配置的就是车机热点 → 跳系统热点设置（原误为 WiFi 跳转）；
+                    // 中继页跳系统 Wi-Fi（随身 WiFi 也在此页连接）。
+                    if (isCar) {
+                        jumpButton("系统热点跳转") { openHotspotSettings() }
+                    } else {
+                        jumpButton("系统WiFi跳转") { openWifiSettings() }
+                    },
+                ),
+                block(top = dip(10)),
+            )
         column.addView(divider(), block(top = dip(14)))
         column.addView(sectionLabel("蓝牙信息"), block(top = dip(12), bottom = dip(4)))
         btSummary = TextView(activity).apply {

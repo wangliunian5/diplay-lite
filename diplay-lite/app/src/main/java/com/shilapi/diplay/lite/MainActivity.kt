@@ -43,9 +43,9 @@ import kotlin.math.abs
  * （SettingsPage/CarIconPage/HotspotPage），根除子 Activity 新窗口出生方向闪转问题。
  *
  * home 页形态（M6k21，对齐原版）：
- * - hero 区（原版式）：ACCENT 眉题 + 大标题 + MUTED 副题；
  * - 「CARPLAY 状态」大状态卡（原版「无线 CARPLAY」式）：眉题 + 实时状态大字 + 主按钮
  *   （空闲=按默认通道连接 / 会话中=断开）+ 默认通道提示；
+ *   （hero 文案区已删除，横屏右列改为与状态卡顶底对齐）
  * - USB 直连键（原版右列位）：竖屏在状态卡下方独立成行；横屏在右列 USB+设置。
  *   通道卡取消：热点/中继网络配置入口移入设置页（「车机热点网络配置」「中继热点网络配置」）。
  *
@@ -62,6 +62,20 @@ import kotlin.math.abs
  * clipToOutline（API18）沿用既有护栏。零 XML，不改 Manifest。
  */
 class MainActivity : Activity() {
+
+    /**
+     * 1.1.1 UI：全局字体放大 1.2 倍 —— 全部文字均为 sp 单位，覆盖 fontScale 一次生效
+     * （含 AlertDialog/弹窗/输入框）。createConfigurationContext 是 API 17+，API 16 回落不放大。
+     */
+    override fun attachBaseContext(newBase: android.content.Context) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+            val config = Configuration(newBase.resources.configuration)
+            config.fontScale = 1.2f
+            super.attachBaseContext(newBase.createConfigurationContext(config))
+        } else {
+            super.attachBaseContext(newBase)
+        }
+    }
 
     private val handler = Handler()
 
@@ -192,6 +206,8 @@ class MainActivity : Activity() {
         videoStretchMode = LiteConfig.load(this).resolutionMode == "stretch"
         handler.post(refreshTask)
         maybeAutoConnect()
+        // 1.1.4 系统诊断：新装无检测记录时，主界面就绪后延迟 5 秒触发首启快检（可跳过）。
+        Diagnostics.quickCheckIfDue(this)
     }
 
     override fun onPause() {
@@ -313,16 +329,28 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 返回键：学习页 → 设置页（学习态下 cleanup 由 setPage 自动触发，等效取消学习）。
-     * 其余子页维持系统默认行为（finish 退出）不变。
+     * 系统返回键层级（1.1.1 UI）：
+     * 图标页裁剪态 → 回图标主页；三级页（图标/方向盘/热点配置）→ 设置页；
+     * 设置页 → 主页；主页 → 弹窗确认退出。
      */
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (page == "steering") {
-            setPage("settings")
-            return
+        when {
+            page == "caricon" && carIconPage?.onBackKey() == true -> return
+            page != "home" && page != "settings" -> setPage("settings")
+            page == "settings" -> goHome()
+            else -> confirmExit()
         }
-        super.onBackPressed()
+    }
+
+    /** 主页返回：确认退出弹窗（防止误触直接杀会话）。 */
+    private fun confirmExit() {
+        AlertDialog.Builder(this)
+            .setTitle("退出 DiPlay Lite")
+            .setMessage("确认退出软件吗？")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("确认退出") { _, _ -> finish() }
+            .show()
     }
 
     /**
@@ -508,9 +536,15 @@ class MainActivity : Activity() {
             )
             ball.setOnClickListener { setPanelVisible(!panelVisible) }
             // 悬浮球初始位置 = 右对齐 + 上下居中；拖拽后吸附最近左/右边。
+            // 1.1.1 UI：横屏（1024x600 车机）右列按键加高后与球重叠 → 初始位改右下角空区；
+            // 竖屏右列窄，保持垂直居中。
             val ballSize = dip(46)
             val ballParams = FrameLayout.LayoutParams(ballSize, ballSize, Gravity.TOP or Gravity.END)
-            ballParams.topMargin = ((resources.displayMetrics.heightPixels - ballSize) / 2).coerceAtLeast(0)
+            ballParams.topMargin = if (isLandscapeUi()) {
+                resources.displayMetrics.heightPixels - ballSize - dip(28)
+            } else {
+                ((resources.displayMetrics.heightPixels - ballSize) / 2).coerceAtLeast(0)
+            }
             ballParams.rightMargin = dip(12)
             ball.layoutParams = ballParams
             attachBallDrag(ball, ballParams)
@@ -566,8 +600,8 @@ class MainActivity : Activity() {
     // ---------- home 页 ----------
 
     /**
-     * home 面板（M6k21）：竖屏 = hero → 状态大卡 → USB 直连（按钮+说明）；
-     * 横屏 = hero+状态卡（左）｜USB 直连+设置（右）。
+     * home 面板（M6k21）：竖屏 = 状态大卡 → USB 直连（按钮+说明）；
+     * 横屏 = 状态卡（左）｜USB 直连+设置（右），右列与左卡垂直对齐。
      */
     private fun homePanel(): View {
         // M6k24：布局方向完全跟随设置（强制横屏/强制竖屏），不再读 Display。
@@ -579,24 +613,18 @@ class MainActivity : Activity() {
         content.addView(buildHeader())
         content.addView(space(12))
 
-        // hero 区（原版式）：ACCENT 眉题 + 大标题 + MUTED 副题。
-        val hero = column()
-        hero.addView(label("你的车机 · 你的 CARPLAY。", 12, Ui.ACCENT, true).apply { applyLetterSpacing(0.16f) })
-        hero.addView(
-            label("熟悉的驾驶体验。", if (wide) 30 else 24, Ui.TEXT, true).apply { setPadding(0, dip(10), 0, dip(8)) },
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
-        )
-        hero.addView(
-            label("无线 CarPlay 与 USB 直连，随时就绪。", 14, Ui.MUTED),
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
-        )
-
         val statusCard = buildStatusCard(config)
 
         if (wide) {
             // 右列（原版式）：USB 直连 + 设置入口。
+            // 1.1.1 UI：按键加高（52dp）+ 行间距拉开（12dp），1024x600 车机横屏不再拥挤。
+            // 8815 版式：hero 文案区删除，右列 MATCH_PARENT 与左侧状态大卡垂直对齐
+            //（USB 直连贴卡顶、设置贴卡底，中段弹性居中）。
             val right = column().apply { gravity = Gravity.CENTER_HORIZONTAL }
-            right.addView(button("USB 直连", false) { connect("usb") })
+            right.addView(
+                button("USB 直连", false) { connect("usb") },
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dip(52)),
+            )
             right.addView(
                 label("将 iPhone 插入车机 USB 数据接口，\n当 iPhone 提示时允许 CarPlay。", 12, Ui.MUTED).apply {
                     gravity = Gravity.CENTER
@@ -605,24 +633,25 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
             )
             // M6k24：右列同样提供 3 个系统设置快捷入口 + 设置键。
-            right.addView(quickSettingsRow(), LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            right.addView(button("设置", false) { setPage("settings") })
+            right.addView(
+                quickSettingsRow(),
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dip(12) },
+            )
+            right.addView(
+                button("设置", false) { setPage("settings") },
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dip(52)).apply { topMargin = dip(12) },
+            )
 
             val topRow = row().apply { gravity = Gravity.TOP }
             topRow.addView(
-                column().apply {
-                    addView(hero)
-                    addView(space(14))
-                    addView(statusCard)
-                },
+                statusCard,
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.6f),
             )
             topRow.addView(space(16), LinearLayout.LayoutParams(dip(16), 1))
-            topRow.addView(right, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            // 右列高度撑满行高（= 左卡高度），实现与状态大卡顶底对齐。
+            topRow.addView(right, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
             content.addView(topRow)
         } else {
-            content.addView(hero)
-            content.addView(space(12))
             content.addView(statusCard)
             // 竖屏：USB 直连键独立成行（原版右列键位）。
             content.addView(
@@ -741,8 +770,8 @@ class MainActivity : Activity() {
             "热点" to { SystemSettingsJumps.openHotspotSettings(this) },
         )
         entries.forEachIndexed { index, (title, onClick) ->
-            val entry = button(title, primary = false, height = 44, click = onClick)
-            entry.layoutParams = LinearLayout.LayoutParams(0, dip(44), 1f).apply {
+            val entry = button(title, primary = false, height = 48, click = onClick)
+            entry.layoutParams = LinearLayout.LayoutParams(0, dip(48), 1f).apply {
                 if (index > 0) leftMargin = dip(8)
             }
             rowView.addView(entry)

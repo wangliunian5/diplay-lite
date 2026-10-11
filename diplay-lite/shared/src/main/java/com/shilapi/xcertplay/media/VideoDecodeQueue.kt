@@ -28,16 +28,21 @@ internal class VideoDecodeQueue(
     private val maxBytes: Int = 8 * 1024 * 1024,
 ) {
     private val jobs = LinkedBlockingQueue<VideoJob>()
+    // 1.1.3（性能）：帧到达速率最高 60fps，原实现每次 offer 都 filterIsInstance 全队列扫一遍
+    // （O(n) 扫描 + 临时集合分配，且与解码线程共用一把锁）→ 改为运行计数，检查 O(1)。
+    private var frameCount = 0
+    private var frameBytes = 0L
 
     @Synchronized fun offer(job: VideoJob) {
         if (job is VideoJob.Frame) {
-            val frames = jobs.filterIsInstance<VideoJob.Frame>()
-            if (frames.size >= maxFrames || frames.sumOf { it.nalus.size.toLong() } + job.nalus.size > maxBytes) {
+            if (frameCount >= maxFrames || frameBytes + job.nalus.size > maxBytes) {
                 discardFrames()
                 jobs.offer(VideoJob.Resync)
             }
             // A single oversized frame is also a lost reference chain.
             if (job.nalus.size > maxBytes) return
+            frameCount++
+            frameBytes += job.nalus.size
         }
         jobs.offer(job)
     }
@@ -47,11 +52,25 @@ internal class VideoDecodeQueue(
         val iterator = jobs.iterator()
         while (iterator.hasNext()) {
             val job = iterator.next()
-            if (job is VideoJob.Frame || job is VideoJob.Resync) iterator.remove()
+            if (job is VideoJob.Frame || job is VideoJob.Resync) {
+                if (job is VideoJob.Frame) {
+                    frameCount--
+                    frameBytes -= job.nalus.size
+                }
+                iterator.remove()
+            }
         }
     }
 
-    fun poll(timeoutMillis: Long): VideoJob? = jobs.poll(timeoutMillis, TimeUnit.MILLISECONDS)
+    fun poll(timeoutMillis: Long): VideoJob? {
+        val job = jobs.poll(timeoutMillis, TimeUnit.MILLISECONDS) ?: return null
+        // 计数修正只在解码线程发生（单消费者），加锁只为与 offer 的检查互斥。
+        if (job is VideoJob.Frame) synchronized(this) {
+            frameCount--
+            frameBytes -= job.nalus.size
+        }
+        return job
+    }
 }
 
 /** Drain output while waiting for input: full output buffers can otherwise starve input forever. */

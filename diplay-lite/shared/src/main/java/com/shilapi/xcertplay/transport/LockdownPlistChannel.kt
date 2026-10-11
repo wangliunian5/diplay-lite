@@ -4,7 +4,7 @@ import android.util.Base64
 import android.util.Xml
 import java.io.Closeable
 import java.io.StringReader
-import java.nio.charset.StandardCharsets
+import java.nio.charset.Charset
 import org.xmlpull.v1.XmlPullParser
 
 /** The small plist value set needed by Lockdown messages. */
@@ -100,7 +100,7 @@ class LockdownPlistChannel(
     }
 
     private fun sendLocked(message: LockdownPlistValue.Dictionary) {
-        val xml = encode(message).toByteArray(StandardCharsets.UTF_8)
+        val xml = encode(message).toByteArray(Charset.forName("UTF-8"))
         if (xml.isEmpty() || xml.size > maximumMessageBytes) {
             throw IphoneUsbException.Protocol("Lockdown plist message length ${xml.size} is outside 1..$maximumMessageBytes")
         }
@@ -147,7 +147,7 @@ class LockdownPlistChannel(
             val parser = Xml.newPullParser().apply {
                 setFeature(XmlPullParser.FEATURE_PROCESS_DOCDECL, false)
                 setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
-                setInput(StringReader(xml.toString(StandardCharsets.UTF_8)))
+                setInput(StringReader(xml.toString(Charset.forName("UTF-8"))))
             }
             if (parser.nextTag() != XmlPullParser.START_TAG || parser.name != "plist") {
                 throw IphoneUsbException.Protocol("Lockdown plist root must be <plist>")

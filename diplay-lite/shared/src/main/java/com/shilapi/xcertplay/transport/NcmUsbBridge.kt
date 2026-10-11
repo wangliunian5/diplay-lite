@@ -391,6 +391,24 @@ class NcmUsbBridge internal constructor(
 
         /** Claims and activates the NCM control/data interfaces; owns the connection on success. */
         fun open(connection: UsbDeviceConnection, function: NcmFunctionDiscovery.NcmFunction): NcmUsbBridge {
+            // 1.1.3（root 抢回）：claim 失败且车机有 root 时，unbind 内核 cdc_ncm 后重试一次。
+            // 同一 connection 复用安全：失败路径已 releaseInterface，重试重新 claim。
+            try {
+                return openOnce(connection, function)
+            } catch (error: IphoneUsbException.DeviceUnavailable) {
+                val message = error.message ?: ""
+                if (!message.contains("could not claim") && !message.contains("could not select")) throw error
+                if (!RootNcmReclaimer.reclaim(message)) throw error
+                try {
+                    Thread.sleep(400)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+                return openOnce(connection, function)
+            }
+        }
+
+        private fun openOnce(connection: UsbDeviceConnection, function: NcmFunctionDiscovery.NcmFunction): NcmUsbBridge {
             val claimed = ArrayList<UsbInterface>(2)
             try {
                 val descriptorHostMac = readNcmHostMac(connection, function.control.id)

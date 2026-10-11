@@ -297,6 +297,8 @@ internal class SteeringPage(private val activity: MainActivity) {
 
         renderList()
         return ScrollView(activity).apply {
+            // 1.1.1 UI：背景与其他页统一为 Ui.BG（此前裸用窗口黑底，观感偏黑不一致）。
+            setBackgroundColor(Ui.BG)
             addView(column, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
         }
     }

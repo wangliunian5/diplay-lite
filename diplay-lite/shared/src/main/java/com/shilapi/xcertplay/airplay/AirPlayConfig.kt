@@ -48,6 +48,10 @@ data class AirPlayConfig(
     val entertainmentSampleRate: Int = 48000,
     val hevc: Boolean = false,
     val disableAudioOutput: Boolean = false,
+    // 1.1.3（bt_audio 试验）：/info 声明变体。no_audio=清音频位+整体省略 audioLatencies/audioFormats
+    // （现状，iOS 16+ 实测不建屏幕流）；keep_formats=同样清音频位但保留两组声明键
+    // （试验 iPhone 的拒绝是否源于键缺失而非 features 位；与上游 modes/resources 声明一致）。
+    val btAudioInfoVariant: String = "no_audio",
     val microphone: Boolean = false,
     /**
      * Whether the device has an OPUS encoder (MediaCodec "audio/opus" encoder).

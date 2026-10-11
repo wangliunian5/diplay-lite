@@ -120,6 +120,7 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var cbSoftDecode: CheckBox
     private lateinit var cbFps30: CheckBox
     private lateinit var cbSpeaker: CheckBox
+    private lateinit var cbVoiceMedia: CheckBox
     private lateinit var tvVersion: TextView
 
     // loadIntoForm 期间静默：setChecked 会触发监听，避免半加载状态写盘
@@ -162,40 +163,92 @@ class SettingsPage(private val activity: MainActivity) {
         }
         column.addView(buildHeader(), block())
 
-        // 数值行：左标题 ｜ 右数值框（回显当前值）+ 应用
-        inputScale = buildValueRow(column, "分辨率自定义", "${LiteConfig.MIN_SCALE_PERCENT}% - ${LiteConfig.MAX_SCALE_PERCENT}%") { applyScale(it) }
-        inputDuck = buildValueRow(column, "导航音频触发音量降低", "${LiteConfig.MIN_DUCK_PERCENT}% - ${LiteConfig.MAX_DUCK_PERCENT}%") { applyDuck(it) }
-        // M6k19：音乐缓存毫秒数（跟随导航音量降低之后），范围 10-4000ms。
-        inputBuffer = buildValueRow(column, "音乐缓存", "${LiteConfig.MIN_MEDIA_BUFFER_MILLIS} - ${LiteConfig.MAX_MEDIA_BUFFER_MILLIS} (ms)") { applyBuffer(it) }
-        // 生效说明：起播阈值跟随设置值；缓冲池深度有 1500ms 下限（T29 防抖动），设置 >1300ms 才会加深。
-        column.addView(
-            TextView(activity).apply {
-                text = "影响音乐起播速度。更改在重新连接后生效。缓冲池固定不低于 1500ms 防网络卡顿，设置高于 1300 才会加深缓冲池。"
-                setTextColor(Ui.SUB)
-                textSize = 12f
-            },
-            block(top = dip(2), bottom = dip(8)),
-        )
+        // 1.1.1 UI：设置页四组分类 —— 连接设置 / 画面设置 / 音频设置 / 体验优化。
 
-        // 1.0.29：分辨率设定 —— 自动（保持纵横比，等比 letterbox）/ 自动（拉伸铺满）/
-        // 手动指定（回报给 iPhone = 手动宽高 ×「分辨率自定义」百分比，重启后生效）。
-        column.addView(sectionLabel("分辨率设定"), block(top = dip(12), bottom = dip(4)))
+        // ── 连接设置：热点网络配置入口 + 打开软件时的默认连接通道 ──
+        // 1.1.3（UI 字号调整）：分组标题 +1dp；入口行改名缩号（16f→13f）。
+        column.addView(sectionLabel("连接设置"), block(top = dip(8), bottom = dip(4)))
+        column.addView(entryRow("车机热点配置") { activity.openHotspotPage("car") }, block(top = dip(4)))
+        column.addView(entryRow("中继热点配置") { activity.openHotspotPage("relay") }, block(top = dip(8)))
+        // M6k19：默认自动连接方式（三选一，从主页 toggle 迁移至此）。
+        // 打开 App 时按此通道自动连接：car=车机热点 / relay=中继热点 / usb=USB（USB 通道待接入时仅记录）。
+        // 1.1.3（UI 字号调整）：加回「自动连接方式」小标题，三个单选归属其下。
+        column.addView(subSectionLabel("自动连接方式"), block(top = dip(8), bottom = dip(2)))
+        rgAutoChannel = RadioGroup(activity).apply { orientation = LinearLayout.HORIZONTAL }
+        rbAutoCar = radio("车机热点")
+        rbAutoRelay = radio("中继热点")
+        rbAutoUsb = radio("USB连接")
+        rgAutoChannel.addView(rbAutoCar)
+        rgAutoChannel.addView(rbAutoRelay)
+        rgAutoChannel.addView(rbAutoUsb)
+        rgAutoChannel.setOnCheckedChangeListener { _, _ ->
+            if (isLoading) return@setOnCheckedChangeListener
+            refreshRadioDrawables(rgAutoChannel)
+            persistFromForm()
+        }
+        column.addView(rgAutoChannel, block(top = dip(6)))
+
+        // ── 画面设置：分辨率自定义百分比 / 分辨率设定 / 横竖屏切换 ──
+        column.addView(sectionLabel("画面设置"), block(top = dip(16), bottom = dip(4)))
+        inputScale = buildValueRow(column, "分辨率自定义", "${LiteConfig.MIN_SCALE_PERCENT}% - ${LiteConfig.MAX_SCALE_PERCENT}%") { applyScale(it) }
+        // 1.0.29：分辨率设定 —— 保持纵横比（等比 letterbox）/ 拉伸（铺满）/
+        // 手动设定分辨率（回报给 iPhone = 手动宽高 ×「分辨率自定义」百分比，重启后生效）。
+        // 1.1.3（UI 字号调整）：加回「纵横比设定」小标题；三选改名；选定后弹窗确认、应用并重启。
+        column.addView(subSectionLabel("纵横比设定"), block(top = dip(8), bottom = dip(2)))
         rgResolution = RadioGroup(activity).apply { orientation = LinearLayout.VERTICAL }
-        rbResFit = radio("自动（保持纵横比）")
-        rbResStretch = radio("自动（拉伸）")
-        rbResManual = radio("手动指定")
+        rbResFit = radio("保持纵横比")
+        rbResStretch = radio("拉伸")
+        rbResManual = radio("手动设定分辨率")
         rgResolution.addView(rbResFit)
         rgResolution.addView(rbResStretch)
         rgResolution.addView(rbResManual)
         rgResolution.setOnCheckedChangeListener { _, _ ->
             if (isLoading) return@setOnCheckedChangeListener
             refreshRadioDrawables(rgResolution)
-            manualResRow.visibility = if (rbResManual.isChecked) android.view.View.VISIBLE else android.view.View.GONE
-            persistFromForm()
+            val previous = LiteConfig.load(activity).resolutionMode
+            val target = currentResolutionMode()
+            if (target == previous) {
+                manualResRow.visibility = if (rbResManual.isChecked) View.VISIBLE else View.GONE
+                return@setOnCheckedChangeListener
+            }
+            val targetName = when (target) {
+                "stretch" -> "拉伸"
+                "manual" -> "手动设定分辨率"
+                else -> "保持纵横比"
+            }
+            val previousName = when (previous) {
+                "stretch" -> "拉伸"
+                "manual" -> "手动设定分辨率"
+                else -> "保持纵横比"
+            }
+            AlertDialog.Builder(activity)
+                .setTitle("应用分辨率设置")
+                .setMessage(
+                    "原模式：$previousName，确认修改为$targetName 吗？\n\n" +
+                        "点击「应用」后将自动重启软件，重启后全局应用新模式。",
+                )
+                .setNegativeButton("取消") { _, _ ->
+                    isLoading = true
+                    when (previous) {
+                        "stretch" -> rbResStretch.isChecked = true
+                        "manual" -> rbResManual.isChecked = true
+                        else -> rbResFit.isChecked = true
+                    }
+                    refreshRadioDrawables(rgResolution)
+                    manualResRow.visibility = if (rbResManual.isChecked) View.VISIBLE else View.GONE
+                    isLoading = false
+                }
+                .setPositiveButton("应用并重启") { _, _ ->
+                    persistFromForm()
+                    manualResRow.visibility = if (rbResManual.isChecked) View.VISIBLE else View.GONE
+                    activity.restartAppForVideoChange()
+                }
+                .show()
         }
-        column.addView(rgResolution, block())
-        // 手动输入行：横 [框] × 纵 [框] [应用]（选中「手动指定」才显示）。
+        column.addView(rgResolution, block(top = dip(6)))
+        // 手动输入行：横 [框] × 纵 [框] [应用]（选中「手动设定分辨率」才显示）。
         // 局部变量构建，避免 lateinit 属性的 smart cast 限制。
+        // 1.1.3（UI 字号调整）：样式与「分辨率自定义」一致——fillInput 输入框 + 主色 pill 应用键。
         val resRow = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = android.view.Gravity.CENTER_VERTICAL
@@ -205,13 +258,18 @@ class SettingsPage(private val activity: MainActivity) {
         fun manualLabel(text: String): TextView = TextView(activity).apply {
             this.text = text
             setTextColor(Ui.SUB)
-            textSize = 14f
+            textSize = 13f
         }
         fun manualField(hint: String): EditText = EditText(activity).apply {
+            background = Ui.fillInput(activity)
+            setHintTextColor(Ui.SUB)
+            setTextColor(Ui.TEXT)
             this.hint = hint
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
-            textSize = 14f
+            textSize = 13f
             setSingleLine(true)
+            gravity = Gravity.CENTER
+            setPadding(dip(10), dip(7), dip(10), dip(7))
         }
         inputResW = manualField("宽 320-4096")
         inputResH = manualField("高 320-4096")
@@ -227,7 +285,12 @@ class SettingsPage(private val activity: MainActivity) {
         )
         val applyResButton = Button(activity).apply {
             text = "应用"
-            textSize = 13f
+            textSize = 12f
+            minHeight = dip(34)
+            setAllCaps(false)
+            background = Ui.pillSolid(activity, Ui.PRIMARY)
+            setTextColor(Ui.PRIMARY_ON)
+            setPadding(dip(14), dip(5), dip(14), dip(5))
             setOnClickListener { applyManualResolution() }
         }
         resRow.addView(applyResButton, rowStretch(dip(8)))
@@ -240,16 +303,11 @@ class SettingsPage(private val activity: MainActivity) {
                 setTextColor(Ui.SUB)
                 textSize = 12f
             },
-            block(top = dip(2), bottom = dip(8)),
+            block(top = dip(2), bottom = dip(4)),
         )
-
-        // M6k21：连接配置（从主页通道卡迁入）——车机热点/中继热点的网络配置入口。
-        column.addView(sectionLabel("连接配置"), block(top = dip(12), bottom = dip(4)))
-        column.addView(entryRow("车机热点网络配置") { activity.openHotspotPage("car") }, block(top = dip(4)))
-        column.addView(entryRow("中继热点网络配置") { activity.openHotspotPage("relay") }, block(top = dip(8)))
-
         // 横竖屏切换（M6k24：自动旋转取消，只留强制横屏/强制竖屏；画面声明方向跟随此设置）
-        column.addView(sectionLabel("横竖屏切换"), block(top = dip(12), bottom = dip(4)))
+        // 1.1.3（UI 字号调整）：加回「画面方向」小标题。
+        column.addView(subSectionLabel("画面方向"), block(top = dip(8), bottom = dip(2)))
         rgOrientation = RadioGroup(activity).apply { orientation = LinearLayout.VERTICAL }
         rbOrientLand = radio("强制横屏")
         rbOrientPortrait = radio("强制竖屏")
@@ -281,27 +339,24 @@ class SettingsPage(private val activity: MainActivity) {
                 }
                 .show()
         }
-        column.addView(rgOrientation, block())
+        column.addView(rgOrientation, block(top = dip(6)))
 
-        // M6k19：默认自动连接方式（三选一，从主页 toggle 迁移至此）。
-        // 打开 App 时按此通道自动连接：car=车机热点 / relay=中继热点 / usb=USB（USB 通道待接入时仅记录）。
-        column.addView(sectionLabel("默认自动连接方式"), block(top = dip(12), bottom = dip(4)))
-        rgAutoChannel = RadioGroup(activity).apply { orientation = LinearLayout.HORIZONTAL }
-        rbAutoCar = radio("车机热点")
-        rbAutoRelay = radio("中继热点")
-        rbAutoUsb = radio("USB连接")
-        rgAutoChannel.addView(rbAutoCar)
-        rgAutoChannel.addView(rbAutoRelay)
-        rgAutoChannel.addView(rbAutoUsb)
-        rgAutoChannel.setOnCheckedChangeListener { _, _ ->
-            if (isLoading) return@setOnCheckedChangeListener
-            refreshRadioDrawables(rgAutoChannel)
-            persistFromForm()
-        }
-        column.addView(rgAutoChannel, block())
-
-        // 音视频链路（横排二选）
-        column.addView(sectionLabel("音视频链路选择"), block(top = dip(12), bottom = dip(4)))
+        // ── 音频设置：导航触发压低 / 音频缓存 / 音视频链路 / 音频流选择 ──
+        column.addView(sectionLabel("音频设置"), block(top = dip(16), bottom = dip(4)))
+        inputDuck = buildValueRow(column, "导航音频触发音量降低", "${LiteConfig.MIN_DUCK_PERCENT}% - ${LiteConfig.MAX_DUCK_PERCENT}%") { applyDuck(it) }
+        // M6k19：音频缓存毫秒数（跟随导航音量降低之后），范围 10-4000ms。1.1.3 改名「音频缓存」。
+        inputBuffer = buildValueRow(column, "音频缓存", "${LiteConfig.MIN_MEDIA_BUFFER_MILLIS} - ${LiteConfig.MAX_MEDIA_BUFFER_MILLIS} (ms)") { applyBuffer(it) }
+        // 生效说明：起播阈值跟随设置值；缓冲池深度有 1500ms 下限（T29 防抖动），设置 >1300ms 才会加深。
+        column.addView(
+            TextView(activity).apply {
+                text = "影响音乐起播速度。更改在重新连接后生效。缓冲池固定不低于 1500ms 防网络卡顿，设置高于 1300 才会加深缓冲池。"
+                setTextColor(Ui.SUB)
+                textSize = 12f
+            },
+            block(top = dip(2), bottom = dip(4)),
+        )
+        // 音视频传输方式（1.1.3：加回小标题；二选一选定后弹窗确认、应用并重启）
+        column.addView(subSectionLabel("音视频传输方式"), block(top = dip(8), bottom = dip(2)))
         val avGroup = RadioGroup(activity).apply { orientation = LinearLayout.HORIZONTAL }
         rbAvFull = radio("全CarPlay")
         rbAvBt = radio("蓝牙音频+CarPlay")
@@ -310,37 +365,79 @@ class SettingsPage(private val activity: MainActivity) {
         avGroup.setOnCheckedChangeListener { _, _ ->
             if (isLoading) return@setOnCheckedChangeListener
             refreshRadioDrawables(avGroup)
-            persistFromForm()
+            val previous = LiteConfig.load(activity).avPathMode
+            val target = if (rbAvBt.isChecked) "bt_audio" else "full"
+            if (target == previous) return@setOnCheckedChangeListener
+            AlertDialog.Builder(activity)
+                .setTitle("应用音视频传输方式")
+                .setMessage(
+                    if (target == "bt_audio") {
+                        // 20261012 定案：iOS 16+ 苹果不提供「音频自动切蓝牙」协议通道（实测实锤：
+                        // no_audio 声明拒建流 / keep_formats 卡 handoff 隧道死锁），本选项改为
+                        // 引导用户手动切换，底层仍走全 CarPlay 推流（画面+音频通道保持完整）。
+                        "蓝牙音频+CarPlay 的音频切换需在 iPhone 上手动完成（iOS 16 及以上）：\n\n" +
+                            "1. 连接成功后打开 iPhone 控制中心；\n" +
+                            "2. 长按音乐卡片，点击右上角 AirPlay 图标；\n" +
+                            "3. 在输出列表中选择车机蓝牙名称。\n\n" +
+                            "画面始终由 CarPlay 推流，音乐改走车机蓝牙出声。" +
+                            "每次重连后如输出被系统改回，需重新选择一次（部分 iPhone 会记住该选择）。\n\n" +
+                            "点击「应用」后将自动重启软件，重启后全局应用新方式。"
+                    } else {
+                        "原方式：${if (previous == "bt_audio") "蓝牙音频+CarPlay" else "全CarPlay"}，" +
+                            "确认修改为全CarPlay吗？\n\n" +
+                            "点击「应用」后将自动重启软件，重启后全局应用新方式。"
+                    },
+                )
+                .setNegativeButton("取消") { _, _ ->
+                    isLoading = true
+                    if (previous == "bt_audio") rbAvBt.isChecked = true else rbAvFull.isChecked = true
+                    refreshRadioDrawables(avGroup)
+                    isLoading = false
+                }
+                .setPositiveButton("应用并重启") { _, _ ->
+                    persistFromForm()
+                    activity.restartAppForVideoChange()
+                }
+                .show()
         }
-        column.addView(avGroup, block())
-
-        // 音频流选择（M6k21，参考 fork carlito12345 版 0~20 音频流编号覆盖）：
+        column.addView(avGroup, block(top = dip(6)))
+        // 音道选择（M6k21，参考 fork carlito12345 版 0~20 音频流编号覆盖）：
         // 媒体/导航各自独立；0=自动路由（usage），1~20=传统音频流编号（含车机厂商扩展流）。
         // 点选数值即试听，保存后重新连接生效。
-        column.addView(sectionLabel("音频流选择"), block(top = dip(12), bottom = dip(4)))
-        column.addView(audioStreamRow("媒体音频流", isMedia = true), block())
-        column.addView(audioStreamRow("导航音频流", isMedia = false), block())
+        // 1.1.3（UI 字号调整）：加回「音道选择」小标题；媒体/导航两行合并为一行。
+        column.addView(subSectionLabel("音道选择"), block(top = dip(8), bottom = dip(2)))
+        val channelRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        channelRow.addView(audioStreamRow("媒体音频流", isMedia = true), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        channelRow.addView(audioStreamRow("导航音频流", isMedia = false), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        column.addView(channelRow, block(top = dip(6)))
         column.addView(
             TextView(activity).apply {
                 text = "0 表示自动路由。1~20 用于选择传统音频流编号，包括车机支持的厂商扩展输出。点选数值可试听。更改在重新连接后生效。"
                 setTextColor(Ui.SUB)
                 textSize = 12f
             },
-            block(bottom = dip(4)),
+            block(top = dip(2), bottom = dip(4)),
         )
 
-        // 体验优化：渲染图画了 3 项，30帧/扬声器两项既有功能保留（图未画出）
+        // 体验优化（1.1.3 UI 调整：主项 +1dp（15f→16f）；改名统一「开机自启X」句式；
+        // Siri/语音提示走媒体音量 从音频设置移入本组）
         column.addView(sectionLabel("体验优化"), block(top = dip(12), bottom = dip(4)))
-        cbBoot = checkbox("开机自启")
+        cbBoot = checkbox("开机自启Diplay Lite")
         // 1.0.11：开机自动开启蓝牙/热点/Wi-Fi（独立于"开机自启"，任一勾选 BootReceiver 即工作；
         // 1.0.29 Wi-Fi 与热点互斥——勾了热点则 Wi-Fi 自启跳过，STA/AP 不能同开）
-        cbBootBluetooth = checkbox("开机自动开启蓝牙")
-        cbBootHotspot = checkbox("开机自动开启热点")
-        cbBootWifi = checkbox("开机自动开启 Wi-Fi")
+        cbBootBluetooth = checkbox("开机自启蓝牙")
+        cbBootHotspot = checkbox("开机自启热点")
+        cbBootWifi = checkbox("开机自启WIFI")
         cbAutoConnect = checkbox("启动后自动连接")
         cbSoftDecode = checkbox("强制软解")
         cbFps30 = checkbox("限制 30 帧")
-        cbSpeaker = checkbox("通话声音走扬声器")
+        cbSpeaker = checkbox("通话声音走媒体音量")
+        // 1.1.2（EU5 双向无声）：Siri/助手语音走媒体通道——ASSISTANT/NAVIGATION usage 在
+        // PATEO 等老 HAL 上静音，勾选后改走媒体音量（媒体通道已实测出声）。
+        cbVoiceMedia = checkbox("Siri/语音提示走媒体音量")
         column.addView(cbBoot, block(bottom = dip(2)))
         column.addView(cbBootBluetooth, block(bottom = dip(2)))
         column.addView(cbBootHotspot, block(bottom = dip(2)))
@@ -348,14 +445,19 @@ class SettingsPage(private val activity: MainActivity) {
         column.addView(cbAutoConnect, block(bottom = dip(2)))
         column.addView(cbSoftDecode, block(bottom = dip(2)))
         column.addView(cbFps30, block(bottom = dip(2)))
-        column.addView(cbSpeaker, block())
+        column.addView(cbSpeaker, block(bottom = dip(2)))
+        column.addView(cbVoiceMedia, block())
 
-        // M6k23：自定义返回图标页（选图→裁剪→确认保存）。
+        // M6k23：自定义返回图标页（选图→裁剪→确认保存）。1.1.3：入口行 -3dp（按钮随行号缩小）。
         column.addView(entryRow("自定义返回图标") { activity.setPage("caricon") }, block(top = dip(14)))
         // 功能入口行（M6k26：方控学习改为独立页面跳转，替代原全屏 Dialog —— 部分 ROM Dialog 内容区不渲染）
         column.addView(entryRow("方向盘按键学习") { activity.setPage("steering") }, block(top = dip(8)))
         // 1.0.29 系统诊断：蓝牙栈状态/getprop/进程/root 探测（t3-p1 等无 ADB 车机的排查通道）
-        column.addView(entryRow("系统诊断（蓝牙/ADB/root）") { Diagnostics.run(activity) }, block(top = dip(8), bottom = dip(8)))
+        // 1.1.4：重做为中文检测报告（逐项检测+连接建议矩阵），原始取证数据仅写日志不上屏；
+        // 报告页「上传诊断日志」直接接设置页 Gitee 上传通道。
+        column.addView(entryRow("系统诊断（蓝牙/WiFi/热点/USB）") {
+            Diagnostics.run(activity) { showGiteeUploadDialog() }
+        }, block(top = dip(8), bottom = dip(8)))
 
         // 运行日志：预览（对话框）+ 导出（文件快照）+ Gitee 上传配置/上传（M6k25）
         val logRow = LinearLayout(activity).apply {
@@ -365,7 +467,8 @@ class SettingsPage(private val activity: MainActivity) {
                 TextView(activity).apply {
                     text = "运行日志"
                     setTextColor(Ui.TEXT)
-                    textSize = 16f
+                    // 1.1.3（UI 字号调整）：入口行属子项，-3dp（原 16f）。
+                    textSize = 13f
                 },
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
             )
@@ -381,7 +484,8 @@ class SettingsPage(private val activity: MainActivity) {
             TextView(activity).apply {
                 text = "关于"
                 setTextColor(Ui.TEXT)
-                textSize = 16f
+                // 1.1.3（UI 字号调整）：入口行属子项，-3dp（原 16f）。
+                textSize = 13f
                 setTypeface(typeface, Typeface.BOLD)
             },
             block(top = dip(12), bottom = dip(2)),
@@ -391,6 +495,24 @@ class SettingsPage(private val activity: MainActivity) {
             textSize = 13f
         }
         column.addView(tvVersion, block())
+        // 1.1.3（GPLv3 合规）：开源声明入口——上游署名 + 许可证 + 源码地址 + 商标免责。
+        column.addView(
+            TextView(activity).apply {
+                text = "本软件基于开源项目 DiPlay（GPL-3.0）修改"
+                setTextColor(Ui.SUB)
+                textSize = 11f
+            },
+            block(top = dip(4)),
+        )
+        column.addView(
+            TextView(activity).apply {
+                text = "查看开源许可与声明 ▸"
+                setTextColor(Ui.PRIMARY)
+                textSize = 13f
+                setOnClickListener { showLicenseNotice() }
+            },
+            block(top = dip(2)),
+        )
         return ScrollView(activity).apply {
             addView(column, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
         }
@@ -416,6 +538,43 @@ class SettingsPage(private val activity: MainActivity) {
             },
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
         )
+    }
+
+    /**
+     * 1.1.3（GPLv3 合规）：开源许可与声明弹窗——许可证、上游署名、商标免责、数据说明。
+     * 内容与公开仓 README 同步维护：源码 https://github.com/wangliunian5/diplay-lite
+     */
+    private fun showLicenseNotice() {
+        val body = TextView(activity).apply {
+            setTextColor(Ui.TEXT)
+            textSize = 12f
+            setPadding(dip(20), dip(12), dip(20), dip(8))
+            text = buildString {
+                appendLine("【许可】")
+                appendLine("本软件是自由软件，基于 GNU GPL-3.0 授权分发，不提供任何担保。")
+                appendLine("你可以在 GPL-3.0 条款下自由使用、学习、修改和再分发本软件；再分发（含修改版）须同样以 GPL-3.0 提供完整对应源码。")
+                appendLine()
+                appendLine("【上游致谢】")
+                appendLine("本软件基于开源项目 DiPlay（© shihabal3amri）修改：")
+                appendLine("https://github.com/shihabal3amri/DiPlay")
+                appendLine("本分支（DiPlay Lite）为社区维护的非官方版本，修改内容包括：老车机兼容适配（API16+）、设置界面重构、系统诊断取证增强、低配设备性能优化。")
+                appendLine("本分支源码：")
+                appendLine("https://github.com/wangliunian5/diplay-lite")
+                appendLine()
+                appendLine("【商标声明】")
+                appendLine("应用内可选择的各汽车品牌标志（BEIJING、BMW、BYD、Ford、Honda、Hyundai、Nissan、Stellantis、Toyota、Volkswagen）版权归各自权利人，仅供车主个性化识别使用；本应用与上述各汽车厂家无关联，未获其授权或背书。")
+                appendLine("CarPlay 为 Apple Inc. 的商标；本应用与 Apple Inc. 无关联，未经 MFi 认证。")
+                appendLine()
+                appendLine("【数据说明】")
+                appendLine("运行日志仅在你主动点击「上传」时发送至维护者的日志仓库，用于问题排查；应用不会在后台收集或上传任何数据。")
+            }
+        }
+        val scroll = ScrollView(activity).apply { addView(body) }
+        AlertDialog.Builder(activity)
+            .setTitle("开源许可与声明")
+            .setView(scroll)
+            .setPositiveButton("关闭", null)
+            .show()
     }
 
     /** 音乐缓存毫秒应用：范围内才落盘（10-4000ms），越界忽略本次输入。 */
@@ -450,7 +609,8 @@ class SettingsPage(private val activity: MainActivity) {
                 TextView(activity).apply {
                     text = title
                     setTextColor(Ui.TEXT)
-                    textSize = 16f
+                    // 1.1.3（UI 字号调整）：数值行标题属子项，-3dp（原 16f）。
+                    textSize = 13f
                 },
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
             )
@@ -461,8 +621,9 @@ class SettingsPage(private val activity: MainActivity) {
             addView(
                 Button(activity).apply {
                     text = "应用"
-                    textSize = 14f
-                    minHeight = dip(38)
+                    // 1.1.3：按钮跟随字号调整（14f → 12f）。
+                    textSize = 12f
+                    minHeight = dip(34)
                     setAllCaps(false)
                     background = Ui.pillSolid(activity, Ui.PRIMARY)
                     setTextColor(Ui.PRIMARY_ON)
@@ -479,14 +640,15 @@ class SettingsPage(private val activity: MainActivity) {
     private fun radio(text: String): RadioButton = RadioButton(activity).apply {
         this.text = text
         setTextColor(Ui.TEXT)
-        textSize = 15f
+        // 1.1.3（UI 字号调整）：所有单选均为「小项」，统一 13f（小标题归属层级）。
+        textSize = 13f
         setButtonDrawable(Ui.radio(activity, false))
         setPadding(dip(8), dip(4), dip(8), dip(4))
         // M6k19：自定义 buttonDrawable 偏小时文字基线与圈错位（8815 实测），强制垂直居中。
         gravity = Gravity.CENTER_VERTICAL
     }
 
-    /** M6k21：「标签 · 当前值 [进入]」一行，进入弹 0~20 单选对话框（点选即试听）。 */
+    /** M6k21：「标签 · 当前值 [进入]」，进入弹 0~20 单选对话框（点选即试听）。 */
     private fun audioStreamRow(label: String, isMedia: Boolean): View = LinearLayout(activity).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
@@ -494,28 +656,30 @@ class SettingsPage(private val activity: MainActivity) {
             TextView(activity).apply {
                 text = label
                 setTextColor(Ui.TEXT)
-                textSize = 16f
+                // 1.1.3（UI 字号调整）：音道行属子项，-3dp（原 16f）。
+                textSize = 13f
             },
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
         )
         val value = TextView(activity).apply {
             setTextColor(Ui.SUB)
-            textSize = 14f
+            textSize = 12f
         }
         if (isMedia) mediaStreamValueText = value else navStreamValueText = value
         addView(
             value,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { rightMargin = dip(10) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { rightMargin = dip(8) },
         )
         addView(
             Button(activity).apply {
                 text = "进入"
-                textSize = 14f
-                minHeight = dip(38)
+                // 1.1.3：按钮跟随字号调整（14f → 12f）。
+                textSize = 12f
+                minHeight = dip(34)
                 setAllCaps(false)
                 background = Ui.pillOutline(activity, Ui.OUTLINE)
                 setTextColor(Ui.OUTLINE)
-                setPadding(dip(16), dip(5), dip(16), dip(5))
+                setPadding(dip(12), dip(4), dip(12), dip(4))
                 setOnClickListener { showAudioStreamDialog(label, isMedia) }
             },
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT),
@@ -554,7 +718,9 @@ class SettingsPage(private val activity: MainActivity) {
     private fun checkbox(text: String): CheckBox = CheckBox(activity).apply {
         this.text = text
         setTextColor(Ui.TEXT)
-        textSize = 15f
+        // 1.1.3（UI 字号调整）：复选框主项 16f；20261012 实机反馈——与「音频缓存」等数值行
+        // 标题同 dp，统一 13f（竖屏小屏一行放得下）。
+        textSize = 13f
         setButtonDrawable(Ui.checkbox(activity, false))
         setPadding(dip(8), dip(4), dip(8), dip(4))
         setOnCheckedChangeListener { buttonView, _ ->
@@ -570,15 +736,17 @@ class SettingsPage(private val activity: MainActivity) {
             TextView(activity).apply {
                 text = title
                 setTextColor(Ui.TEXT)
-                textSize = 16f
+                // 1.1.3（UI 字号调整）：入口行属子项，-3dp（原 16f）。
+                textSize = 13f
             },
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
         )
         addView(
             Button(activity).apply {
                 text = "进入"
-                textSize = 14f
-                minHeight = dip(38)
+                // 1.1.3：按钮跟随字号调整（14f → 12f）。
+                textSize = 12f
+                minHeight = dip(34)
                 setAllCaps(false)
                 background = Ui.pillOutline(activity, Ui.OUTLINE)
                 setTextColor(Ui.OUTLINE)
@@ -591,8 +759,9 @@ class SettingsPage(private val activity: MainActivity) {
 
     private fun smallOutlineButton(text: String, onClick: () -> Unit): Button = Button(activity).apply {
         setText(text)
-        textSize = 14f
-        minHeight = dip(38)
+        // 1.1.3：按钮跟随字号调整（14f → 12f）。
+        textSize = 12f
+        minHeight = dip(34)
         setAllCaps(false)
         background = Ui.pillOutline(activity, Ui.OUTLINE)
         setTextColor(Ui.OUTLINE)
@@ -606,7 +775,16 @@ class SettingsPage(private val activity: MainActivity) {
     private fun sectionLabel(text: String): TextView = TextView(activity).apply {
         this.text = text
         setTextColor(Ui.TEXT)
-        textSize = 16f
+        // 1.1.3（UI 字号调整）：分组大标题 +1dp（原 16f）。
+        textSize = 17f
+        setTypeface(typeface, Typeface.BOLD)
+    }
+
+    /** 1.1.3（UI 字号调整）：小节标题（归属层）——加回「自动连接方式/纵横比设定/画面方向/音视频传输方式/音道选择」。 */
+    private fun subSectionLabel(text: String): TextView = TextView(activity).apply {
+        this.text = text
+        setTextColor(Ui.SUB)
+        textSize = 13f
         setTypeface(typeface, Typeface.BOLD)
     }
 
@@ -660,6 +838,14 @@ class SettingsPage(private val activity: MainActivity) {
         }
         rbAvFull.isChecked = config.avPathMode != "bt_audio"
         rbAvBt.isChecked = config.avPathMode == "bt_audio"
+        // 1.1.3（bt_audio 试验）：长按「蓝牙音频+CarPlay」循环切换 /info 声明变体并立即落盘，
+        // 无独立 UI。no_audio=现状（清音频位+省略音频声明键）；keep_formats=清位但保留声明键。
+        rbAvBt.setOnLongClickListener {
+            val next = if (LiteConfig.load(activity).btAudioInfoVariant == "keep_formats") "no_audio" else "keep_formats"
+            LiteConfig.setBtAudioInfoVariant(activity, next)
+            Toast.makeText(activity, "bt_audio /info 变体：$next（重开会话生效）", Toast.LENGTH_LONG).show()
+            true
+        }
         // 1.0.29：分辨率设定回显（手动行只在 manual 模式显示）。
         when (config.resolutionMode) {
             "stretch" -> rbResStretch.isChecked = true
@@ -680,6 +866,7 @@ class SettingsPage(private val activity: MainActivity) {
         cbSoftDecode.isChecked = config.softwareVideoDecoder
         cbFps30.isChecked = config.limit30Fps
         cbSpeaker.isChecked = config.speakerForCalls
+        cbVoiceMedia.isChecked = config.voiceRoutedToMedia
         isLoading = false
     }
 
@@ -718,6 +905,7 @@ class SettingsPage(private val activity: MainActivity) {
                 },
                 limit30Fps = cbFps30.isChecked,
                 speakerForCalls = cbSpeaker.isChecked,
+                voiceRoutedToMedia = cbVoiceMedia.isChecked,
                 softwareVideoDecoder = cbSoftDecode.isChecked,
                 orientationMode = currentOrientationMode(),
                 avPathMode = if (rbAvBt.isChecked) "bt_audio" else "full",
@@ -997,7 +1185,8 @@ class SettingsPage(private val activity: MainActivity) {
     private fun uploadLogToGitee(name: String, stamp: String, encoded: String) {
         val owner = "wangliunian"
         val repo = "display--log-collection"
-        val token = "27a79346e0946691779eaee5647d86e4"
+        // 1.1.3（20261012 轮换）：旧 token 27a79346… 已作废（公开源码前换专用令牌）。
+        val token = "420ad33fe308814dfef2a91ea569b853"
         var attemptName = name
         var lastCode = 0
         var lastBody = ""
