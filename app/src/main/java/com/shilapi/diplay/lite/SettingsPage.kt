@@ -1,4 +1,4 @@
-package com.shilapi.diplay.lite
+﻿package com.shilapi.diplay.lite
 
 import android.app.Activity
 import android.app.AlertDialog
@@ -702,8 +702,9 @@ class SettingsPage(private val activity: MainActivity) {
     private fun checkbox(text: String): CheckBox = CheckBox(activity).apply {
         this.text = text
         setTextColor(Ui.TEXT)
-        // 1.1.3（UI 字号调整）：体验优化主项 +1dp（原 15f）。
-        textSize = 16f
+        // 1.1.3（UI 字号调整）：复选框主项 16f；20261012 实机反馈——与「音频缓存」等数值行
+        // 标题同 dp，统一 13f（竖屏小屏一行放得下）。
+        textSize = 13f
         setButtonDrawable(Ui.checkbox(activity, false))
         setPadding(dip(8), dip(4), dip(8), dip(4))
         setOnCheckedChangeListener { buttonView, _ ->
@@ -1169,7 +1170,7 @@ class SettingsPage(private val activity: MainActivity) {
         val owner = "wangliunian"
         val repo = "display--log-collection"
         // 1.1.3（20261012 轮换）：旧 token 27a79346… 已作废（公开源码前换专用令牌）。
-        val token = "420ad33fe308814dfef2a91ea569b853"
+        val token = ""  // 日志上传令牌不随源码公开，自行替换为你自己的 gitee token
         var attemptName = name
         var lastCode = 0
         var lastBody = ""

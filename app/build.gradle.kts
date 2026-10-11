@@ -11,7 +11,7 @@ android {
         applicationId = "com.shilapi.diplay.lite"
         minSdk = 16
         targetSdk = 19
-        versionCode = 53
+        versionCode = 54
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
         // 版本迭代规则：1.0.x 系列止于 1.0.29，自 1.1.x 重新起排（每次出包 patch +1）。
@@ -28,6 +28,8 @@ android {
         //（usb-uevent/usb-devices/net-dev/ps-all/usb-holder）+ 8815 SDP 连续失败用户指引与
         // SDP 服务列表取证 + StandardCharsets→Charset.forName（API19 前车机 Lockdown 不再挂）
         // + 硬解渲染只渲最新帧/renderHold 恢复抑制（绿线+burst 节流）+ 开源声明弹窗 + 日志 token 轮换。
+        // 1.1.3(vc54)：修复 drainOutput 忙死循环（TRY_AGAIN 未无条件退出，解码线程卡死致全黑屏，
+        // 8815 010252 定案）+ 设置页复选框字号统一 13f（实机反馈）。
         versionName = "1.1.3"
     }
 

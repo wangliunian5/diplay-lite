@@ -763,37 +763,45 @@ private class VideoDecoder(
         // 改法：只持有最新一个输出缓冲，被更新帧取代的旧帧静默归还（render=false），
         // 等没有新帧时才真正渲染最新帧 —— burst 期间合成量 N→1，撕裂源消失。
         var pendingIndex = -1
+        var pendingRender = false
         var pendingEos = false
         fun renderPending(): Boolean {
-            if (pendingIndex < 0) return pendingEos
-            val render = outputSurface != null && !renderHold
-            codec.releaseOutputBuffer(pendingIndex, render)
-            pendingIndex = -1
-            if (render) {
-                stats.onRendered()
-                // 1.0.29：恢复看门狗复位——有画面了，通道健康。
-                keyframeRequestsWithoutRender = 0
-                keyframeStallReported = false
-                if (!renderedFrameLogged) {
-                    renderedFrameLogged = true
-                    report("first frame rendered")
-                    Log.i(TAG, "video decoder rendered first frame")
+            if (pendingIndex >= 0) {
+                val render = outputSurface != null && !renderHold && pendingRender
+                codec.releaseOutputBuffer(pendingIndex, render)
+                pendingIndex = -1
+                if (render) {
+                    stats.onRendered()
+                    // 1.0.29：恢复看门狗复位——有画面了，通道健康。
+                    keyframeRequestsWithoutRender = 0
+                    keyframeStallReported = false
+                    if (!renderedFrameLogged) {
+                        renderedFrameLogged = true
+                        report("first frame rendered")
+                        Log.i(TAG, "video decoder rendered first frame")
+                    }
                 }
             }
-            return pendingEos
+            pendingEos = false
+            return false
         }
         while (running) {
             val index = codec.dequeueOutputBuffer(info, 0)
             when {
-                index == MediaCodec.INFO_TRY_AGAIN_LATER -> if (renderPending()) return
+                // 1.1.3 修复（8815 010252 无画面定案）：TRY_AGAIN 必须**无条件退出**本轮 drain。
+                // 上一版写成 `if (renderPending()) return`，无挂起帧时 renderPending 返回 false，
+                // 循环继续 → dequeue 又是 TRY_AGAIN → **忙死循环**：解码线程卡死在本函数，
+                // 队列无人消费（无 stats/无首帧/无关键帧请求），网络层视频包堆积——1.1.3 首包即中招。
+                index == MediaCodec.INFO_TRY_AGAIN_LATER -> { renderPending(); return }
                 index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    if (renderPending()) return
+                    renderPending()
                     logOutputFormat(codec.outputFormat)
                 }
                 index >= 0 -> {
                     // 上一帧被更新帧取代：静默归还，不上合成器。
                     if (pendingIndex >= 0) codec.releaseOutputBuffer(pendingIndex, false)
                     pendingIndex = index
+                    pendingRender = info.size > 0
                     pendingEos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                     if (info.size <= 0 && !pendingEos) {
                         // 零长度填充缓冲（部分厂商 OMX 会吐）：直接归还，不参与渲染。
@@ -801,7 +809,8 @@ private class VideoDecoder(
                         pendingIndex = -1
                     }
                 }
-                else -> if (renderPending()) return
+                // 负值未知码（防御）：与 TRY_AGAIN 同样必须退出，防忙循环。
+                else -> { renderPending(); return }
             }
         }
     }
