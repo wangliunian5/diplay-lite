@@ -1,5 +1,48 @@
 # DiPlay
 
+> ## DiPlay Lite — Chinese community fork (README top notice)
+>
+> This repository contains **DiPlay Lite**, an independent community-maintained fork of
+> [shihabal3amri/DiPlay](https://github.com/shihabal3amri/DiPlay) (upstream of [shilapi/xcertplay](https://github.com/shilapi/xcertplay) lineage),
+> adapted for low-spec Chinese-market Android head units (Android 4.1+ / various OEM platforms).
+> It is maintained on a **non-commercial** basis for personal research, owner-to-owner exchange and
+> compatibility maintenance. No commercial sales, paid licensing or commercial support is provided.
+> This positioning does not alter the rights granted by the original code licenses; assets may carry
+> their own restrictions, see below.
+>
+> ### License & attribution
+> - Receiver and derivative code: upstream **GPL-3.0** retained, together with existing notices. GPL itself permits commercial use and redistribution, subject to its obligations.
+> - UI adapted from **DiAuto** (AGPL-3.0) — preserve those notices when distributing.
+> - Upstream projects and original contributors keep full authorship credit.
+>
+> ### Trademarks
+> CarPlay, iPhone, iPad and Apple are trademarks of Apple Inc.; OEM brand names and logos (BYD, Geely,
+> Ora/Haval, Chery, etc.) belong to their respective owners. Neither the code license nor this project
+> grants any right to use those marks, and no affiliation with or endorsement by Apple, any OEM or the
+> upstream authors is implied.
+>
+> ### Experimental accessory identity
+> This is **not an Apple-certified product**. Builds may bundle an experimental accessory identity
+> recovered from publicly available third-party firmware. The **source repository excludes all
+> authentication keys and Android signing keys**; runtime identity assets are described in the build
+> instructions. Future iOS updates may break it at any time.
+>
+> ### Warranty & safety
+> The software is provided **AS IS**, without warranty of any kind. Compatibility is verified only on
+> specific tested platforms/firmware/iOS combinations; nothing is promised for any other device.
+> You install and use it **at your own risk**. Head units are driving-related equipment — do not
+> operate or configure the app while driving, and obey local laws.
+>
+> ### Device modification & diagnostics
+> Some features (wired CarPlay on certain platforms, adb self-boot, NCM guard) rely on **modifying your
+> own head-unit system** (root/adb). Such actions may void warranties or brick devices and are entirely
+> the user's responsibility. Diagnostic logs leave the device **only when you explicitly trigger an
+> upload**; the log-upload credential is injected at build time and never committed.
+>
+> ---
+>
+> The remainder of this README is the upstream project's description, preserved for reference.
+
 **CarPlay for compatible Android head units.** Wired and wireless, with the familiar DiAuto interface. Independent app: `com.shihab.diplay`.
 
 [Download & website](https://shihabal3amri.github.io/DiPlay/) · [Release](https://github.com/shihabal3amri/DiPlay/releases/tag/v0.2.0) · [Report a problem](https://github.com/shihabal3amri/DiPlay/issues/new/choose)
