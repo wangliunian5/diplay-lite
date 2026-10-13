@@ -35,6 +35,8 @@
 完全由用户自行承担。诊断日志仅在用户**主动触发上传**时才会离开设备；日志上传凭据
 由构建时注入，绝不入库。
 
+- 上游依赖与逐项移植清单详见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES.md)。
+
 ## 构建
 
 - Android Studio 或命令行 `gradlew assembleRelease`（需 JDK 17）
