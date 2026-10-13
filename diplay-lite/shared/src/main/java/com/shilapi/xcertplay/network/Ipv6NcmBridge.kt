@@ -38,7 +38,10 @@ class Ipv6NcmBridge(
     private var loggedInbound = false
     private var loggedOutbound = false
     private var loggedWaitingForPeer = false
-    private var inboundLogBudget = 16
+    // vc67 诊断（TS7 0x4301 后 iPhone 零数据面）：入站日志预算放开到 4000，
+    // 全量记录 iPhone 在 NCM 链路上的每个 IPv6 帧；非 IPv6 帧不再静默丢弃，记录帧头。
+    private var inboundLogBudget = 4000
+    private var nonIpv6DropCount = 0
     private var outboundLogBudget = 24
     private val running = AtomicBoolean(false)
     private lateinit var ncmToTunThread: Thread
@@ -112,7 +115,17 @@ class Ipv6NcmBridge(
                     streamingSeen = true
                     onDiagnostic("ncm streaming detected; inbound stall watchdog armed")
                 }
-                val ipv6 = EthernetIpv6Codec.parseIpv6View(frame) ?: continue
+                val ipv6 = EthernetIpv6Codec.parseIpv6View(frame)
+                if (ipv6 == null) {
+                    // vc67：非 IPv6 帧（ARP/VLAN 0x8100 等）此前静默丢弃——TS7 上 iPhone
+                    // 数据面零流量，先取证这些帧是否真实存在以及帧型是什么。
+                    nonIpv6DropCount++
+                    if (nonIpv6DropCount <= 64) {
+                        val head = frame.take(20).joinToString("") { "%02x".format(it) }
+                        Log.i(TAG, "ncm non-ipv6 frame #%d size=%d head=%s".format(nonIpv6DropCount, frame.size, head))
+                    }
+                    continue
+                }
                 peerMac = ipv6.sourceMac
                 if (!loggedInbound) {
                     loggedInbound = true

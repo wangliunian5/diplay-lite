@@ -27,7 +27,8 @@ import java.util.concurrent.atomic.AtomicInteger
 class AirPlayTcpServer {
 
     sealed class AttachResult {
-        object Started : AttachResult() { override fun toString() = "Started" }
+        /** vc67：携带实际绑定成功的端口（7100 被占时可能回退到其他端口）。 */
+        data class Started(val port: Int) : AttachResult() { override fun toString() = "Started(port=$port)" }
         object AlreadyStarted : AttachResult() { override fun toString() = "AlreadyStarted" }
         data class Failed(val message: String) : AttachResult()
     }
@@ -70,10 +71,10 @@ class AirPlayTcpServer {
         }
         active.set(true)
         return try {
-            startAirPlayServer(
+            val boundPort = startAirPlayServer(
                 AirPlayAttachment(bindAddress, config, identity, pairings, mfi, listener, media),
             )
-            AttachResult.Started
+            AttachResult.Started(boundPort)
         } catch (error: Exception) {
             releaseLocked()
             AttachResult.Failed(error.message ?: error.javaClass.simpleName)
@@ -88,52 +89,123 @@ class AirPlayTcpServer {
 
     fun isAttached(): Boolean = active.get() && attachment != null
 
+    /**
+     * vc67：绑定首选端口，被占时端口回退。coocaa BEP10A 215128 实测：车机自带投屏服务
+     * 常驻监听 7100（AirPlay 标准端口族，OEM 常同时占 7000/7100 等多个），且该类服务
+     * 重启后 inode 变化、无法无 root 清除。三层策略：
+     * ①首选 config.port（默认 7100）按 BIND_ATTEMPTS 重试（自残留竞态自愈）；
+     * ②扫 /proc/net/tcp(6) 全表 LISTEN 端口做黑名单，从 7101..7199 选第一个空闲直绑
+     *  （跳过被占端口，不再逐个盲试）；③仍失败则 bind(port=0) 内核任选空闲端口兜底。
+     * 实际端口经 AttachResult.Started(port) 回传，controller 注入 0x5703 airPlayPort
+     * 与 Bonjour TXT——iPhone 侧不写死端口，规范即从这两个字段获取。
+     */
     private fun startAirPlayServer(
         replacement: AirPlayAttachment,
-    ) {
-        val port = replacement.config.port
+    ): Int {
         var lastError: IOException? = null
-        for (attempt in 1..BIND_ATTEMPTS) {
+
+        fun bindOnce(port: Int): ServerSocket? {
             val server = ServerSocket()
             // API16 适配：bind 前开 SO_REUSEADDR，避免上一会话 socket TIME_WAIT 时 EADDRINUSE。
             server.reuseAddress = true
-            try {
+            return try {
                 server.bind(InetSocketAddress(replacement.address, port))
-                attachment = replacement
-                serverSocket = server
-                val generation = ++attachGeneration
-                Thread(
-                    { acceptLoop(generation, server) },
-                    "airplay-accept",
-                ).apply {
-                    isDaemon = true
-                    start()
-                }
-                return
+                server
             } catch (error: IOException) {
                 runCatching { server.close() }
                 lastError = error
-                Log.w(TAG, "airplay bind $port attempt=$attempt failed: ${error.message}")
+                Log.w(TAG, "airplay bind $port failed: ${error.message}")
                 // 1.1.2（PDYM20 130013 / EU5 实车 7100 EADDRINUSE）：bind 失败大概率是上一代
                 // listener 的 fd 释放竞态（teardown 异步线程与重建 attach 赛跑，且「占用诊断
                 // 无占用记录」即自占用特征）——每次重试前强制同步释放本对象持有的旧监听与
                 // 会话，再重试 bind。attach 持有本对象 monitor，releaseLocked 合法。
                 runCatching { releaseLocked() }
-                if (attempt < BIND_ATTEMPTS) {
-                    try {
-                        Thread.sleep(BIND_RETRY_MILLIS)
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                    }
+                null
+            }
+        }
+
+        fun startAcceptLoop(server: ServerSocket, port: Int): Int {
+            // attachment.config 同步为实际端口，下游（会话/诊断）读到的 port 恒为真值。
+            attachment = replacement.copy(config = replacement.config.copy(port = port))
+            serverSocket = server
+            val generation = ++attachGeneration
+            Thread(
+                { acceptLoop(generation, server) },
+                "airplay-accept",
+            ).apply {
+                isDaemon = true
+                start()
+            }
+            return port
+        }
+
+        // ① 首选端口，带重试（自占用竞态自愈窗口）
+        val preferred = replacement.config.port
+        for (attempt in 1..BIND_ATTEMPTS) {
+            val server = bindOnce(preferred)
+            if (server != null) {
+                if (attempt > 1) Log.i(TAG, "airplay bind $preferred recovered on attempt $attempt")
+                return startAcceptLoop(server, preferred)
+            }
+            if (attempt < BIND_ATTEMPTS) {
+                try {
+                    Thread.sleep(BIND_RETRY_MILLIS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
                 }
             }
         }
+
+        // ② 预扫 LISTEN 端口黑名单，从首选+1 起找空闲端口直绑
+        val occupied = occupiedListenPorts()
+        Log.w(
+            TAG,
+            "airplay port $preferred occupied; LISTEN ports on host: " +
+                occupied.sorted().joinToString(",").ifEmpty { "(unreadable)" },
+        )
+        for (candidate in (preferred + 1)..(preferred + PORT_FALLBACK_RANGE)) {
+            if (candidate in occupied) continue
+            val server = bindOnce(candidate)
+            if (server != null) {
+                Log.i(TAG, "airplay fallback bound to $candidate (preferred $preferred occupied)")
+                return startAcceptLoop(server, candidate)
+            }
+        }
+
+        // ③ 内核任选空闲端口兜底（port=0）
+        runCatching {
+            val server = ServerSocket()
+            server.reuseAddress = true
+            server.bind(InetSocketAddress(replacement.address, 0))
+            val port = server.localPort
+            Log.w(TAG, "airplay ephemeral fallback bound to $port (all candidates occupied)")
+            return startAcceptLoop(server, port)
+        }.getOrElse { error ->
+            lastError = IOException(lastError?.message ?: error.message, error)
+        }
+
         active.set(false)
         throw IOException(
-            "AirPlay 监听端口 $port 绑定失败（重试${BIND_ATTEMPTS}次）：" +
-                "${lastError?.message}；占用诊断 ${tcpPortOwners(port)}",
+            "AirPlay 监听端口 $preferred 绑定失败（重试${BIND_ATTEMPTS}次+回退" +
+                "${preferred + 1}..${preferred + PORT_FALLBACK_RANGE}+随机端口均失败）：" +
+                "${lastError?.message}；占用诊断 ${tcpPortOwners(preferred)}",
             lastError,
         )
+    }
+
+    /** 读 /proc/net/tcp(6) 返回本机全部 LISTEN（state=0A）本地端口集合；读不到返回空集。 */
+    private fun occupiedListenPorts(): Set<Int> = buildSet {
+        for (table in listOf("/proc/net/tcp", "/proc/net/tcp6")) {
+            val lines = runCatching { File(table).readLines() }.getOrNull() ?: continue
+            for (line in lines.drop(1)) {
+                val parts = line.trim().split(Regex("\\s+"))
+                if (parts.size > 3 && parts[3] == "0A") {
+                    val portHex = parts[1].substringAfterLast(':')
+                    val port = portHex.toIntOrNull(16)
+                    if (port != null && port > 0) add(port)
+                }
+            }
+        }
     }
 
     /**
@@ -302,5 +374,7 @@ class AirPlayTcpServer {
         private const val TAG = "xcertplay-airplay"
         private const val BIND_ATTEMPTS = 3
         private const val BIND_RETRY_MILLIS = 500L
+        /** vc67：首选端口被占时向上扫描的候选端口范围（7101..7110），超出仍失败则走内核随机端口。 */
+        private const val PORT_FALLBACK_RANGE = 10
     }
 }

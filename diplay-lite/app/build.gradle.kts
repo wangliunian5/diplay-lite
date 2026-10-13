@@ -38,8 +38,63 @@ android {
         // + 主页面 hero 文案删除与右列对齐；取证数据只写日志不上屏。
         // 1.1.3(vc58)：诊断过程弹窗按钮被挤出可视区修复——ScrollView 加 weight=1，
         // 「下一步/跳过」恒定钉在弹窗底部（8815 横屏 540px 实测）。
-        versionName = "1.1.3"
-        versionCode = 58
+        // 1.1.3(vc59)：分辨率设定落盘丢键修复——LiteConfig.save 漏写 video_resolution_mode/
+        // manual_resolution_w/h，「手动设定分辨率」确认重启后单选弹回、输入行不显示。
+        // 1.1.3(vc60)：分辨率交互改版（点选→右方应用键→重启生效，手动输入行恒显示）
+        // vc61：FE-6 楔死自愈跳过重复选配（消除权限竞态误报）+ 诊断取证加 dmesg 采集
+        // 1.1.4(vc62)：EU5 电话无收音修复（telephony 源序 6→1→7 避免源 7 毒化 HAL +
+        // 上行启动失败延时重试 800ms/2s + 全败矩阵明细/音频系统快照落盘）+
+        // wired 建立期看门狗 8s→15s（EU5 iPhone 起流可慢至 8~16s，8s 杀了两轮）。
+        // 1.1.4(vc63)：TS7 mazda2 修复——①0x52 response=0x6（已配置拒绝重枚举）不再死等，
+        // 直接开数据面；②多 NCM 组优选内核未绑定组 + 失败轮换（绕开 cdc_ncm 抢占致
+        // NTB16 打碎，无 root 方案）。
+        // 1.1.4(vc64)：无线 First TCP 超时自动打断残留会话（B 方案，TS7 170921 实测）——
+        // 超时时拆蓝牙引导链并强制 ≥8s 全断窗口重启（热点不保留），模拟「断开→重连」
+        // 强制 iOS 清残留 CarPlay 会话（此前保持热点的 RESTART 两代 30s 双超时）。
+        // 1.1.4(vc65)：无线连接提速（10-12 TS7 Manual/Relay 双样本日志对比 0.2.6 结论）——
+        // ①BT 单台直选：唯一 bonded iPhone 跳过 HFP/A2DP profile proxy 查询（省 ~8s）；
+        // ②First TCP 看门狗 30s 后加 35s 宽限复查，窗口内 TCP 进入即放行（iPhone 实测
+        // 入网 25~35s，旧值恰好杀在入网途中）；③重试/看门狗失败路径保留热点附着
+        // （keepHotspotForReuse，iPhone 不掉网、下一轮秒连，对齐 0.2.6 热点常开模式）；
+        // ④Bonjour 注销异步化（goodbye 限时 300ms，解除 JmDNS close 7~8s 阻塞）。
+        // 1.1.4(vc66)：Bonjour start() 整体后台化——TS7 204308 实测 JmDNS
+        // create+registerService 同步阻塞 7.5s/次（真凶是它而非 BT 探针，BT 快路径
+        // vc65 已生效）。mDNS 广播非连接关键链路（0x5703 直驱），失败本就非致命降级；
+        // 后台完成后代次过期自查 close，bonjour 字段引用比较防误伤新一代实例。
+        // 实测 vc65 已达 Manual 15.4s / Relay 17.3s（vc64 为 104~107s），vc66 预期 ~8s。
+        // 1.1.4(vc67)：AirPlay 监听端口回退——coocaa BEP10A（Android14）215128 实测车机自带
+        // 投屏服务常驻监听 7100（EADDRINUSE，inode 随服务重启变化，无 root 不可清）。三层
+        // 策略：①首选端口重试（自占用竞态自愈）②扫 /proc/net/tcp(6) LISTEN 黑名单后从
+        // 7101..7110 直选空闲端口③bind(port=0) 内核随机端口兜底；实际端口注入 0x5703
+        // airPlayPort + Bonjour TXT（iPhone 侧不写死端口），失败诊断升级为全 LISTEN 表。
+        // 1.1.5/vc70：TS7 端点差分——NCM 选组反转为优先 3/4（OUT=0x06，带 interrupt EP），
+        // A/B 测 MUSB EP 0x07 TX 静默丢弃嫌疑。vc70 实锤：iPhone 首次真实连入。
+        // 1.1.5/vc71：建立看门狗 30s→60s（iPhone mDNS 收敛 ~30s 压线误杀）。vc71 实测画面
+        // 已出但 MUSB 满流丢包致 NTB16 错位、一次校验失败即拆桥。
+        // 1.1.5/vc72：NTB16 失步重同步（丢错位前缀对齐下一签名，风暴上限 64）。
+        // 1.1.5/vc73：风暴计数窗口化（30s 无错位重置，窗口 256）——静态画面期错位
+        // ~1-2 次/秒，vc72 累计 64 上限 2.5 分钟自拆（20:26:18 实测）。
+        // 1.1.5/vc74：内置 cdc_ncm 解绑守护（WiredNcmGuard，2s 扫配置 6 接口，su 写
+        // unbind，无 root 降级）——替代电脑侧外置循环，脱离电脑可独立工作。
+        // 1.1.5/vc75：守护收窄为只解绑 6.3——解绑已 claim 的 6.4 会触发 alt 复位打死
+        // bulk-out（20:56 实测两窗口全超时），外置守护成功行为就是只动 6.3。
+        versionName = "1.1.5"
+        versionCode = 75
+    }
+
+    // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties
+    // 注入（GITEE_LOG_TOKEN=...，该文件已被 .gitignore 排除，永不入仓）。
+    // 未配置时为空串：Gitee 上传按钮自动降级为「生成文件后手动发送」路径。
+    defaultConfig {
+        val localProps = java.util.Properties().apply {
+            val f = rootProject.file("local.properties")
+            if (f.exists()) f.inputStream().use { load(it) }
+        }
+        buildConfigField("String", "GITEE_LOG_TOKEN", "\"${localProps.getProperty("GITEE_LOG_TOKEN") ?: ""}\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     compileOptions {

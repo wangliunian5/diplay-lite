@@ -195,6 +195,28 @@ class MainActivity : Activity() {
             runOnUiThread { applyVideoFit(width, height) }
         }
         LiteLog.log("ui", "主界面就绪（原版式视觉：page 路由 + render 整页重建）")
+        bootstrapNetworkAdb()
+    }
+
+    /**
+     * vc67（TS7 调试自举）：App 启动即用 root 把 adbd 拉到 TCP 5555。TS7 车机重启后
+     * 网络 adb 不持久（展锐 ROM adbd 不读 persist），USB adb 又被编译期阉割，调试链路
+     * 反复断——DiPlay 已有记住的 Superuser 授权，静默自举，失败无感（未 root/被拒绝均忽略）。
+     * 仅诊断版本启用，稳定版可移除。
+     */
+    private fun bootstrapNetworkAdb() {
+        Thread {
+            try {
+                val su = Runtime.getRuntime().exec(arrayOf("su", "-c",
+                    "setprop service.adb.tcp.port 5555; stop adbd; start adbd"))
+                su.waitFor()
+                val check = Runtime.getRuntime().exec(arrayOf("sh", "-c", "getprop service.adb.tcp.port"))
+                val value = check.inputStream.bufferedReader().readText().trim()
+                LiteLog.log("ui", "adb 自举完成 tcp.port=$value")
+            } catch (error: Exception) {
+                LiteLog.log("ui", "adb 自举跳过：${error.message}")
+            }
+        }.start()
     }
 
     override fun onResume() {

@@ -38,6 +38,8 @@ import com.shilapi.xcertplay.network.ConfirmedChannelMemory
 import com.shilapi.xcertplay.network.Ipv6NcmBridge
 import com.shilapi.xcertplay.network.ManualHotspotManager
 import com.shilapi.xcertplay.network.RelayClientManager
+import com.shilapi.xcertplay.network.WiredBonjourAdvertiser
+import com.shilapi.xcertplay.network.WiredNcmGuard
 import com.shilapi.xcertplay.network.WiredVpnService
 import com.shilapi.xcertplay.network.WirelessHotspotBackend
 import com.shilapi.xcertplay.network.WirelessHotspotInfo
@@ -242,6 +244,13 @@ class CarPlayController(
     @Volatile private var wirelessLinkOpenedAtMs = 0L
     // M6k11：本轮重试是否为僵尸族——决定长退避、UI 提示与蓝牙适配器 reset。
     @Volatile private var wirelessZombieMode = false
+    /**
+     * 1.1.4（B 方案，TS7 mazda2 170921 实测）：First TCP 超时后的一轮「残留会话打断重启」。
+     * 实测：断开后 19s 内重连，RFCOMM 活着 iPhone 就不清残留 CarPlay 会话——保持热点的
+     * RESTART 两代双双 30s 不入网；用户手动断开（蓝牙+热点全拆）再连 17s 即成功。
+     * 置位后 retry 强制 ≥8s 间隔且热点不保留，模拟「断开→重连」动作。
+     */
+    @Volatile private var wirelessStaleSessionBounce = false
     // M6k11 hotfix：分类结果缓存（teardown 前算好，scheduleWirelessRetry 消费后清空）。
     @Volatile private var lastWirelessFailureClass: String? = null
     // 1.1.3（8815 230420 定案）：连续 SDP 发现失败计数——iPhone iAP2 服务未广播=残留会话，
@@ -259,6 +268,11 @@ class CarPlayController(
     // 被看门狗误杀（EU5 实测每轮均 +8.0s 精确触发，RTSP/首帧已正常），拆完 iPhone 停留
     // config 6 不再重枚举 → 死循环。
     @Volatile private var wiredStreamSeen = false
+    // FE-6 楔死自愈：本插线周期内 wired 是否成功跑过流。自愈重试开路时若同一设备实例
+    // 曾跑过流，iPhone 必然仍在 CarPlay 配置——跳过 setConfiguration（见 IphoneUsbHost）。
+    @Volatile private var wiredEverStreamed = false
+    @Volatile private var wiredOpenDeviceId = Int.MIN_VALUE
+    @Volatile private var wiredStreamedDeviceId = Int.MIN_VALUE
 
     // M6k23：未建流阶段（无 SETUP/未激活）控制流 peer EOF 连续计数。8815 实测：
     // pair-verify 通过、加密开启后 iPhone 立即 EOF，每 ~5s 重连 TCP 循环、gen 恒定，
@@ -289,6 +303,18 @@ class CarPlayController(
     private val availabilityPollGeneration = AtomicInteger(0)
     private var permissionPollGeneration = 0
     private var reenumerationAttempts = 0
+    // 1.1.4（对齐上游 2.11(143) 有线首连策略）：本 controller 周期内是否做过 0x52 重枚举
+    // + 发起重枚举时的源设备名。重枚举完成判定只认 deviceName 不同的**新实例**——
+    // 0x52 后 iPhone 需 1~3s 才完成重枚举，旧实例仍留在 UsbManager.deviceList 里，
+    // 按「有 Apple 设备」判定会对失效实例请求权限/claim，导致首连失败链。
+    @Volatile private var reenumerationPerformed = false
+    @Volatile private var reenumerationSourceDeviceName: String? = null
+    // 1.1.4（TS7 mazda2 NTB16 绕过）：上次打开的 NCM control id + 上次失败要避开的组。
+    // NCM 桥报错（含 NTB16 内核抢占污染）时把失败组记入 avoid，重建时轮换到下一组；
+    // 流真正跑起来后清空。多 NCM 组的车机（iPhone 配置暴露两组 CDC-NCM）借此绕开
+    // 内核 cdc_ncm 抢绑的那一组，无 root 解决双读污染。
+    @Volatile private var ncmLastControlId: Int? = null
+    @Volatile private var ncmAvoidControlId: Int? = null
     // 1.0.1：重枚举阶段看门狗 + 轮询兜底的车代（attach/权限路径会递增 availabilityPollGeneration），
     // 双定时器都以 phase==REENUMERATION && 代未变 && 未关闭 为存活条件。
     private val reenumerationPollGeneration = AtomicInteger(0)
@@ -297,6 +323,9 @@ class CarPlayController(
     @Volatile private var wiredMux: Iap2UsbMuxHost? = null
     @Volatile private var wiredCsm: Iap2Session? = null
     @Volatile private var wiredBridge: Ipv6NcmBridge? = null
+    // vc68：有线 mDNS 应答器（iOS16.x 在 NCM 链路上 mDNS 发现 _airplay，无应答拒绝起会话）
+    @Volatile private var wiredBonjour: WiredBonjourAdvertiser? = null
+    @Volatile private var wiredNcmGuard: WiredNcmGuard? = null
     // 1.1.3（bt_audio 协同）：蓝牙音频模式下的 A2DP 监听（跟随上游 BluetoothAudioHandoff）。
     // 仅在 airPlayConfig.disableAudioOutput（av_path=bt_audio）时挂载；suppressed 恒 false，
     // 不做 A2DP 断开/重连，只监听连接与播放态（isA2dpPlaying 反射 + PLAYING 广播）供日志观测。
@@ -681,11 +710,17 @@ class CarPlayController(
     }
 
     private fun restartWireless() {
+        // 1.1.4（B 方案）：打断轮的强制窗口已由 delay 保证，重启时清除标记回归正常节奏。
+        wirelessStaleSessionBounce = false
         // M6k11 修复 gen 双自增：startWireless() 内部已 incrementAndGet，
         // 此处再 +1 导致实测 gen 1→3→5→7→…；陈旧重试失效判断不受影响。
         Thread(
             {
-                closeWirelessStack()
+                // 1.1.5（提速）：重试保留热点附着（M6k24 C 方案路径扩展到所有重试）——
+                // 10-12 实机日志：每轮 teardown 释放热点会把 iPhone 踢下网，下一轮
+                // iPhone 重新入网 25s+；热点常开（旧版 0.2.6 模式）时 iPhone 不掉线、
+                // 重连即秒连。僵尸第 3 次 reset 蓝牙适配器的路径不受影响（只动 BT 侧）。
+                closeWirelessStack(keepHotspotForReuse = true)
                 // M6k11：僵尸族第 3 次起，teardown 后顺带 reset 本机蓝牙适配器，
                 // 清车机侧 RFCOMM 服务状态。失败只记日志不阻断重连。
                 if (!closed && wirelessZombieMode && wirelessRetryCount.get() >= 3) {
@@ -789,6 +824,8 @@ class CarPlayController(
                 deviceId = deviceIdentifier,
                 btMac = hostBluetoothMac,
             )
+            // vc67：attach 后可能因端口回退而与 wirelessAirPlayConfig 端口不同。
+            var effectiveWirelessAirPlayConfig = wirelessAirPlayConfig
 
             // Lite：进程内 AirPlayTcpServer 取代 CarPlayVpnService 绑定。
             onStatus(CarPlayStatus.AttachingNetwork)
@@ -805,15 +842,27 @@ class CarPlayController(
                     media = media,
                 )
             ) {
-                AirPlayTcpServer.AttachResult.Started -> airPlayServer = server
+                is AirPlayTcpServer.AttachResult.Started -> {
+                    airPlayServer = server
+                    // vc67：7100 被车机自带投屏服务占用（coocaa BEP10A 215128 实测）时端口
+                    // 回退——实际端口同步进 config，Bonjour TXT 与 0x5703 airPlayPort 都按
+                    // 真实端口下发（iPhone 不写死端口）。
+                    effectiveWirelessAirPlayConfig = wirelessAirPlayConfig.copy(port = result.port)
+                }
                 AirPlayTcpServer.AttachResult.AlreadyStarted ->
                     throw IOException("Wireless AirPlay transport is already attached")
                 is AirPlayTcpServer.AttachResult.Failed ->
                     throw IOException(result.message)
             }
+            if (effectiveWirelessAirPlayConfig.port != airPlayConfig.port) {
+                debugLog(
+                    "wireless AirPlay port fallback: ${airPlayConfig.port} occupied, " +
+                        "using ${effectiveWirelessAirPlayConfig.port} (injected into 0x5703 + Bonjour)",
+                )
+            }
             debugLog(
                 "wireless AirPlay listener attached bind=$hostAddressText " +
-                    "port=${airPlayConfig.port} (Bonjour advertisement uses the same port)",
+                    "port=${effectiveWirelessAirPlayConfig.port} (Bonjour advertisement uses the same port)",
             )
             // M6k20（移植自上游 FirstTcpWatchdog 语义，适配 Lite 架构）：
             // 热点+监听口就绪后，若 FIRST_TCP_TIMEOUT_MILLIS 内 iPhone 从未发起任何 TCP
@@ -839,7 +888,7 @@ class CarPlayController(
 
             val bonjourClient = CarPlayBonjour(
                 context = appContext,
-                config = wirelessAirPlayConfig,
+                config = effectiveWirelessAirPlayConfig,
                 identity = identity,
                 advertisedHost = hostAddress.hostAddress,
                 // Bind discovery and its connect probe to the same AP/address family as AirPlay.
@@ -849,21 +898,45 @@ class CarPlayController(
                 onEvent = { event -> debugLog("wireless bonjour: ${event.diagnosticSummary()}") },
             )
             bonjour = bonjourClient
-            try {
-                bonjourClient.start()
-                debugLog(
-                    "wireless Bonjour services started mode=interface " +
-                        "iface=${hotspotInfo.interfaceName ?: "unknown"}",
-                )
-            } catch (error: Throwable) {
-                // 自研 mDNS 落地前的临时策略（10-02）：4.1 上 JmDNS joinGroup 报 ENODEV，
-                // 但 mDNS 广播与蓝牙 iAP2 握手相互独立。此处降级为非致命、放行蓝牙段，
-                // 以便先探测 Apple 端鉴权与 iPhone 入网行为；换自研 mDNS 后恢复为致命。
-                bonjour = null
-                runCatching { bonjourClient.close() }
-                debugLog(
-                    "wireless Bonjour 广播失败（非致命，继续蓝牙段）: ${error.message}",
-                )
+            // vc66（提速）：start() 整体后台化。TS7 204308 实测：JmDNS create+registerService
+            // 同步阻塞 7.5s（23.82 attach 完成 → 31.40 started），是关键路径上最大的单项
+            // 开销。mDNS 广播不在连接关键链路上（iPhone 入网由 iAP2 0x5703 直发凭证驱动，
+            // vc65 日志 tcpAccepted 与 Bonjour started 无先后依赖），且 start 失败本来就是
+            // 非致命降级——后台化语义零变化。竞态护栏：代次过期则自行 close；与 teardown
+            // 撞车时 CarPlayBonjour 内部 lifecycleLock/closed 保证行为正确（close 先到则
+            // start 抛 check 走降级），bonjour 字段清理用引用比较防止误伤新一代实例。
+            Thread(
+                {
+                    try {
+                        bonjourClient.start()
+                        if (isStaleWirelessRun(generation)) {
+                            runCatching { bonjourClient.close() }
+                            debugLog(
+                                "wireless Bonjour async start done but generation stale; " +
+                                    "closed gen=$generation",
+                            )
+                            return@Thread
+                        }
+                        debugLog(
+                            "wireless Bonjour services started mode=interface (async) " +
+                                "iface=${hotspotInfo.interfaceName ?: "unknown"} gen=$generation",
+                        )
+                    } catch (error: Throwable) {
+                        // 自研 mDNS 落地前的临时策略（10-02）：4.1 上 JmDNS joinGroup 报 ENODEV，
+                        // 但 mDNS 广播与蓝牙 iAP2 握手相互独立。此处降级为非致命、放行蓝牙段，
+                        // 以便先探测 Apple 端鉴权与 iPhone 入网行为；换自研 mDNS 后恢复为致命。
+                        if (bonjour === bonjourClient) bonjour = null
+                        runCatching { bonjourClient.close() }
+                        debugLog(
+                            "wireless Bonjour 广播失败（非致命，继续蓝牙段）: " +
+                                "${error.message} gen=$generation",
+                        )
+                    }
+                },
+                "xcertplay-bonjour-start",
+            ).apply {
+                isDaemon = true
+                start()
             }
             if (isStaleWirelessRun(generation)) {
                 closeWirelessStack()
@@ -910,7 +983,7 @@ class CarPlayController(
                 channel = hotspotInfo.channel,
                 security = hotspotInfo.security,
                 ipAddresses = listOf(hostAddressText),
-                airPlayPort = airPlayConfig.port,
+                airPlayPort = effectiveWirelessAirPlayConfig.port,
                 deviceIdentifier = deviceIdentifier,
                 publicKey = identity.publicKeyHex,
                 sourceVersion = airPlayConfig.sourceVersion,
@@ -1100,7 +1173,10 @@ class CarPlayController(
         if (failureClass == "IPHONE_ZOMBIE") {
             wirelessZombieMode = true
         }
-        val delayMs = if (wirelessZombieMode) {
+        val delayMs = if (wirelessStaleSessionBounce) {
+            // 1.1.4（B 方案）：残留会话打断轮——强制 ≥8s 蓝牙/热点全断窗口，让 iOS 清态。
+            maxOf(STALE_SESSION_BOUNCE_DELAY_MILLIS, minOf(WIRELESS_RETRY_DELAY_BASE_MILLIS * attempt, WIRELESS_RETRY_DELAY_MAX_MILLIS))
+        } else if (wirelessZombieMode) {
             when (attempt) {
                 1, 2 -> ZOMBIE_FAST_RETRY_MILLIS
                 else -> {
@@ -1124,7 +1200,8 @@ class CarPlayController(
             "wireless link dropped (${error.message ?: error.javaClass.simpleName}) " +
                 "class=$failureClass; " +
                 "auto-retry $attempt/$MAX_WIRELESS_RETRIES " +
-                "RESTART gen=$generation backoff=${delayMs}ms",
+                "RESTART gen=$generation backoff=${delayMs}ms" +
+                if (wirelessStaleSessionBounce) " stale-session-bounce" else "",
         )
         mainHandler.postDelayed(
             {
@@ -1235,11 +1312,18 @@ class CarPlayController(
         object : AirPlaySessionListener by sessionListener {
             override fun onSessionActive(session: AirPlaySession) {
                 wiredStreamSeen = true
+                wiredEverStreamed = true
+                wiredStreamedDeviceId = wiredOpenDeviceId
+                // 1.1.4：当前 NCM 组跑通了流——清掉轮换避让，保持优选。
+                ncmAvoidControlId = null
                 sessionListener.onSessionActive(session)
             }
 
             override fun onVideoFrameRendered(session: AirPlaySession) {
                 wiredStreamSeen = true
+                wiredEverStreamed = true
+                wiredStreamedDeviceId = wiredOpenDeviceId
+                ncmAvoidControlId = null
                 sessionListener.onVideoFrameRendered(session)
             }
         }
@@ -1450,27 +1534,73 @@ class CarPlayController(
                             "(top suspect: iPhone WLAN off / join not happened)",
                     )
                 }
-                Thread(
+                // 1.1.5（提速）：宽限复查。10-12 实机三样本（Manual 与 Relay 各一次）：
+                // iPhone 实际入网 +25~35s，0x5703 重发预算 12×5s=60s 仍在推进，
+                // 30s 一刀切 teardown 恰好杀在 iPhone 入网/握手途中（差 2~5s 就能成），
+                // 且 teardown 拆热点会踢掉 iPhone 关联，越重试越慢。
+                // 改为：fire 时只提示，再给 FIRST_TCP_GRACE_MILLIS 窗口；
+                // 窗口内任一 TCP 进入即静默放行，仍为 0 才走 teardown+fail。
+                mainHandler.postDelayed(
                     {
-                        if (closed || generation != wirelessGeneration.get()) return@Thread
-                        closeWirelessStack()
-                        fail(
-                            IOException(
-                                (if (relaySuspect) {
-                                    "First TCP timeout (relay): iPhone never connected over the relay Wi-Fi " +
-                                        "(iPhone WLAN off / join not happened; AP isolation secondary)"
-                                } else {
-                                    "First TCP timeout: iPhone never connected to the car network " +
-                                        "(stale mDNS cache / Wi-Fi not joined / AP isolation)"
-                                }),
-                            ),
+                        if (
+                            closed ||
+                            phase != Phase.WIRELESS ||
+                            generation != wirelessGeneration.get() ||
+                            wirelessActiveReported.get() ||
+                            wirelessDegradedActive.get() ||
+                            wirelessHandoffRequested.get()
+                        ) {
+                            return@postDelayed
+                        }
+                        val graceAccepted = airPlayServer?.acceptedConnectionCount() ?: 0
+                        if (graceAccepted > 0) {
+                            debugLog(
+                                "first TCP watchdog: connection arrived during grace window; " +
+                                    "continuing generation=$generation",
+                            )
+                            return@postDelayed
+                        }
+                        debugLog(
+                            "first TCP watchdog: still 0 TCP after ${timeoutMillis}ms+" +
+                                "${FIRST_TCP_GRACE_MILLIS}ms grace; failing generation=$generation",
                         )
+                        Thread(
+                            {
+                                if (closed || generation != wirelessGeneration.get()) return@Thread
+                                if (!relaySuspect) {
+                                    // 1.1.4（B 方案）：先拆蓝牙引导链——RFCOMM 活着 iPhone 就维持
+                                    // 残留会话态；配合 retry 的 ≥8s 间隔模拟「断开→重连」。
+                                    debugLog(
+                                        "first TCP timeout: bouncing Bluetooth bootstrap to clear " +
+                                            "stale iPhone CarPlay session",
+                                    )
+                                    wirelessStaleSessionBounce = true
+                                    closeBluetoothBootstrapTransport()
+                                }
+                                // 1.1.5（提速）：失败重试不拆热点（M6k24 C 方案路径）——
+                                // 车机热点保持 + iPhone 关联不掉，下一轮 0x5703 即刻秒连；
+                                // 旧版 0.2.6 即为热点常开、iPhone 挂网不掉线的模式。
+                                closeWirelessStack(keepHotspotForReuse = true)
+                                fail(
+                                    IOException(
+                                        (if (relaySuspect) {
+                                            "First TCP timeout (relay): iPhone never connected over the relay Wi-Fi " +
+                                                "(iPhone WLAN off / join not happened; AP isolation secondary)"
+                                        } else {
+                                            "First TCP timeout: iPhone never connected to the car network " +
+                                                "(stale mDNS cache / Wi-Fi not joined / AP isolation)"
+                                        }),
+                                    ),
+                                )
+                            },
+                            "xcertplay-first-tcp-timeout",
+                        ).apply {
+                            isDaemon = true
+                            start()
+                        }
                     },
-                    "xcertplay-first-tcp-timeout",
-                ).apply {
-                    isDaemon = true
-                    start()
-                }
+                    FIRST_TCP_GRACE_MILLIS,
+                )
             },
             timeoutMillis,
         )
@@ -1643,6 +1773,11 @@ class CarPlayController(
         val iPhones = bonded.filter { device ->
             device.name?.contains("iPhone", ignoreCase = true) == true
         }
+        // 1.1.5（提速）：仅一台已配对 iPhone 时直接选定——RFCOMM 建链本身就是可达性验证，
+        // 跳过 HFP/A2DP profile proxy 查询（每 profile 最长 3s，10-12 实机日志：累计 ~8s）。
+        // 旧版 0.2.6 同场景 0.1~0.9s 即发起 RFCOMM。单台时与原逻辑结果等价（原逻辑最终
+        // 也落到 iPhones.single()），多台时仍走连接态判定消歧。
+        if (iPhones.size == 1) return iPhones.single()
         val directlyConnectedIPhones = iPhones.filter(::isBluetoothDeviceConnected)
         Log.i(
             IphoneCarPlayConfiguration.TAG,
@@ -1864,7 +1999,37 @@ class CarPlayController(
         debugLog("wireless teardown step=1/5 unregistering Bonjour advertisement")
         val activeBonjour = bonjour
         bonjour = null
-        timedStep("Bonjour") { activeBonjour?.close() }
+        if (activeBonjour != null) {
+            // 1.1.5（提速）：JmDNS close（goodbye 重传等待 + worker join）实测可阻塞 7~8s
+            //（10-12 实机：elapsedMs=7021/8019 两样本），直接拖慢整条 teardown 与下一次
+            // 尝试启动。goodbye 报文在 close() 首毫秒即发出，改为后台线程异步收尾，主
+            // teardown 只等 300ms 保证 goodbye 先于 AirPlay 下线（保住 M6k8 顺序约束）；
+            // 多播套接字 SO_REUSEADDR 允许与下一代注册短暂并存。
+            val bonjourGoodbye = CountDownLatch(1)
+            Thread(
+                {
+                    try {
+                        activeBonjour.close()
+                        debugLog("wireless teardown resource=Bonjour completed (async)")
+                    } catch (error: Throwable) {
+                        debugLog("wireless Bonjour async close failed: ${error.message}")
+                    } finally {
+                        bonjourGoodbye.countDown()
+                    }
+                },
+                "xcertplay-bonjour-close",
+            ).apply {
+                isDaemon = true
+                start()
+            }
+            bonjourGoodbye.await(300, TimeUnit.MILLISECONDS)
+            debugLog(
+                "wireless teardown resource=Bonjour goodbyeFlushed=" +
+                    (bonjourGoodbye.count == 0L) + " (async close continues in background)",
+            )
+        } else {
+            debugLog("wireless teardown resource=Bonjour completed=true elapsedMs=0")
+        }
 
         val activeServer = airPlayServer
         airPlayServer = null
@@ -2012,24 +2177,43 @@ class CarPlayController(
                             (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP &&
                                 IphoneCarPlayConfiguration.usbMuxInterfaceLegacy(result.device) != null &&
                                 NcmFunctionDiscovery.findLegacy(result.device) != null)
-                        if (legacyCarPlayReady) {
-                            openDataPaths(result.device)
-                        } else {
-                            // M6k24d 诊断：重枚举后 iPhone 未带 CarPlay 配置时，dump 完整
-                            // 描述符（配置/接口/类三元组），确认它到底以什么形态回来。
-                            debugLog(
-                                "wired re-attached iPhone pid=0x" + result.device.productId.toString(16) +
-                                    " topology=" + IphoneCarPlayConfiguration.describeDevice(result.device),
-                            )
-                            if (reenumerationAttempts < MAXIMUM_REENUMERATION_ATTEMPTS) {
-                                beginReenumeration(result.device)
-                            } else {
-                                fail(
-                                    IphoneUsbException.Protocol(
-                                        "iPhone did not expose a complete CarPlay USB configuration",
-                                    ),
+                        val canReenumerate = reenumerationAttempts < MAXIMUM_REENUMERATION_ATTEMPTS
+                        // 干净重置仅对 API≥21 生效：上游 2.11(143) minSdk 24，一次成功率路径
+                        // 只在 Android 7+ 实证过；API<21 老车机保持「ready 即开路」原行为，
+                        // 避免 0x52+二次权限在低版本上引入新回归。
+                        val wantCleanReset = Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP
+                        // 1.1.4（对齐上游 2.11(143) 外测一次成功率路径）：即使 iPhone 已带
+                        // CarPlay 配置（上次会话残留的 0x52 形态），只要本周期还没做过 0x52
+                        // 重枚举，就先重枚举拿干净状态再开路——残留栈直接 usbmux/Lockdown
+                        // 握手易超时（外测「首连常失败、重连才成」实锤根因）。做过则直接开路。
+                        val action = when {
+                            legacyCarPlayReady && wantCleanReset && !reenumerationPerformed && canReenumerate -> "clean-reenumerate"
+                            legacyCarPlayReady -> "open-data-paths"
+                            canReenumerate -> "force-reenumerate"
+                            else -> "reject-missing-configuration"
+                        }
+                        debugLog(
+                            "wired permission granted: carPlayReady=$legacyCarPlayReady " +
+                                "cleanReset=$wantCleanReset attempts=$reenumerationAttempts " +
+                                "performed=$reenumerationPerformed action=$action",
+                        )
+                        when (action) {
+                            "clean-reenumerate" -> beginReenumeration(result.device)
+                            "open-data-paths" -> openDataPaths(result.device)
+                            "force-reenumerate" -> {
+                                // M6k24d 诊断：iPhone 未带 CarPlay 配置时，dump 完整
+                                // 描述符（配置/接口/类三元组），确认它到底以什么形态回来。
+                                debugLog(
+                                    "wired re-attached iPhone pid=0x" + result.device.productId.toString(16) +
+                                        " topology=" + IphoneCarPlayConfiguration.describeDevice(result.device),
                                 )
+                                beginReenumeration(result.device)
                             }
+                            else -> fail(
+                                IphoneUsbException.Protocol(
+                                    "iPhone did not expose a complete CarPlay USB configuration",
+                                ),
+                            )
                         }
                     }
                     else -> Unit
@@ -2073,14 +2257,29 @@ class CarPlayController(
     private fun beginReenumeration(device: UsbDevice) {
         phase = Phase.REENUMERATION
         reenumerationAttempts += 1
+        // 真重枚举（0x52 模式切换）后必须重新走 setConfiguration——自愈豁免仅限同插线周期。
+        wiredEverStreamed = false
+        wiredStreamedDeviceId = Int.MIN_VALUE
+        // 1.1.4：记录「做过重枚举」与源设备名——权限回来时据此决定干净重置/直接开路，
+        // 轮询据此只认 deviceName 不同的新实例（上游同款双标志）。
+        reenumerationPerformed = true
+        reenumerationSourceDeviceName = device.deviceName
         onStatus(CarPlayStatus.SelectingConfiguration)
         iphoneHost?.requestCarPlayReenumerationAsync(device, executor) { transition ->
             when (transition) {
                 is IphoneUsbHost.TransitionResult.ReenumerationRequested -> {
                     // M6k24d 诊断：0x52 的响应字节决定 iPhone 是否接受 CarPlay 模式切换。
                     debugLog("wired CarPlay vendor request 0x52 response=0x${transition.vendorResponseByte.toString(16)}")
-                    onStatus(CarPlayStatus.WaitingForReenumeration)
-                    startReenumerationWatchdog()
+                    // 1.1.4（TS7 mazda2 实测）：response=0x6 = iPhone 已处于 CarPlay 配置、
+                    // 拒绝重枚举——新实例永远不会出现，旧实例也未失效。取消等待，直接对
+                    // 当前设备开数据面（重枚举定时器在 phase 离开 REENUMERATION 后自然失活）。
+                    if (transition.vendorResponseByte == 0x06) {
+                        debugLog("wired 0x52 rejected (already configured); opening data paths directly")
+                        openDataPaths(device)
+                    } else {
+                        onStatus(CarPlayStatus.WaitingForReenumeration)
+                        startReenumerationWatchdog()
+                    }
                 }
                 is IphoneUsbHost.TransitionResult.Failed -> fail(transition.error)
             }
@@ -2104,21 +2303,31 @@ class CarPlayController(
             val appleDevices = usbManager?.deviceList?.values?.filter {
                 IphoneUsbMatcher.appleVendor().matches(it.vendorId, it.productId)
             }.orEmpty()
-            if (polls % 2 == 1) {
+            // 1.1.4（对齐上游 deviceName 比对）：0x52 后旧实例仍留在设备列表 1~3s，
+            // 完成判定只认 deviceName 与源设备不同的**新实例**，防止对失效实例请求权限。
+            val sourceName = reenumerationSourceDeviceName
+            val freshDevices = if (sourceName == null) appleDevices else {
+                appleDevices.filter { it.deviceName != sourceName }
+            }
+            if (polls % 8 == 1) {
                 debugLog(
                     "reenumerate waiting: appleDevices=" +
-                        appleDevices.joinToString(separator = ", ", prefix = "[", postfix = "]") { "vid=0x${it.vendorId.toString(16)} pid=0x${it.productId.toString(16)}" },
+                        appleDevices.joinToString(separator = ", ", prefix = "[", postfix = "]") { "vid=0x${it.vendorId.toString(16)} pid=0x${it.productId.toString(16)}" } +
+                        " fresh=${freshDevices.size}",
                 )
             }
-            if (appleDevices.isNotEmpty()) {
-                debugLog("reenumerate poll: detected Apple device; treating as re-attached")
+            if (freshDevices.isNotEmpty()) {
+                val reattached = freshDevices.first()
+                debugLog(
+                    "reenumerate poll: detected fresh Apple device (name=${reattached.deviceName}); treating as re-attached",
+                )
                 // 1.0.19（AC822X API17 实测）：补打重枚举后拓扑——此前只有首 attach 的
                 // legacy dump，renum 后进没进 CarPlay 配置、iface2/3 是不是真 NCM 全靠猜。
                 debugLog(
                     "reenumerate poll: re-attached topology " +
-                        IphoneCarPlayConfiguration.describeDevice(appleDevices.first()),
+                        IphoneCarPlayConfiguration.describeDevice(reattached),
                 )
-                onIphoneAttached(appleDevices.first())
+                onIphoneAttached(reattached)
                 return
             }
             mainHandler.postDelayed(::pollOnce, REENUMERATION_POLL_INTERVAL_MILLIS)
@@ -2197,22 +2406,34 @@ class CarPlayController(
         }
         phase = Phase.DATAPATHS
         debugLog("wired opening iPhone USB data paths")
+        wiredOpenDeviceId = target.deviceId
+        // FE-6 楔死自愈：同一设备实例曾跑过流 → iPhone 仍在 CarPlay 配置，首跳跳过
+        // setConfiguration，避免多余的 re-enumerate 作废刚拿到的 USB 权限。
+        val assumeConfigured = wiredEverStreamed && target.deviceId == wiredStreamedDeviceId
+        if (assumeConfigured) {
+            debugLog("wired self-heal retry: same device instance streamed before; assuming CarPlay configuration")
+        }
         onStatus(CarPlayStatus.SelectingConfiguration)
         onStatus(CarPlayStatus.OpeningDataPaths)
-        iphoneHost?.openIap2UsbSessionAsync(target, executor) { result ->
-            when (result) {
-                is IphoneUsbHost.Iap2SessionResult.Connected -> {
-                    try {
-                        val ncm = openNcm(target)
-                        runWiredStack(result.session, ncm)
-                    } catch (error: Throwable) {
-                        result.session.close()
-                        fail(error)
+        iphoneHost?.openIap2UsbSessionAsync(
+            target,
+            executor,
+            callback = { result ->
+                when (result) {
+                    is IphoneUsbHost.Iap2SessionResult.Connected -> {
+                        try {
+                            val ncm = openNcm(target)
+                            runWiredStack(result.session, ncm)
+                        } catch (error: Throwable) {
+                            result.session.close()
+                            fail(error)
+                        }
                     }
+                    is IphoneUsbHost.Iap2SessionResult.Failed -> fail(result.error)
                 }
-                is IphoneUsbHost.Iap2SessionResult.Failed -> fail(result.error)
-            }
-        }
+            },
+            assumeAlreadyConfigured = assumeConfigured,
+        )
     }
 
     /** 1.0.20：重新枚举当前在位的 Apple 设备实例（图库/USB 模式切换会造成实例更替）。 */
@@ -2252,20 +2473,23 @@ class CarPlayController(
 
     private fun openNcmOnce(device: UsbDevice, attempt: Int): NcmUsbBridge {
         // 调度器：>=21 且拿到多配置时走 find(configuration)，否则 findLegacy 扫默认配置。
+        // 1.1.4：传入 avoid 组——NTB16 类失败重建时轮换到下一 NCM 组（优选内核未绑定组）。
         val configuration = IphoneCarPlayConfiguration.find(device)
-        val function = NcmFunctionDiscovery.find(device, configuration)
+        val function = NcmFunctionDiscovery.find(device, configuration, ncmAvoidControlId)
             ?: throw IphoneUsbException.Protocol("iPhone configuration does not expose an NCM function")
+        ncmLastControlId = function.control.id
         debugLog(
             // getAlternateSetting 是 API 24+（at8317 实测 API17 崩），诊断行低版本打 0。
             // 1.0.19：补 control/data 接口类——真 NCM 应为 control=2(CDC) data=10(CDC-Data)，
-            // 用于识别 ROM 拓扑误配。
+            // 用于识别 ROM 拓扑误配。1.1.4：补 avoid 组与候选选择线索。
             "ncm attempt#$attempt config=${configuration?.id} " +
                 "control=${function.control.id}/${if (Build.VERSION.SDK_INT >= 24) function.control.alternateSetting else 0}" +
                 " class=${function.control.interfaceClass}" +
                 " data=${function.data.id}/${if (Build.VERSION.SDK_INT >= 24) function.data.alternateSetting else 0}" +
                 " class=${function.data.interfaceClass}" +
                 " status=${function.statusIn?.address?.let { "0x${it.toString(16)}" } ?: "none"}" +
-                " in=0x${function.bulkIn.address.toString(16)} out=0x${function.bulkOut.address.toString(16)}",
+                " in=0x${function.bulkIn.address.toString(16)} out=0x${function.bulkOut.address.toString(16)}" +
+                " avoid=${ncmAvoidControlId ?: "-"}",
         )
         val connection = usbManager?.openDevice(device)
             ?: throw IphoneUsbException.DeviceUnavailable("Could not open the iPhone NCM connection")
@@ -2462,6 +2686,12 @@ class CarPlayController(
      */
     private fun attachWiredNetwork(ncm: NcmUsbBridge, hostMac: ByteArray): Ipv6NcmBridge? {
         onStatus(CarPlayStatus.AttachingNetwork)
+        // vc74：内置 cdc_ncm 解绑守护（TS7 内核反复绑定 6.3 与 App 抢接口，外置循环实测
+        // 有效后内置；无 root 静默降级）。claim(force=true) 只在 claim 时解绑一次，此后
+        // 内核的周期性 rebind 由本守护处理。
+        val guard = WiredNcmGuard(onDiagnostic = ::debugLog)
+        guard.start()
+        wiredNcmGuard = guard
         WiredVpnService.request(config.linkLocal)
         try {
             appContext.startService(
@@ -2488,7 +2718,19 @@ class CarPlayController(
             listener = wiredSessionListener(),
             media = media,
         )) {
-            AirPlayTcpServer.AttachResult.Started -> airPlayServer = server
+            is AirPlayTcpServer.AttachResult.Started -> {
+                airPlayServer = server
+                debugLog("wired AirPlay listener attached port=${result.port}")
+                // vc68：tun 地址上注册 airplay/raop mDNS 应答（iOS16.x NCM 链路发现必需）
+                val advertiser = WiredBonjourAdvertiser(
+                    bindAddress = InetAddress.getByName(config.linkLocal),
+                    config = airPlayConfig,
+                    identity = identity,
+                    onDiagnostic = ::debugLog,
+                )
+                advertiser.start()
+                wiredBonjour = advertiser
+            }
             AirPlayTcpServer.AttachResult.AlreadyStarted -> {
                 debugLog("wired AirPlay transport is already attached")
                 runCatching { tun.close() }
@@ -2509,6 +2751,8 @@ class CarPlayController(
             onDiagnostic = ::debugLog,
             onError = { error ->
                 debugLog("wired NCM bridge error: ${error.message ?: error.javaClass.simpleName}")
+                // 1.1.4：NCM 桥报错（含 NTB16 内核抢占污染）→ 记住失败组，重建时轮换。
+                ncmAvoidControlId = ncmLastControlId ?: ncmAvoidControlId
                 // 1.1.2（EU5 104759 实测）：桥在流中楔死后自杀关桥，但 USBMUX 控制面是独立
                 // 连接不受影响 → 控制环不结束 → 僵尸会话（音频 rx=0 直至拔线）。这里主动关
                 // wiredCsm 让控制环正常退出，走既有 peer 自动重试链全量重建。
@@ -2547,6 +2791,14 @@ class CarPlayController(
         val activeServer = airPlayServer
         airPlayServer = null
         timedStep("WiredAirPlayServer") { activeServer?.detach() }
+        // vc68：mDNS 应答器在 AirPlay 服务器之后收（goodbye 随 close 异步发出）
+        val activeBonjour = wiredBonjour
+        wiredBonjour = null
+        timedStep("WiredBonjour") { activeBonjour?.close() }
+        // vc74：解绑守护最先停（避免 teardown 期间 su 轮询干扰收尾）
+        val activeGuard = wiredNcmGuard
+        wiredNcmGuard = null
+        timedStep("WiredNcmGuard") { activeGuard?.close() }
 
         val activeCsm = wiredCsm
         wiredCsm = null
@@ -2881,12 +3133,22 @@ class CarPlayController(
         // 大概率是陈旧 mDNS 缓存（实测过期约 40s）或没入网，早失败早重连（4s 退避重试
         // 恰好覆盖缓存过期窗口）。
         private const val FIRST_TCP_TIMEOUT_MILLIS = 30_000L
+        /**
+         * 1.1.5（提速）：first-TCP 看门狗宽限复查窗口。10-12 实机三样本：iPhone 实际入网
+         * 距 0x5703 首发需 25~35s（第 3 轮才成），而 0x5703 重发预算为 12×5s=60s；
+         * 30s 一刀切 teardown 会杀在 iPhone 入网途中。fire 后先给宽限，窗口内 TCP 进入
+         * 即放行，仍为 0 才 fail（总上限 30+35=65s，仍远短于 handoff 45s+重试循环）。
+         */
+        private const val FIRST_TCP_GRACE_MILLIS = 35_000L
         /** [RELAY-TEST] 实验模式下 first-TCP 看门狗超时：须覆盖三阶段总时长（~134s）。 */
         private const val RELAY_TEST_FIRST_TCP_TIMEOUT_MILLIS = 150_000L
 
-        // 1.0.1：重枚举阶段看门狗（15s 显性失败）与轮询兜底（2s）/样本日志节拍（4s=2次一打）。
+        // 1.0.1：重枚举阶段看门狗（15s 显性失败）与轮询兜底（1.1.4 起 500ms）
+        // /样本日志节拍（polls%8，约 4s 一打）。
         private const val REENUMERATION_WATCHDOG_MILLIS = 15_000L
-        private const val REENUMERATION_POLL_INTERVAL_MILLIS = 2_000L
+        // 1.1.4：2s→500ms（对齐上游 400ms）——重枚举通常 1~3s，2s 轮询白耗时间且
+        // 与看门狗窗口不匹配；500ms 让重枚举完成后尽快进入权限请求。
+        private const val REENUMERATION_POLL_INTERVAL_MILLIS = 500L
         // M6k23：未建流阶段控制流 peer EOF 触发整代重启的阈值（连续次数）。
         private const val PRE_STREAM_EOF_RESTART_THRESHOLD = 2
         // M6h：链路掉线后的自动重连（次数 + 间隔）。
@@ -2895,12 +3157,23 @@ class CarPlayController(
         private const val MAX_WIRELESS_RETRIES = 5
         private const val WIRELESS_RETRY_DELAY_BASE_MILLIS = 4_000L
         private const val WIRELESS_RETRY_DELAY_MAX_MILLIS = 15_000L
+        // 1.1.4（B 方案）：残留会话打断轮的最小全断窗口（蓝牙+热点），实测 17s 内可重连成功。
+        private const val STALE_SESSION_BOUNCE_DELAY_MILLIS = 8_000L
         // 1.0.10：wired peer 断链自动重试（与无线链同款退避节奏，API16 安全原语）。
         private const val MAX_WIRED_RETRIES = 5
         private const val WIRED_RETRY_DELAY_BASE_MILLIS = 4_000L
         private const val WIRED_RETRY_DELAY_MAX_MILLIS = 15_000L
-        // 1.0.29：wired 建立期看门狗——0x4301 后 8s 仍零流帧即关桥重建；楔死类退避 ≥30s。
-        private const val WIRED_ESTABLISH_WATCHDOG_MILLIS = 8_000L
+        // 1.0.29：wired 建立期看门狗——0x4301 后仍零流帧即关桥重建；楔死类退避 ≥30s。
+        // vc62（EU5 123838 实测）：iPhone 起流可慢至 8~16s（两轮被 8s 看门狗杀掉，第 3 轮
+        // 才成，插线到画面 ~45s），8s→15s 一轮等到，省两轮重建。
+        // vc68：15s→30s——WiredBonjourAdvertiser 的 JmDNS 注册实测耗时 ~10s（tun 接口上
+        // bind+announce 慢），15s 窗口只留 5s 应答期，iPhone 的 _airplay 查询全落在盲区被拆桥。
+        // 30s 给足「注册 10s + 应答 20s」，健康路径（0.9s 直连）不受影响（看门狗只是上限）。
+        // vc70/71（TS7 实测）：选 3/4 组后 iPhone 首次真实连入（tcp->7100 + 1500B 视频帧），
+        // 但连接发生在 0x4301+30s 整——iPhone 在此平台的 mDNS 问答循环要 ~30s 才收敛，
+        // 30s 看门狗在数据到达前 57ms 拆桥误杀。30s→60s：查询收敛 ~30s + 流建立 20s 富余；
+        // wiredStreamSeen 置位后看门狗即失效，健康路径不变。
+        private const val WIRED_ESTABLISH_WATCHDOG_MILLIS = 60_000L
         private const val WIRED_WEDGE_RETRY_DELAY_MILLIS = 30_000L
         // M6k11：CSM 打开后 <500ms 被 iPhone 关流 → IPHONE_ZOMBIE（重试治不了）。
         // 僵尸策略：快试 2 次（4s）→ 第 3 次起长退避 30s/60s 并提示用户关开 iPhone 蓝牙；

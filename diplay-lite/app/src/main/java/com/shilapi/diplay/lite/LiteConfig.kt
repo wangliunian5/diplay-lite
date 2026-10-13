@@ -186,6 +186,12 @@ data class LiteConfig(
                 .putString("av_path_mode", config.avPathMode)
                 .putString("bt_audio_info_variant", config.btAudioInfoVariant)
                 .putInt("media_buffer_millis", config.mediaBufferMillis)
+                // vc59 修复（8815 实测）：分辨率设定三键漏写——load 读 video_resolution_mode/
+                // manual_resolution_w/h，但 save 从未写入，导致「手动设定分辨率」确认重启后
+                // 落盘丢失，单选弹回「保持纵横比」、手动输入行不显示。
+                .putString("video_resolution_mode", config.resolutionMode)
+                .putInt("manual_resolution_w", config.manualWidth)
+                .putInt("manual_resolution_h", config.manualHeight)
                 .putInt("media_audio_stream", config.mediaAudioStream)
                 .putInt("nav_audio_stream", config.navAudioStream)
                 .putBoolean("voice_routed_to_media", config.voiceRoutedToMedia)

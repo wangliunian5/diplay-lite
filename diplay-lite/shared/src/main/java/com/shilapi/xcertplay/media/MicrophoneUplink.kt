@@ -162,13 +162,17 @@ internal class MicrophoneUplink(
     }
 
     // API16 适配：按优先级给出可尝试的录音源。4.1 上 VOICE_COMMUNICATION 常常初始化不了
-    // （要求 MODE_IN_COMMUNICATION），所以让 7 → 6 → 1 逐级退；语音识别走 6 → 1。
+    // （要求 MODE_IN_COMMUNICATION），所以逐级退；语音识别走 6 → 1。
     // 代价：退到 MIC 时没有平台回声消除，远端可能听到回声（后续可跟 #33 的 AEC/NS）。
+    // 1.1.4（EU5 123838 实锤）：telephony 源序 7→6→1 改 6→1→7 —— 同一台车 Siri（源 6）
+    // 能开而电话全灭，只有「源 7 先行」一个差异变量；源 7 初始化失败会短暂占住/弄脏
+    // PATEO HAL 的输入句柄，300ms 内殃及矩阵里后续的源 6/1 全败。7 移末位，即使失败
+    // 也不殃及前面的尝试；正常车机源 6 本就能开，第一候选即命中、零行为变化。
     private fun sourcesFor(audioType: String): List<Int> = when (audioType) {
         "telephony" -> listOf(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
             MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
         )
         "speechrecognition" -> listOf(
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
@@ -205,10 +209,19 @@ internal class MicrophoneUplink(
         val masks = intArrayOf(requestedMask, AndroidAudioFormat.CHANNEL_IN_MONO, AndroidAudioFormat.CHANNEL_IN_STEREO).distinct().toIntArray()
         val attempts = StringBuilder()
         val winner = tryOpen(rates, masks, attempts)
-        if (winner != null && attempts.isNotEmpty()) {
+        if (winner != null) {
+            if (attempts.isNotEmpty()) {
+                diagnostics?.invoke(
+                    "microphone fallback matrix winner source=${winner.source} rate=${winner.rate} " +
+                        "channels=${winner.channels} (negotiated rate=${config.sampleRate} " +
+                        "channels=${config.channels}) attempts:$attempts",
+                )
+            }
+        } else {
+            // 1.1.4 补盲：全败时也落盘逐候选明细（此前只在胜出时打 attempts，
+            // EU5 123838 报告里因此查不到每个源失败的具体原因，A/B 定性失据）。
             diagnostics?.invoke(
-                "microphone fallback matrix winner source=${winner.source} rate=${winner.rate} " +
-                    "channels=${winner.channels} (negotiated rate=${config.sampleRate} " +
+                "microphone fallback matrix exhausted (negotiated rate=${config.sampleRate} " +
                     "channels=${config.channels}) attempts:$attempts",
             )
         }

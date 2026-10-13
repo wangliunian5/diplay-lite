@@ -80,6 +80,18 @@ class AndroidMediaSink(
      * UI 层据此把 SurfaceView 等比适配，避免硬拉伸变形。
      */
     private val onVideoOutputSizeChanged: ((Int, Int) -> Unit)? = null,
+    /**
+     * 1.1.4（EU5 电话无收音排查）：麦克风上行启动全败时的音频系统现场快照
+     * （audio mode / SCO / A2DP 状态等），由持有 Context 的上层注入。sink 不持
+     * Context，故用取值回调；空串表示上层未提供。
+     */
+    private val microphoneSystemSnapshot: () -> String = { "" },
+    /**
+     * 1.1.4（ECARX 媒体中心冒充桥）：CarPlay 媒体流（audioType=media）首包到达时
+     * 触发，上层据此通知 EcarxMediaCenterBridge 显式抢占 ONLINE 音源。电话/导航/
+     * Siri 流不触发。
+     */
+    private val onMediaPlaybackStarted: (() -> Unit)? = null,
 ) : MediaSink {
     private val screenStateLock = Any()
     private val activeScreenTypes = mutableSetOf<Int>()
@@ -96,6 +108,18 @@ class AndroidMediaSink(
     private val audioStreamTypes =
         java.util.Collections.synchronizedSet(java.util.LinkedHashSet<String>())
     private val microphoneUplinks = ConcurrentHashMap<Int, MicrophoneUplink>()
+    /**
+     * 1.1.4（EU5 电话无收音）：上行启动失败后的延时重试。失败时 iPhone 已收到 SETUP 200
+     * 且不再重发，一锤定音=整通电话静音；而通话建立期 HAL 输入可能被短暂占用（EU5 疑点 B）。
+     * 重试节奏：800ms / 2s 各一次（重建 uplink 全矩阵再试），STOP/新一轮 SETUP 时取消。
+     * 独立调度器，不与视频恢复共用线程（recoveryExecutor 无 schedule 能力）。
+     */
+    private val microphoneRetryExecutor =
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor { task ->
+            Thread(task, "carplay-mic-retry").apply { isDaemon = true }
+        }
+    private val microphoneRetryFutures =
+        ConcurrentHashMap<Int, MutableList<java.util.concurrent.ScheduledFuture<*>>>()
     private val pendingVideoCodec = ConcurrentHashMap<Int, VideoCodec>()
     private val videoRecoveryHandlers = ConcurrentHashMap<Int, () -> Unit>()
     private val videoDiagnosticHandlers = ConcurrentHashMap<Int, (String) -> Unit>()
@@ -168,6 +192,7 @@ class AndroidMediaSink(
     override fun onAudioStarted(type: Int, format: AudioFormat, firstSample: Int) {
         noteAudioStreamType(type, format.audioType)
         audioRenderer(type, format).start()
+        if (format.audioType == "media") onMediaPlaybackStarted?.invoke()
     }
 
     /** 新出现的 audioType 才打一行汇总，避免刷屏。 */
@@ -186,6 +211,13 @@ class AndroidMediaSink(
     }
 
     override fun onMicrophoneStarted(type: Int, config: MicrophoneConfig) {
+        // iPhone 新一轮 onStarted：作废未决重试（参数以最新 SETUP 为准）。
+        cancelMicrophoneRetries(type)
+        startMicrophoneUplink(type, config, retriesLeft = 2)
+    }
+
+    /** 1.1.4：上行启动 + 失败延时重试（800ms→2s），重试时全新建 uplink 走完整兜底矩阵。 */
+    private fun startMicrophoneUplink(type: Int, config: MicrophoneConfig, retriesLeft: Int) {
         // API16 适配：ConcurrentHashMap.computeIfAbsent 是 API 24+，改两段式 get + putIfAbsent。
         var uplink = microphoneUplinks[type]
         if (uplink == null) {
@@ -193,10 +225,32 @@ class AndroidMediaSink(
             val raced = microphoneUplinks.putIfAbsent(type, created)
             uplink = raced ?: created
         }
-        if (!uplink.start()) microphoneUplinks.remove(type, uplink)
+        if (uplink.start()) {
+            cancelMicrophoneRetries(type)
+            return
+        }
+        microphoneUplinks.remove(type, uplink)
+        if (retriesLeft <= 0) {
+            onAudioDiagnostic(
+                "Microphone uplink start failed after retries; " +
+                    "uplink stays silent until iPhone re-SETUP. snapshot: ${microphoneSystemSnapshot()}",
+            )
+            return
+        }
+        val delay = if (retriesLeft == 2) 800L else 2000L
+        val future = microphoneRetryExecutor.schedule({
+            startMicrophoneUplink(type, config, retriesLeft - 1)
+        }, delay, TimeUnit.MILLISECONDS)
+        microphoneRetryFutures.getOrPut(type) { mutableListOf() }.add(future)
+    }
+
+    /** 取消某流未决的上行重试（onMicrophoneStopped / 新 onStarted / 成功时调用）。 */
+    private fun cancelMicrophoneRetries(type: Int) {
+        microphoneRetryFutures.remove(type)?.forEach { it.cancel(false) }
     }
 
     override fun onMicrophoneStopped(type: Int) {
+        cancelMicrophoneRetries(type)
         microphoneUplinks.remove(type)?.close()
     }
 
@@ -215,6 +269,8 @@ class AndroidMediaSink(
         audioRenderers.clear()
         microphoneUplinks.values.forEach(MicrophoneUplink::close)
         microphoneUplinks.clear()
+        microphoneRetryFutures.clear()
+        microphoneRetryExecutor.shutdownNow()
     }
 
     private fun videoDecoder(type: Int): VideoDecoder {

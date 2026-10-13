@@ -20,6 +20,7 @@ import com.shilapi.xcertplay.airplay.AirPlayContact
 import com.shilapi.xcertplay.airplay.AirPlayDeviceInfo
 import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
 import com.shilapi.xcertplay.airplay.AirPlayDisplaySettings
+import com.shilapi.xcertplay.vehicle.EcarxMediaCenterBridge
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
 import com.shilapi.xcertplay.airplay.AirPlaySession
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
@@ -115,6 +116,8 @@ class LiteSessionService : Service() {
     /** M3 媒体面：每轮 startController 新建一套（AndroidMediaSink.close() 后不可复用）。 */
     private var mediaSink: AndroidMediaSink? = null
     private var mediaEngine: CarPlayMediaEngine? = null
+    /** 1.1.4：ECARX 媒体中心冒充桥（非 ECARX 车机内部静默禁用，零开销）。 */
+    private var ecarxBridge: EcarxMediaCenterBridge? = null
 
     private val sessionListener = object : AirPlaySessionListener {
         override fun onSessionActive(session: AirPlaySession) {
@@ -189,6 +192,8 @@ class LiteSessionService : Service() {
         mediaSink?.close()
         mediaSink = null
         mediaEngine = null
+        ecarxBridge?.close()
+        ecarxBridge = null
         LiteVideoBridge.bindSink(null)
         LiteState.running = false
         LiteState.phase = LiteState.Phase.IDLE
@@ -219,6 +224,8 @@ class LiteSessionService : Service() {
         mediaSink?.close()
         mediaSink = null
         mediaEngine = null
+        ecarxBridge?.close()
+        ecarxBridge = null
         LiteVideoBridge.bindSink(null)
         val config = LiteConfig.load(this)
         val usb = requestedChannel == "usb"
@@ -267,6 +274,11 @@ class LiteSessionService : Service() {
                 "channel=$requestedChannel ssid=$ssid security=$security",
         )
         // M3：MediaCodec 解码到 SurfaceView；SurfaceView 的 Surface 由 LiteVideoBridge 补齐。
+        // 1.1.4：ECARX 媒体中心冒充桥——探测失败（非 ECARX 车机）内部静默禁用，
+        // 只落一条诊断；媒体流首包到达时经 sink 回调显式抢 ONLINE 音源。
+        val bridge = EcarxMediaCenterBridge(this) { LiteLog.log("media", it) }
+        ecarxBridge = bridge
+        bridge.activate()
         val sink = AndroidMediaSink(
             videoWidth = size.first,
             videoHeight = size.second,
@@ -291,6 +303,15 @@ class LiteSessionService : Service() {
                 LiteLog.log("media", "video output size coded=${w}x${h}")
                 LiteVideoBridge.notifyVideoSize(w, h)
             },
+            // 1.1.4（EU5 电话无收音）：麦克风上行全败时的音频系统现场快照，用于
+            // 判断通话态（MODE_IN_COMMUNICATION / SCO / A2DP）下输入被占的情况。
+            microphoneSystemSnapshot = {
+                val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+                "mode=${am.mode} scoOn=${am.isBluetoothScoOn} a2dpOn=${am.isBluetoothA2dpOn} " +
+                    "wiredHeadset=${am.isWiredHeadsetOn} speakerphoneOn=${am.isSpeakerphoneOn}"
+            },
+            // 1.1.4：CarPlay 媒体流首包 → ECARX 桥显式抢源。
+            onMediaPlaybackStarted = { bridge.onCarPlayMediaStarted() },
         )
         // 麦克风上行：RECORD_AUDIO 在 targetSdk19 下安装即授予，原生分支同样按“可用”声明。
         val engine = CarPlayMediaEngine(sink = sink, microphoneEnabled = true)

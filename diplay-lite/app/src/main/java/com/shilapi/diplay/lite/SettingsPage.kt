@@ -104,7 +104,7 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var rbResFit: RadioButton
     private lateinit var rbResStretch: RadioButton
     private lateinit var rbResManual: RadioButton
-    private lateinit var manualResRow: android.view.View
+    private lateinit var applyResModeButton: android.widget.Button
     private lateinit var inputResW: EditText
     private lateinit var inputResH: EditText
     // M6k21：音频流编号当前值（弹窗选定时先存内存，点保存才落盘）
@@ -202,57 +202,53 @@ class SettingsPage(private val activity: MainActivity) {
         rgResolution.addView(rbResFit)
         rgResolution.addView(rbResStretch)
         rgResolution.addView(rbResManual)
+        // 1.1.3(vc60 交互改版·8815 实测反馈)：三选项点选不再弹确认框——点选后右方出现
+        // 「应用」按钮，点击才落盘并重启生效；不点应用即自动取消（选择不落盘）。
         rgResolution.setOnCheckedChangeListener { _, _ ->
             if (isLoading) return@setOnCheckedChangeListener
             refreshRadioDrawables(rgResolution)
-            val previous = LiteConfig.load(activity).resolutionMode
-            val target = currentResolutionMode()
-            if (target == previous) {
-                manualResRow.visibility = if (rbResManual.isChecked) View.VISIBLE else View.GONE
-                return@setOnCheckedChangeListener
-            }
-            val targetName = when (target) {
-                "stretch" -> "拉伸"
-                "manual" -> "手动设定分辨率"
-                else -> "保持纵横比"
-            }
-            val previousName = when (previous) {
-                "stretch" -> "拉伸"
-                "manual" -> "手动设定分辨率"
-                else -> "保持纵横比"
-            }
-            AlertDialog.Builder(activity)
-                .setTitle("应用分辨率设置")
-                .setMessage(
-                    "原模式：$previousName，确认修改为$targetName 吗？\n\n" +
-                        "点击「应用」后将自动重启软件，重启后全局应用新模式。",
-                )
-                .setNegativeButton("取消") { _, _ ->
-                    isLoading = true
-                    when (previous) {
-                        "stretch" -> rbResStretch.isChecked = true
-                        "manual" -> rbResManual.isChecked = true
-                        else -> rbResFit.isChecked = true
-                    }
-                    refreshRadioDrawables(rgResolution)
-                    manualResRow.visibility = if (rbResManual.isChecked) View.VISIBLE else View.GONE
-                    isLoading = false
+            applyResModeButton.visibility =
+                if (currentResolutionMode() != LiteConfig.load(activity).resolutionMode) {
+                    View.VISIBLE
+                } else {
+                    View.GONE
                 }
-                .setPositiveButton("应用并重启") { _, _ ->
+        }
+        val resModeRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            addView(
+                rgResolution,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+            )
+            applyResModeButton = Button(activity).apply {
+                text = "应用"
+                textSize = 12f
+                minHeight = dip(34)
+                setAllCaps(false)
+                background = Ui.pillSolid(activity, Ui.PRIMARY)
+                setTextColor(Ui.PRIMARY_ON)
+                setPadding(dip(14), dip(5), dip(14), dip(5))
+                visibility = View.GONE
+                setOnClickListener {
                     persistFromForm()
-                    manualResRow.visibility = if (rbResManual.isChecked) View.VISIBLE else View.GONE
+                    toast("分辨率设定已应用，软件即将重启")
                     activity.restartAppForVideoChange()
                 }
-                .show()
+            }
+            val btnParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            btnParams.setMargins(dip(8), 0, 0, 0)
+            addView(applyResModeButton, btnParams)
         }
-        column.addView(rgResolution, block(top = dip(6)))
-        // 手动输入行：横 [框] × 纵 [框] [应用]（选中「手动设定分辨率」才显示）。
+        column.addView(resModeRow, block(top = dip(6)))
+        // 手动输入行：横 [框] × 纵 [框] [应用]——恒显示（vc60 交互改版，不再随单选切换可见性）。
         // 局部变量构建，避免 lateinit 属性的 smart cast 限制。
         // 1.1.3（UI 字号调整）：样式与「分辨率自定义」一致——fillInput 输入框 + 主色 pill 应用键。
         val resRow = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = android.view.Gravity.CENTER_VERTICAL
-            visibility = android.view.View.GONE
             setPadding(0, dip(4), 0, 0)
         }
         fun manualLabel(text: String): TextView = TextView(activity).apply {
@@ -294,7 +290,6 @@ class SettingsPage(private val activity: MainActivity) {
             setOnClickListener { applyManualResolution() }
         }
         resRow.addView(applyResButton, rowStretch(dip(8)))
-        manualResRow = resRow
         column.addView(resRow, block())
         // 计算说明：与「分辨率自定义」百分比联动。
         column.addView(
@@ -846,7 +841,7 @@ class SettingsPage(private val activity: MainActivity) {
             Toast.makeText(activity, "bt_audio /info 变体：$next（重开会话生效）", Toast.LENGTH_LONG).show()
             true
         }
-        // 1.0.29：分辨率设定回显（手动行只在 manual 模式显示）。
+        // 1.0.29：分辨率设定回显（vc60：手动行恒显示，只回显选中态与数值）。
         when (config.resolutionMode) {
             "stretch" -> rbResStretch.isChecked = true
             "manual" -> rbResManual.isChecked = true
@@ -854,7 +849,6 @@ class SettingsPage(private val activity: MainActivity) {
         }
         inputResW.setText(config.manualWidth.toString())
         inputResH.setText(config.manualHeight.toString())
-        manualResRow.visibility = if (config.resolutionMode == "manual") View.VISIBLE else View.GONE
         mediaAudioStreamValue = config.mediaAudioStream
         navAudioStreamValue = config.navAudioStream
         updateStreamValueTexts()
@@ -1185,8 +1179,11 @@ class SettingsPage(private val activity: MainActivity) {
     private fun uploadLogToGitee(name: String, stamp: String, encoded: String) {
         val owner = "wangliunian"
         val repo = "display--log-collection"
-        // 1.1.3（20261012 轮换）：旧 token 27a79346… 已作废（公开源码前换专用令牌）。
-        val token = "420ad33fe308814dfef2a91ea569b853"
+        // 1.1.3（20261012 轮换）：旧 token 27a79346… 已作废。
+        // 脱敏（公开源码前置）：token 由 local.properties 经 BuildConfig.GITEE_LOG_TOKEN 注入，
+        // 未配置时为空串——下方判空降级为「生成文件后手动发送」路径，不再硬编码进源码。
+        val token = BuildConfig.GITEE_LOG_TOKEN
+        if (token.isEmpty()) throw UploadException(0, "GITEE_LOG_TOKEN not configured")
         var attemptName = name
         var lastCode = 0
         var lastBody = ""

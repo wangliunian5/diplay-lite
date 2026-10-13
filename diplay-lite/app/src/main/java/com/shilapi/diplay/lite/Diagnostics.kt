@@ -199,8 +199,11 @@ internal object Diagnostics {
     // ---------- 检测项 ----------
 
     private fun detectDevice(context: Context): String {
+        // vc60（用户要求）：报告展示当前设备实际分辨率（真实像素，含系统缩放后的显示值）。
+        val metrics = context.resources.displayMetrics
         return "Android ${apiToRelease(Build.VERSION.SDK_INT)}（API ${Build.VERSION.SDK_INT}）" +
             "\n　型号：${Build.MODEL.trim()}" +
+            "\n　分辨率：${metrics.widthPixels}×${metrics.heightPixels}" +
             "\n　软件：${appVersionName(context)}"
     }
 
@@ -622,6 +625,18 @@ internal object Diagnostics {
                     "stop adbd; start adbd; sleep 1; getprop service.adb.tcp.port",
             ).trim()
             log("root: 直试 setprop 开网络 ADB port=[$enable]${if (enable.contains("5555")) "（成功）" else "（无权限，属正常 uid）"}")
+            // FE-6（ECARX）NCM 楔死取证：root 下抓内核环形缓冲尾部，定位 USB host
+            // 控制器端点报错（chipidea/dwc3 halt 类）；无 root 时输出为空属正常。
+            runCatching {
+                val dmesg = exec("su -c 'dmesg | tail -n 400'").trim()
+                if (dmesg.isNotEmpty()) {
+                    log("dmesg: begin lines=${dmesg.lines().size}")
+                    dmesg.lines().take(400).forEach { log("dmesg: $it") }
+                    log("dmesg: end")
+                } else {
+                    log("dmesg: 无输出（无 root 或内核 dmesg_restrict）")
+                }
+            }.onFailure { log("dmesg: 采集失败 ${it.message}") }
             log("=== 诊断取证结束 ===")
         } catch (error: Throwable) {
             log("取证异常: ${error.javaClass.simpleName} ${error.message}")

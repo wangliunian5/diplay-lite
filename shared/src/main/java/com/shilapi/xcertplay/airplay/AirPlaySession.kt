@@ -331,6 +331,11 @@ class AirPlaySession(
     }
 
     private fun handle(request: RtspMessage.Request): RtspMessage.Response {
+        // 探针（1.1.2-test）：请求入口时序——/info 之后若再无任何 rx/SETUP，即 iPhone 拒绝继续会话
+        // （bt_audio 零音频声明判读的关键证据）。/feedback 高频且无诊断价值，跳过防刷屏。
+        if (!request.path.endsWith("/feedback")) {
+            debugLog("airplay rx method=${request.method} path=${request.path}")
+        }
         when (request.method) {
             "SETUP" -> return handleSetup(request)
             "RECORD" -> {
@@ -365,10 +370,11 @@ class AirPlaySession(
                     }
                     debugLog("airplay /info request=$requestInfo")
                 }
-                Log.i(
-                    TAG,
-                    "airplay /info features=${info["features"]} " +
-                        "audioFormats=${(info["audioFormats"] as? List<*>)?.size ?: 0} " +
+                // 探针（1.1.2-test）：/info 声明层实况走 debugLog 进 LiteLog——外测无 adb 也能看到
+                // features 实际值与 audioFormats/audioLatencies 条数，确认 avPathMode 声明层是否生效。
+                debugLog(
+                    "airplay /info features=${info["features"]}(0x%x)".format((info["features"] as? Number)?.toLong() ?: 0L) +
+                        " audioFormats=${(info["audioFormats"] as? List<*>)?.size ?: 0} " +
                         "audioLatencies=${(info["audioLatencies"] as? List<*>)?.size ?: 0}",
                 )
                 debugLog("airplay /info displays=${info["displays"]}")
