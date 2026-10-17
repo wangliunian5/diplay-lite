@@ -59,6 +59,9 @@ class CarPlayRuntimeConfig(
     val manualHotspotSecurity: ManualHotspotSecurity = ManualHotspotSecurity.WPA2,
     val wirelessBluetoothDeviceAddress: String? = null,
     val locationReportingEnabled: Boolean = false,
+    // 1.1.6(vc76)：有线 cdc_ncm 解绑守护开关（TS7 无 root 裁决实验）。默认 true=正式路径；
+    // false 时不启动 WiredNcmGuard，验证「仅 NTB16 重同步、无 root 无守护」能否稳住会话。
+    val wiredNcmGuardEnabled: Boolean = true,
 ) {
     init {
         require(hostMac.size == 6) { "hostMac must be 6 bytes" }

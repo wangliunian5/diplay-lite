@@ -43,9 +43,9 @@ import kotlin.math.abs
  * （SettingsPage/CarIconPage/HotspotPage），根除子 Activity 新窗口出生方向闪转问题。
  *
  * home 页形态（M6k21，对齐原版）：
- * - hero 区（原版式）：ACCENT 眉题 + 大标题 + MUTED 副题；
  * - 「CARPLAY 状态」大状态卡（原版「无线 CARPLAY」式）：眉题 + 实时状态大字 + 主按钮
  *   （空闲=按默认通道连接 / 会话中=断开）+ 默认通道提示；
+ *   （hero 文案区已删除，横屏右列改为与状态卡顶底对齐）
  * - USB 直连键（原版右列位）：竖屏在状态卡下方独立成行；横屏在右列 USB+设置。
  *   通道卡取消：热点/中继网络配置入口移入设置页（「车机热点网络配置」「中继热点网络配置」）。
  *
@@ -195,6 +195,28 @@ class MainActivity : Activity() {
             runOnUiThread { applyVideoFit(width, height) }
         }
         LiteLog.log("ui", "主界面就绪（原版式视觉：page 路由 + render 整页重建）")
+        bootstrapNetworkAdb()
+    }
+
+    /**
+     * vc67（TS7 调试自举）：App 启动即用 root 把 adbd 拉到 TCP 5555。TS7 车机重启后
+     * 网络 adb 不持久（展锐 ROM adbd 不读 persist），USB adb 又被编译期阉割，调试链路
+     * 反复断——DiPlay 已有记住的 Superuser 授权，静默自举，失败无感（未 root/被拒绝均忽略）。
+     * 仅诊断版本启用，稳定版可移除。
+     */
+    private fun bootstrapNetworkAdb() {
+        Thread {
+            try {
+                val su = Runtime.getRuntime().exec(arrayOf("su", "-c",
+                    "setprop service.adb.tcp.port 5555; stop adbd; start adbd"))
+                su.waitFor()
+                val check = Runtime.getRuntime().exec(arrayOf("sh", "-c", "getprop service.adb.tcp.port"))
+                val value = check.inputStream.bufferedReader().readText().trim()
+                LiteLog.log("ui", "adb 自举完成 tcp.port=$value")
+            } catch (error: Exception) {
+                LiteLog.log("ui", "adb 自举跳过：${error.message}")
+            }
+        }.start()
     }
 
     override fun onResume() {
@@ -206,6 +228,8 @@ class MainActivity : Activity() {
         videoStretchMode = LiteConfig.load(this).resolutionMode == "stretch"
         handler.post(refreshTask)
         maybeAutoConnect()
+        // 1.1.4 系统诊断：新装无检测记录时，主界面就绪后延迟 5 秒触发首启快检（可跳过）。
+        Diagnostics.quickCheckIfDue(this)
     }
 
     override fun onPause() {
@@ -324,6 +348,37 @@ class MainActivity : Activity() {
             steeringPage?.let { if (it.consumeKeyDown(keyCode, event)) return true }
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    /**
+     * fe6t2 方控监听（FE-6「方控上/下一首无效」取证）：全量 KeyEvent 落日志，
+     * 只观察不改分发。MediaSession/logcat/广播三条通路日志里零触发记录，先确认
+     * 车机方控按键是否以窗口 KeyEvent 形态进 App、键码/来源为何，再定映射修复。
+     *
+     * vc87（fe6t5）方控派发接通：fe6t3 日志实锤按键确实以窗口 KeyEvent 形态进 App
+     * （code=87/88 dev=-1 src=0），学习绑定能建立但标准派发只有 MediaSession 与
+     * logcat/广播两条通路，窗口 KeyEvent 永不派发——「方控按键 sent=」零记录。
+     * 观察侧升级为观察+派发：非学习页把事件转发给 LiteSteeringKeys 窗口派发入口，
+     * 仍不改变 super 分发（返回键/页面导航行为不变）。
+     */
+    override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
+        if (event != null &&
+            (event.action == KeyEvent.ACTION_UP || (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0))
+        ) {
+            LiteLog.log(
+                "ui",
+                "方控监听 code=${event.keyCode} action=${event.action} scan=${event.scanCode} " +
+                    "repeat=${event.repeatCount} dev=${event.deviceId} src=${event.source}",
+            )
+            // 学习页自己消费 onKeyDown 捕获，转发会造成双重上报；其余页面统一派发。
+            // DOWN(非 repeat) 命中学习绑定（event=ACTION_DOWN 存储），UP 命中标准媒体键。
+            if (page != "steering") {
+                val forward = (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) ||
+                    event.action == KeyEvent.ACTION_UP
+                if (forward) LiteSteeringKeys.onWindowKeyEvent(event.keyCode, event.action)
+            }
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     /**
@@ -598,8 +653,8 @@ class MainActivity : Activity() {
     // ---------- home 页 ----------
 
     /**
-     * home 面板（M6k21）：竖屏 = hero → 状态大卡 → USB 直连（按钮+说明）；
-     * 横屏 = hero+状态卡（左）｜USB 直连+设置（右）。
+     * home 面板（M6k21）：竖屏 = 状态大卡 → USB 直连（按钮+说明）；
+     * 横屏 = 状态卡（左）｜USB 直连+设置（右），右列与左卡垂直对齐。
      */
     private fun homePanel(): View {
         // M6k24：布局方向完全跟随设置（强制横屏/强制竖屏），不再读 Display。
@@ -611,23 +666,13 @@ class MainActivity : Activity() {
         content.addView(buildHeader())
         content.addView(space(12))
 
-        // hero 区（原版式）：ACCENT 眉题 + 大标题 + MUTED 副题。
-        val hero = column()
-        hero.addView(label("你的车机 · 你的 CARPLAY。", 12, Ui.ACCENT, true).apply { applyLetterSpacing(0.16f) })
-        hero.addView(
-            label("熟悉的驾驶体验。", if (wide) 30 else 24, Ui.TEXT, true).apply { setPadding(0, dip(10), 0, dip(8)) },
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
-        )
-        hero.addView(
-            label("无线 CarPlay 与 USB 直连，随时就绪。", 14, Ui.MUTED),
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
-        )
-
         val statusCard = buildStatusCard(config)
 
         if (wide) {
             // 右列（原版式）：USB 直连 + 设置入口。
             // 1.1.1 UI：按键加高（52dp）+ 行间距拉开（12dp），1024x600 车机横屏不再拥挤。
+            // 8815 版式：hero 文案区删除，右列 MATCH_PARENT 与左侧状态大卡垂直对齐
+            //（USB 直连贴卡顶、设置贴卡底，中段弹性居中）。
             val right = column().apply { gravity = Gravity.CENTER_HORIZONTAL }
             right.addView(
                 button("USB 直连", false) { connect("usb") },
@@ -652,19 +697,14 @@ class MainActivity : Activity() {
 
             val topRow = row().apply { gravity = Gravity.TOP }
             topRow.addView(
-                column().apply {
-                    addView(hero)
-                    addView(space(14))
-                    addView(statusCard)
-                },
+                statusCard,
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.6f),
             )
             topRow.addView(space(16), LinearLayout.LayoutParams(dip(16), 1))
-            topRow.addView(right, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            // 右列高度撑满行高（= 左卡高度），实现与状态大卡顶底对齐。
+            topRow.addView(right, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
             content.addView(topRow)
         } else {
-            content.addView(hero)
-            content.addView(space(12))
             content.addView(statusCard)
             // 竖屏：USB 直连键独立成行（原版右列键位）。
             content.addView(
@@ -933,18 +973,64 @@ class MainActivity : Activity() {
                     LiteLog.log("ui", "USB 通道连接请求：未发现 Apple VID(0x05ac) USB 设备")
                     return
                 }
-                val consent = try {
-                    VpnService.prepare(this)
+                // vc93：三段式授权。部分 OEM ROM（235521 日志实锤）裁剪了
+                // com.android.vpndialogs，startActivityForResult 直接抛
+                // ActivityNotFoundException 崩溃主线程。顺序：标准对话框 →
+                // root appops 免对话框授权 → 明确报错，任何一步都不许崩。
+                var consent: Intent? = null
+                var prepareBroken = false
+                try {
+                    consent = VpnService.prepare(this)
                 } catch (error: Exception) {
-                    LiteLog.log("ui", "USB 通道：VpnService.prepare 失败 ${error.message}")
-                    null
+                    prepareBroken = true
+                    LiteLog.log("ui", "USB 通道：VpnService.prepare 异常 ${error.message}")
                 }
-                if (consent != null) {
-                    startActivityForResult(consent, REQUEST_VPN_PERMISSION)
-                    LiteLog.log("ui", "USB 通道：请求 VPN 授权")
+                if (!prepareBroken && consent != null) {
+                    var launched = false
+                    try {
+                        startActivityForResult(consent, REQUEST_VPN_PERMISSION)
+                        LiteLog.log("ui", "USB 通道：请求 VPN 授权")
+                        launched = true
+                    } catch (error: Exception) {
+                        LiteLog.log("ui", "USB 通道：VPN 授权对话框无法启动（ROM 疑似裁剪 vpndialogs）：${error.message}")
+                    }
+                    if (launched) return
+                    // 对话框路走不通 → root 兜底：免对话框写 appops 后复检。
+                    if (grantVpnConsentViaRoot()) {
+                        val after = try {
+                            VpnService.prepare(this)
+                        } catch (error: Exception) {
+                            null
+                        }
+                        if (after == null) {
+                            LiteLog.log("ui", "USB 通道：root appops 免对话框授权成功")
+                            startSession(config, key, "usb")
+                            return
+                        }
+                    }
+                    toast("车机 ROM 缺失 VPN 授权组件（vpndialogs），USB 有线模式不可用")
+                    LiteLog.log("ui", "USB 通道：VPN 授权链路全失败（无 root 或 appops 未生效）")
                     return
                 }
-                startSession(config, key, "usb")
+                if (!prepareBroken && consent == null) {
+                    startSession(config, key, "usb")
+                    return
+                }
+                // prepare 本身异常 → 也尝试 root 兜底后复检。
+                if (grantVpnConsentViaRoot()) {
+                    val after = try {
+                        VpnService.prepare(this)
+                    } catch (error: Exception) {
+                        null
+                    }
+                    if (after == null) {
+                        LiteLog.log("ui", "USB 通道：root appops 授权成功（prepare 异常路径）")
+                        startSession(config, key, "usb")
+                        return
+                    }
+                }
+                toast("车机 VPN 授权组件异常，USB 有线模式不可用")
+                LiteLog.log("ui", "USB 通道：VpnService.prepare 异常且 root 兜底未生效")
             }
             else -> {
                 toast("未知连接通道")
@@ -958,6 +1044,36 @@ class MainActivity : Activity() {
         (getSystemService(USB_SERVICE) as? UsbManager)?.deviceList?.values?.any {
             it.vendorId == APPLE_USB_VENDOR_ID
         } == true
+
+    /** vc93：root 免对话框写 appops 放行 ACTIVATE_VPN（授权组件被裁的 ROM 上绕过对话框）。
+     *  只负责尝试写 op，最终是否生效由调用方复检 VpnService.prepare 判定。
+     *  vc94：原 waitFor() 无超时——su 弹交互授权框无人应答会永久阻塞主线程直至 ANR；
+     *  Process.waitFor(timeout) 是 API24+（minSdk16 不可用），改轮询 exitValue，4s 无果即
+     *  destroy 走失败（低于 5s ANR 线；预授权车机 su 秒回不受影响）。 */
+    private fun grantVpnConsentViaRoot(): Boolean = try {
+        val su = Runtime.getRuntime().exec(arrayOf("su", "-c",
+            "appops set $packageName ACTIVATE_VPN allow"))
+        var exit: Int? = null
+        var waited = 0
+        while (exit == null && waited < 4_000) {
+            Thread.sleep(100)
+            waited += 100
+            try {
+                exit = su.exitValue()
+            } catch (_: IllegalThreadStateException) {
+            }
+        }
+        if (exit == null) {
+            su.destroy()
+            LiteLog.log("ui", "USB 通道：root 免对话框授权超时（4s）")
+            false
+        } else {
+            true
+        }
+    } catch (error: Exception) {
+        LiteLog.log("ui", "USB 通道：root 免对话框授权失败：${error.message}")
+        false
+    }
 
     /** VpnService 授权 / CarIconPage 图库选择的系统回调。 */
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {

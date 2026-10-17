@@ -30,6 +30,12 @@ internal object BydHudBridge {
     private val callbacks = Executors.newSingleThreadExecutor { task ->
         Thread(task, "diplay-hud-callback").apply { isDaemon = true }
     }
+    // 1.1.6(vc76)：bindService=false 风暴退避——8815 通宵实测无 SOME/IP 网关的机型
+    // 每 250ms 刷一条 bindService=false（日志洪水 + 空耗电）。指数退避 1s→30s 封顶，
+    // 绑定成功即复位；另外非 BYD 输出（enabled()=false）根本不发起绑定。
+    private val BIND_BACKOFF_MILLIS = longArrayOf(1_000L, 2_000L, 5_000L, 10_000L, 30_000L)
+    private var bindFails = 0
+    private var nextBindAllowedNs = 0L
     private val lock = Any()
     private val route = BydHudRouteState()
     private var context: Context? = null
@@ -72,7 +78,7 @@ internal object BydHudBridge {
 
     fun initialize(appContext: Context) = synchronized(lock) {
         if (context == null) context = appContext.applicationContext
-        bindLocked()
+        if (enabled()) bindLocked()
         if (!senderStarted) {
             senderStarted = true
             Executors.newSingleThreadScheduledExecutor { runnable ->
@@ -104,7 +110,7 @@ internal object BydHudBridge {
     }
 
     private fun tick() = synchronized(lock) {
-        if (binder == null && !binding) bindLocked()
+        if (binder == null && !binding && enabled()) bindLocked()
         sendCurrentLocked()
     }
 
@@ -162,6 +168,8 @@ internal object BydHudBridge {
     private fun bindLocked() {
         val appContext = context ?: return
         if (binder != null || binding) return
+        val now = System.nanoTime()
+        if (now < nextBindAllowedNs) return
         try {
             // The gateway's onUnbind requires a MIME type; a typeless bind crashes the whole SOME/IP process.
             val intent = Intent(SOMEIP_ACTION).apply {
@@ -169,9 +177,20 @@ internal object BydHudBridge {
                 type = appContext.packageName
             }
             binding = appContext.bindService(intent, connection, Context.BIND_AUTO_CREATE)
-            Log.i(TAG, "bindService=$binding")
+            if (binding) {
+                bindFails = 0
+                nextBindAllowedNs = 0L
+            } else {
+                bindFails++
+                nextBindAllowedNs =
+                    now + BIND_BACKOFF_MILLIS[bindFails.coerceAtMost(BIND_BACKOFF_MILLIS.size - 1)] * 1_000_000L
+            }
+            Log.i(TAG, "bindService=$binding fails=$bindFails")
         } catch (error: Throwable) {
             binding = false
+            bindFails++
+            nextBindAllowedNs =
+                now + BIND_BACKOFF_MILLIS[bindFails.coerceAtMost(BIND_BACKOFF_MILLIS.size - 1)] * 1_000_000L
             Log.w(TAG, "cannot bind SOME/IP service", error)
         }
     }

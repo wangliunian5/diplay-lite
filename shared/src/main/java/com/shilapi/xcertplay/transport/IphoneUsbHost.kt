@@ -188,10 +188,11 @@ class IphoneUsbHost(
         device: UsbDevice,
         executor: Executor,
         callback: (Iap2SessionResult) -> Unit,
+        assumeAlreadyConfigured: Boolean = false,
     ) {
         executor.execute {
             val result = try {
-                Iap2SessionResult.Connected(openIap2UsbSession(device))
+                Iap2SessionResult.Connected(openIap2UsbSession(device, assumeAlreadyConfigured))
             } catch (error: IphoneUsbException) {
                 Iap2SessionResult.Failed(error)
             } catch (error: SecurityException) {
@@ -243,7 +244,10 @@ class IphoneUsbHost(
         TransitionResult.Failed(IphoneUsbException.DeviceUnavailable("iPhone USB operation failed", error))
     }
 
-    private fun openIap2UsbSession(device: UsbDevice): Iap2UsbSession {
+    private fun openIap2UsbSession(
+        device: UsbDevice,
+        assumeAlreadyConfigured: Boolean = false,
+    ): Iap2UsbSession {
         requireConfiguredDevice(device)
         if (!usbManager.hasPermission(device)) {
             throw IphoneUsbException.PermissionDenied("USB permission has not been granted")
@@ -259,7 +263,7 @@ class IphoneUsbHost(
                 Thread.sleep(CONFIG_SETTLE_DELAY_MILLIS)
             }
             try {
-                return openIap2UsbSessionOnce(device, attempt)
+                return openIap2UsbSessionOnce(device, attempt, assumeAlreadyConfigured)
             } catch (error: IphoneUsbException) {
                 // 配置缺失类错误重试也没用（iPhone 没切模式），直接抛可行动文案。
                 if (error.message?.contains("no CarPlay USB configuration") == true) throw error
@@ -269,7 +273,11 @@ class IphoneUsbHost(
         throw lastError ?: IphoneUsbException.DeviceUnavailable("could not open iPhone USB data paths")
     }
 
-    private fun openIap2UsbSessionOnce(device: UsbDevice, attempt: Int): Iap2UsbSession =
+    private fun openIap2UsbSessionOnce(
+        device: UsbDevice,
+        attempt: Int,
+        assumeAlreadyConfigured: Boolean = false,
+    ): Iap2UsbSession =
         runOwnedConnection(device) { connection ->
             // API16 适配：UsbConfiguration/UsbDevice.getConfiguration/setConfiguration 都是
             // API 21+；< 21 只能扫默认配置的 device.getInterface()，找不到就明确报错。
@@ -283,14 +291,25 @@ class IphoneUsbHost(
                         "Re-enumerated iPhone exposes no CarPlay USB configuration",
                     )
                 }
-                report("attempt#$attempt target CarPlay configuration id=${configuration.id}")
-                val switched = connection.setConfiguration(configuration)
-                report("attempt#$attempt setConfiguration(${configuration.id}) success=$switched")
-                if (!switched) {
-                    // 1.0.21（3e 实测 195341 日志）：设备已在目标配置时 EMUI setConfiguration 返回
-                    // false（0x4301 重启代际场景：iPhone 已处于 CarPlay 配置，无重枚举）。
-                    // 不再立即失败——继续走接口发现/claim，接口真不在再由 claim 路径报错。
-                    report("attempt#$attempt switch returned false; assuming already in CarPlay configuration and continuing")
+                if (attempt == 0 && assumeAlreadyConfigured) {
+                    // FE-6（ECARX API22）楔死自愈实测：同一次插线内 iPhone 从未离开 CarPlay
+                    // 配置，此时再 setConfiguration 会触发一次多余的 re-enumerate，把刚拿到的
+                    // USB 权限作废（grant 绑定 UsbDevice 实例）→ "permission was denied" 误报
+                    // 终态。自愈重试的首跳直接跳过选配，claim 失败再由下一跳走完整路径兜底。
+                    report(
+                        "attempt#$attempt skipping setConfiguration: iPhone already in " +
+                            "CarPlay configuration (self-heal retry, config id=${configuration.id})",
+                    )
+                } else {
+                    report("attempt#$attempt target CarPlay configuration id=${configuration.id}")
+                    val switched = connection.setConfiguration(configuration)
+                    report("attempt#$attempt setConfiguration(${configuration.id}) success=$switched")
+                    if (!switched) {
+                        // 1.0.21（3e 实测 195341 日志）：设备已在目标配置时 EMUI setConfiguration 返回
+                        // false（0x4301 重启代际场景：iPhone 已处于 CarPlay 配置，无重枚举）。
+                        // 不再立即失败——继续走接口发现/claim，接口真不在再由 claim 路径报错。
+                        report("attempt#$attempt switch returned false; assuming already in CarPlay configuration and continuing")
+                    }
                 }
                 IphoneCarPlayConfiguration.usbMuxInterface(configuration)
                     ?: throw IphoneUsbException.Protocol("CarPlay configuration exposes no USBMUX interface")

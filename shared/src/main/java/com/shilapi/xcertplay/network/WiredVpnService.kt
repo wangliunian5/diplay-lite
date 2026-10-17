@@ -49,6 +49,9 @@ class WiredVpnService : VpnService() {
             null
         }
         synchronized(lock) {
+            // vc94：快速重连二次 startService 而 request() 未再调用时（或并发竞态），旧 fd 会被
+            // 直接覆盖泄漏——establish 前先关存量 fd（request() 路径此时已置 null，no-op）。
+            established?.let { runCatching { it.close() } }
             established = tun
             latch.countDown()
         }

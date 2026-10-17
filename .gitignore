@@ -24,3 +24,6 @@ M6k*.md
 
 # MFi 认证身份资产（不随源码公开，构建时自备）
 app/src/main/assets/offline-mfi/
+
+# 车标素材（141 品牌图标，权利归各自权利人，不随源码公开，构建时自备）
+app/src/main/assets/car-logos/

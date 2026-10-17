@@ -28,6 +28,9 @@ class Ipv6NcmBridge(
     // 1.0.26 的原生日志（xcertplay-usb TAG）在采集文件里 0 条，clear-halt 是否
     // 触发过完全无法取证。
     private val onDiagnostic: (String) -> Unit = {},
+    // vc96（FE-6 断链分析）：wedge fatal 判定阈值可调——no_audio 会话无音频恒流垫底，
+    // 画面静止时入向断流属正常形态，构造方按变体放宽；默认维持 6s。
+    private val stallFatalMillis: Long = STALL_FATAL_MILLIS,
 ) : Closeable {
     init {
         require(hostMac.size == EthernetIpv6Codec.MAC_BYTES) { "hostMac must be 6 bytes" }
@@ -38,14 +41,21 @@ class Ipv6NcmBridge(
     private var loggedInbound = false
     private var loggedOutbound = false
     private var loggedWaitingForPeer = false
-    private var inboundLogBudget = 16
+    // vc67 诊断（TS7 0x4301 后 iPhone 零数据面）：入站日志预算放开到 4000，
+    // 全量记录 iPhone 在 NCM 链路上的每个 IPv6 帧；非 IPv6 帧不再静默丢弃，记录帧头。
+    private var inboundLogBudget = 4000
+    private var nonIpv6DropCount = 0
     private var outboundLogBudget = 24
     private val running = AtomicBoolean(false)
     private lateinit var ncmToTunThread: Thread
     private lateinit var tunToNcmThread: Thread
+    // vc94：close 时写哑包唤醒阻塞在 TUN read 的出站线程（部分内核/ROM 上 tun fd close
+    // 不唤醒阻塞中的 read，僵尸线程随重连累积）。
+    private var tunOutput: FileOutputStream? = null
 
     fun start() {
         check(running.compareAndSet(false, true)) { "bridge is already started" }
+        tunOutput = FileOutputStream(tun.fileDescriptor)
         ncmToTunThread = Thread(::runNcmToTun, "ncm-ipv6-in").apply {
             isDaemon = true
             start()
@@ -58,8 +68,13 @@ class Ipv6NcmBridge(
 
     override fun close() {
         if (!running.compareAndSet(true, false)) return
-        ncm.close()
-        tun.close()
+        // vc94：先写哑包再关 fd——TUN 只有 fe80::/64 路由，目的地址 ff02::1（链路本地组播）
+        // 的包会被内核从 TUN 路由出去，read 侧必然醒来；reader 在 read 返回后检查 running
+        // 已 false 即退出，哑包不会被转发到 NCM。随后关 fd 并 join，防僵尸线程累积。
+        runCatching { tunOutput?.write(DUMMY_TUN_PACKET) }
+        runCatching { ncm.close() }
+        runCatching { tunOutput?.close() }
+        runCatching { tun.close() }
         join(ncmToTunThread)
         join(tunToNcmThread)
     }
@@ -90,7 +105,7 @@ class Ipv6NcmBridge(
                             onDiagnostic("ncm inbound stalled ${idleMs}ms mid-stream; attempting clear halt")
                             ncm.clearHaltInEndpoints()
                         }
-                        if (idleMs > STALL_FATAL_MILLIS) {
+                        if (idleMs > stallFatalMillis) {
                             onDiagnostic(
                                 "ncm inbound stalled ${idleMs}ms mid-stream; closing bridge for full reconnect",
                             )
@@ -112,7 +127,17 @@ class Ipv6NcmBridge(
                     streamingSeen = true
                     onDiagnostic("ncm streaming detected; inbound stall watchdog armed")
                 }
-                val ipv6 = EthernetIpv6Codec.parseIpv6View(frame) ?: continue
+                val ipv6 = EthernetIpv6Codec.parseIpv6View(frame)
+                if (ipv6 == null) {
+                    // vc67：非 IPv6 帧（ARP/VLAN 0x8100 等）此前静默丢弃——TS7 上 iPhone
+                    // 数据面零流量，先取证这些帧是否真实存在以及帧型是什么。
+                    nonIpv6DropCount++
+                    if (nonIpv6DropCount <= 64) {
+                        val head = frame.take(20).joinToString("") { "%02x".format(it) }
+                        Log.i(TAG, "ncm non-ipv6 frame #%d size=%d head=%s".format(nonIpv6DropCount, frame.size, head))
+                    }
+                    continue
+                }
                 peerMac = ipv6.sourceMac
                 if (!loggedInbound) {
                     loggedInbound = true
@@ -152,6 +177,9 @@ class Ipv6NcmBridge(
                     continue
                 }
                 val tunPacket = buffer.copyOf(length)
+                // vc94：close() 写哑包唤醒本线程——read 返回后 running 已 false，直接退出，
+                // 哑包不进入编解码与 NCM 发送路径。
+                if (!running.get()) return
                 val ipv6 = EthernetIpv6Codec.addNeighborAdvertisementTargetMac(tunPacket, hostMac)
                 if (ipv6.size != tunPacket.size) {
                     Log.i(TAG, "ncm added target-link-layer option to neighbor advertisement")
@@ -224,6 +252,21 @@ class Ipv6NcmBridge(
         const val TUN_READ_BYTES = 4_096
         const val ZERO_READ_BACKOFF_NANOS = 1_000_000L
         const val JOIN_TIMEOUT_MILLIS = 2_000L
+
+        // vc94：close 唤醒哑包——最小 IPv6 头（40B），next header=59(No Next Header)、
+        // hop limit=1、src=fe80::2、dst=ff02::1。TUN 仅 fe80::/64 路由，链路本地组播包
+        // 内核必然从 TUN 发出 → 阻塞在 read 的线程醒来（只用于唤醒，reader 不转发）。
+        val DUMMY_TUN_PACKET = ByteArray(40).apply {
+            this[0] = 0x60
+            this[6] = 0x3b
+            this[7] = 0x01
+            this[8] = 0xfe.toByte() // src fe80::2
+            this[9] = 0x80.toByte()
+            this[23] = 0x02
+            this[24] = 0xff.toByte() // dst ff02::1
+            this[25] = 0x02
+            this[39] = 0x01
+        }
 
         // 1.0.26 入向楔死看门狗：armed 后静默先试 clear halt，仍死关桥重建。
         // 阈值依据：会话内音频 50pkt/s 恒流 + RTSP 秒级轮询，零入向远超正常空闲。

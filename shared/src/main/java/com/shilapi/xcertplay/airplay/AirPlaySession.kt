@@ -13,8 +13,10 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 data class AirPlayDeviceInfo(
     val name: String,
@@ -33,6 +35,14 @@ interface AirPlaySessionListener {
     fun onHostUiRequested(session: AirPlaySession) {}
     fun onCommand(session: AirPlaySession, type: String, params: Map<String, Any?>) {}
     fun onDebugLog(message: String) {}
+
+    /**
+     * vc84：Siri 后无声恢复回调。speechrecognition 音频流被 TEARDOWN 后
+     * [AirPlaySession.SIRI_AUDIO_RESTORE_TIMEOUT_MS] 内无任何音频 SETUP 重来时触发
+     * （FE-6 fe6t2 实证：iPhone 进 Siri 拆媒体音频流、Siri 结束后不再重发 SETUP，
+     * 音乐静音到用户手动断开）。编排层据此收会话走既有重试链全量重建。
+     */
+    fun onSiriAudioStall(session: AirPlaySession) {}
 }
 
 /** Stream transport seam; media decode/render is supplied by a later layer. */
@@ -82,6 +92,19 @@ class AirPlaySession(
     private var pendingNightMode: Boolean? = null
     private val firstTouchSendLogged = AtomicBoolean(false)
     private val touchSendFailureLogged = AtomicBoolean(false)
+    // vc84：Siri 后无声恢复看门狗（FE-6 fe6t2 日志 diplay-20261015-110554 实证）。iPhone 进
+    // Siri 时拆媒体音频流（TEARDOWN type=100 ended=true）→ SETUP speechrecognition 上行 →
+    // Siri 结束后第二个 TEARDOWN，此后 iPhone 不再重发媒体音频 SETUP，音乐静音到用户手动
+    // 断开（会话其余全健康，enhancedSiri 会话特有，TS7/8815 无复现）。检测：本会话出现过
+    // speechrecognition 音频流、其音频流被 TEARDOWN 且会话内再无 media 音频流 → 装看门狗；期间
+    // 任一音频 SETUP 到来即撤销；到期仍无 media 音频 → onSiriAudioStall 回调编排层收会话重建。
+    @Volatile private var siriAudioSeen = false
+    private val siriWatchdogGeneration = AtomicInteger(0)
+    // vc86（fe6t4）：活跃音频流 type→audioType 映射。100 的类型码可为 media 或
+    // speechrecognition，无法从类型码区分；fe6t3 实测（diplay-20261015-185536）Siri
+    // TEARDOWN 时 101/default 残存导致「无任何音频流」判据永不满足、看门狗从未装弹，
+    // 判据改为「无 media 音频流」。
+    private val activeAudioKinds = ConcurrentHashMap<Int, String>()
     private val ntp = NtpClock { message -> debugLog("airplay ntp $message") }
     private var keepAliveSocket: DatagramSocket? = null
     private var keepAliveThread: Thread? = null
@@ -527,6 +550,12 @@ class AirPlaySession(
                     }
                 }
                 STREAM_TYPE_MAIN_AUDIO, STREAM_TYPE_ALT_AUDIO, STREAM_TYPE_MAIN_HIGH_AUDIO -> {
+                    val audioKind = stream["audioType"]?.toString()?.lowercase().orEmpty()
+                    if (audioKind == "speechrecognition") {
+                        siriAudioSeen = true
+                    }
+                    // 任一音频 SETUP 到来即视为音频已恢复，撤销 Siri 后无声看门狗。
+                    siriWatchdogGeneration.incrementAndGet()
                     val streamResponse = media.onAudio(this, type, stream)
                     debugLog(
                         "airplay audio stream type=$type accepted=${streamResponse != null} " +
@@ -535,6 +564,7 @@ class AirPlaySession(
                     )
                     if (streamResponse != null) {
                         activeStreams.add(type)
+                        activeAudioKinds[type] = audioKind
                         result.add(streamResponse)
                     }
                 }
@@ -593,10 +623,54 @@ class AirPlaySession(
         if (types.isEmpty()) {
             activeStreams.toList().forEach { media.onTeardown(this, it) }
             activeStreams.clear()
+            activeAudioKinds.clear()
         } else {
-            types.forEach { type -> if (activeStreams.remove(type)) media.onTeardown(this, type) }
+            val removed = types.filter { activeStreams.remove(it) }
+            removed.forEach { type -> media.onTeardown(this, type) }
+            removed.forEach { type -> activeAudioKinds.remove(type) }
+            maybeArmSiriRestoreWatchdog(removed)
         }
         return RtspMessage.Response(status = 200)
+    }
+
+    /**
+     * vc84：Siri 后无声看门狗装弹。本会话出现过 speechrecognition 音频流（Siri 已用过）
+     * 且本次 TEARDOWN 移除的正是音频流、会话内已无 media 音频流时，启动
+     * [SIRI_AUDIO_RESTORE_TIMEOUT_MS] 定时检查；期间任一音频 SETUP（generation 递增）或
+     * 会话关闭即失效；到期仍无 media 音频 → onSiriAudioStall（见字段注释）。
+     */
+    private fun maybeArmSiriRestoreWatchdog(removedTypes: List<Int>) {
+        if (!siriAudioSeen) return
+        if (removedTypes.none { it in AUDIO_STREAM_TYPES }) return
+        // vc86：101/default 等控制音频流常残存且反复 flap，不能作为「音频还在」判据；
+        // 只有 media 音频仍活跃才意味着音乐在放。
+        if (activeAudioKinds.containsValue("media")) return
+        val generation = siriWatchdogGeneration.incrementAndGet()
+        debugLog(
+            "airplay Siri audio torn down; media-restore watchdog armed " +
+                "${SIRI_AUDIO_RESTORE_TIMEOUT_MS}ms",
+        )
+        Thread(
+            {
+                try {
+                    Thread.sleep(SIRI_AUDIO_RESTORE_TIMEOUT_MS)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                if (closed.get() || generation != siriWatchdogGeneration.get()) return@Thread
+                if (activeAudioKinds.containsValue("media")) return@Thread
+                debugLog(
+                    "airplay Siri audio stall: no audio SETUP after " +
+                        "${SIRI_AUDIO_RESTORE_TIMEOUT_MS}ms; requesting session recovery",
+                )
+                try {
+                    listener.onSiriAudioStall(this)
+                } catch (error: Exception) {
+                    Log.w(TAG, "siri audio stall callback failed", error)
+                }
+            },
+            "airplay-siri-restore",
+        ).apply { isDaemon = true; start() }
     }
 
     private fun openTiming(peerPort: Int): Int {
@@ -695,6 +769,10 @@ class AirPlaySession(
             val socket = server.accept()
             socket.setSoLinger(true, 0)
             debugLog("airplay event connection accepted from ${socket.remoteSocketAddress}")
+            // vc77：触摸/控制通道 TCP_NODELAY（对齐上游 0.2.13 触摸修复；小包即时下发，
+            // Nagle 聚包会叠加触摸2frame延迟；AirPlayTcpServer accept 侧已设，此处补齐 event 侧）
+            socket.tcpNoDelay = true
+            socket.keepAlive = true
             eventSocket = socket
             val shared = pairVerify.shared
             if (shared == null) {
@@ -729,6 +807,10 @@ class AirPlaySession(
     }
 
     private fun runEventRead(socket: Socket) {
+        // vc87（fe6t5）掉线取证：fe6t3 日志实锤 FE-6 会话死亡首发点是 event 连接
+        // 被对端关闭（18:51:15.674，恰为 Siri 结束后整 60s，随后才连锁 wedge 误判）。
+        // 记录最后入站时刻，区分「对端 EOF/空闲多久」vs「本地异常」。
+        var lastInboundAt = System.currentTimeMillis()
         try {
             val input = BufferedInputStream(socket.getInputStream())
             val output = BufferedOutputStream(socket.getOutputStream())
@@ -737,7 +819,14 @@ class AirPlaySession(
             val buffer = ByteArray(READ_CHUNK_BYTES)
             while (!closed.get()) {
                 val count = input.read(buffer)
-                if (count < 0) break
+                if (count < 0) {
+                    debugLog(
+                        "airplay event connection closed reason=peer-eof " +
+                            "idleMs=${System.currentTimeMillis() - lastInboundAt}",
+                    )
+                    break
+                }
+                lastInboundAt = System.currentTimeMillis()
                 val cipher = eventCipher ?: break
                 encrypted += buffer.copyOf(count)
                 val decrypted = try {
@@ -770,7 +859,7 @@ class AirPlaySession(
         } catch (error: Exception) {
             if (!closed.get()) Log.e(TAG, "airplay event read failed", error)
         } finally {
-            debugLog("airplay event connection closed")
+            debugLog("airplay event connection closed idleMs=${System.currentTimeMillis() - lastInboundAt}")
             if (eventSocket === socket) eventSocket = null
             eventCipher = null
             safeClose(socket)
@@ -796,6 +885,13 @@ class AirPlaySession(
         const val STREAM_TYPE_ALT_AUDIO = 101
         const val STREAM_TYPE_MAIN_HIGH_AUDIO = 102
         const val STREAM_TYPE_DATA = 130
+
+        private val AUDIO_STREAM_TYPES =
+            setOf(STREAM_TYPE_MAIN_AUDIO, STREAM_TYPE_ALT_AUDIO, STREAM_TYPE_MAIN_HIGH_AUDIO)
+
+        // vc84：Siri 结束后等 iPhone 重发媒体音频 SETUP 的窗口。fe6t2 实测 Siri 结束后
+        // iPhone 侧若健康会在秒级重来；10s 足够覆盖慢协商，又不至于让静音悬置太久。
+        const val SIRI_AUDIO_RESTORE_TIMEOUT_MS = 10_000L
 
         const val READ_CHUNK_BYTES = 16 * 1024
         const val EVENT_READY_POLL_MILLIS = 25L

@@ -31,6 +31,10 @@ import kotlin.math.roundToInt
 internal class MicrophoneUplink(
     private val config: MicrophoneConfig,
     private val diagnostics: ((String) -> Unit)? = null,
+    // 1.1.5/e5t1(vc85)：麦克风静音位检查/自动恢复，由持 Context 的上层注入（见
+    // LiteSessionService）。EU5 QG DSP 仲裁链可能在 Android 层留下 mute 位——App 层
+    // 能做的修复就是检测到即解除。空实现跳过，对其他平台零行为变化。
+    private val muteRestore: (() -> String)? = null,
 ) : Closeable {
     private val running = AtomicBoolean(false)
     private val firstPacketLogged = AtomicBoolean(false)
@@ -52,6 +56,13 @@ internal class MicrophoneUplink(
     private var nativeChannels = 0
     private var resamplePos = 0.0
     private var resampleTail = ShortArray(0)
+    // 1.1.5/e5t1(vc85)：EU5 数字静默自愈（核心修复）。判据=windowPeak==0（真全零，
+    // DSP/静音路径特征；近静音 <300 是环境噪音，绝不能触发，否则正常通话轮流拆重建）。
+    // 连续 5s 全零 → 换下一个未试过的音频源重建录音（源序沿 6→1→7 逐个排除）；
+    // 全部源轮完仍全零 → 停止轮换，落 QG DSP 层嫌疑取证（EU5 实锤 Android 全栈无错
+    // 可报的静音只能出在该层，App 层无罪）。
+    private val triedSources = LinkedHashSet<Int>()
+    @Volatile private var healExhausted = false
 
     /** Reports a start failure into the diagnostic log so field reports show why calls went silent. */
     private fun fail(message: String): Boolean {
@@ -103,6 +114,15 @@ internal class MicrophoneUplink(
         // 1.1.1（EU5 实测）：24k+源6/1 也全灭而 HAL 声明支持 —— 升级为
         // **源×采样率×声道兜底矩阵**，每次尝试都落盘诊断；胜出参数≠协商参数时由
         // capture() 做线性重采样/声道变换，编码器与 RTP 打包不变。
+        // 1.1.5/e5t1(vc85)：静音位检查/自动恢复放在录音源打开之前——mute 位可能正是
+        // 源打不开/开了全零的原因，先解除再开源，避免「解除前开的源被 DSP 静音」窗口。
+        muteRestore?.let { restore ->
+            try {
+                diagnostics?.invoke("Microphone mute-bit check: ${restore()}")
+            } catch (error: Throwable) {
+                diagnostics?.invoke("Microphone mute-bit check failed: ${error.javaClass.simpleName}")
+            }
+        }
         val opened = openRecorder()
         val nextRecorder = opened?.recorder
         if (nextRecorder == null) {
@@ -113,6 +133,9 @@ internal class MicrophoneUplink(
         nativeChannels = opened.channels
         resamplePos = 0.0
         resampleTail = ShortArray(0)
+        // e5t1：记录初始胜出源，静默自愈轮换时排除已试过的源。
+        synchronized(triedSources) { triedSources.add(opened.source) }
+        healExhausted = false
         val chosenSource = opened.source
 
         val nextSocket = try {
@@ -162,13 +185,17 @@ internal class MicrophoneUplink(
     }
 
     // API16 适配：按优先级给出可尝试的录音源。4.1 上 VOICE_COMMUNICATION 常常初始化不了
-    // （要求 MODE_IN_COMMUNICATION），所以让 7 → 6 → 1 逐级退；语音识别走 6 → 1。
+    // （要求 MODE_IN_COMMUNICATION），所以逐级退；语音识别走 6 → 1。
     // 代价：退到 MIC 时没有平台回声消除，远端可能听到回声（后续可跟 #33 的 AEC/NS）。
+    // 1.1.4（EU5 123838 实锤）：telephony 源序 7→6→1 改 6→1→7 —— 同一台车 Siri（源 6）
+    // 能开而电话全灭，只有「源 7 先行」一个差异变量；源 7 初始化失败会短暂占住/弄脏
+    // PATEO HAL 的输入句柄，300ms 内殃及矩阵里后续的源 6/1 全败。7 移末位，即使失败
+    // 也不殃及前面的尝试；正常车机源 6 本就能开，第一候选即命中、零行为变化。
     private fun sourcesFor(audioType: String): List<Int> = when (audioType) {
         "telephony" -> listOf(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
             MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
         )
         "speechrecognition" -> listOf(
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
@@ -195,7 +222,8 @@ internal class MicrophoneUplink(
      * capture() 内做线性重采样与声道变换，编码器/RTP 打包完全不受影响，
      * 对「协商参数本来就能开」的正常车机第一个候选即命中、零行为变化。
      */
-    private fun openRecorder(): OpenedRecorder? {
+    private fun openRecorder(excludeSources: Set<Int> = emptySet()): OpenedRecorder? {
+        val sources = sourcesFor(config.audioType).filter { it !in excludeSources }
         val requestedMask = if (config.channels >= 2) {
             AndroidAudioFormat.CHANNEL_IN_STEREO
         } else {
@@ -204,19 +232,33 @@ internal class MicrophoneUplink(
         val rates = intArrayOf(config.sampleRate, 48_000, 16_000, 8_000).distinct().toIntArray()
         val masks = intArrayOf(requestedMask, AndroidAudioFormat.CHANNEL_IN_MONO, AndroidAudioFormat.CHANNEL_IN_STEREO).distinct().toIntArray()
         val attempts = StringBuilder()
-        val winner = tryOpen(rates, masks, attempts)
-        if (winner != null && attempts.isNotEmpty()) {
+        val winner = tryOpen(sources, rates, masks, attempts)
+        if (winner != null) {
+            if (attempts.isNotEmpty()) {
+                diagnostics?.invoke(
+                    "microphone fallback matrix winner source=${winner.source} rate=${winner.rate} " +
+                        "channels=${winner.channels} (negotiated rate=${config.sampleRate} " +
+                        "channels=${config.channels}) attempts:$attempts",
+                )
+            }
+        } else {
+            // 1.1.4 补盲：全败时也落盘逐候选明细（此前只在胜出时打 attempts，
+            // EU5 123838 报告里因此查不到每个源失败的具体原因，A/B 定性失据）。
             diagnostics?.invoke(
-                "microphone fallback matrix winner source=${winner.source} rate=${winner.rate} " +
-                    "channels=${winner.channels} (negotiated rate=${config.sampleRate} " +
+                "microphone fallback matrix exhausted (negotiated rate=${config.sampleRate} " +
                     "channels=${config.channels}) attempts:$attempts",
             )
         }
         return winner
     }
 
-    private fun tryOpen(rates: IntArray, masks: IntArray, attempts: StringBuilder): OpenedRecorder? {
-        for (source in sourcesFor(config.audioType)) {
+    private fun tryOpen(
+        sources: List<Int>,
+        rates: IntArray,
+        masks: IntArray,
+        attempts: StringBuilder,
+    ): OpenedRecorder? {
+        for (source in sources) {
             for (rate in rates) {
                 for (mask in masks) {
                     val minBuffer = AudioRecord.getMinBufferSize(rate, mask, AndroidAudioFormat.ENCODING_PCM_16BIT)
@@ -319,7 +361,8 @@ internal class MicrophoneUplink(
         }
     }
 
-    private fun capture(recorder: AudioRecord, socket: DatagramSocket) {
+    private fun capture(initialRecorder: AudioRecord, socket: DatagramSocket) {
+        var currentRecorder = initialRecorder
         val frame = ByteArray(config.frameBytes)
         // 1.1.1：胜出参数≠协商参数时，读入缓冲按 native 速率/声道放大，读多读少都能处理。
         val conversionFactor = maxOf(
@@ -338,25 +381,43 @@ internal class MicrophoneUplink(
         var windowFrames = 0
         var lastLevelLog = 0L
         // 1.1.1：胜出参数恰好等于协商参数时走零转换快路径（对正常车机零行为变化）。
-        val passthrough = nativeRate == config.sampleRate && nativeChannels == config.channels
+        // e5t1：改为动态判定——静默自愈轮换可能改变 native 参数，不能用启动时的快照。
+        // e5t1：连续全零秒计数（数字静默自愈触发器，见字段注释）。
+        var zeroPeakSeconds = 0
+        // vc87（fe6t5）：read 零字节连击计数（HAL 出数失败检测，见常量注释）。
+        var zeroReadStreak = 0
         try {
             while (running.get()) {
                 // API16 适配：带 mode 的 AudioRecord.read 是 API 23+；低版本用阻塞语义的 int 重载。
                 val count = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    recorder.read(readBuffer, 0, readBuffer.size, AudioRecord.READ_BLOCKING)
+                    currentRecorder.read(readBuffer, 0, readBuffer.size, AudioRecord.READ_BLOCKING)
                 } else {
-                    recorder.read(readBuffer, 0, readBuffer.size)
+                    currentRecorder.read(readBuffer, 0, readBuffer.size)
                 }
                 if (count < 0) {
                     if (running.get()) Log.e(TAG, "microphone read failed code=$count")
                     return
                 }
                 if (count == 0) {
+                    // vc87（fe6t5）：read 恒返 0 = HAL 出数失败（非 error 非 EOF），循环空转
+                    // 连整帧都凑不满。连续超阈值落证并走换源自愈（同 peak==0 路径）。
+                    if (!healExhausted && ++zeroReadStreak >= ZERO_READ_HEAL_THRESHOLD) {
+                        zeroReadStreak = 0
+                        diagnostics?.invoke(
+                            "Microphone zero-read streak: AudioRecord.read returns 0 x" +
+                                "$ZERO_READ_HEAL_THRESHOLD; rotating source",
+                        )
+                        val rotated = rotateSilentRecorder(currentRecorder)
+                        if (rotated != null) {
+                            currentRecorder = rotated
+                        }
+                    }
                     continue
                 }
+                zeroReadStreak = 0
                 val data: ByteArray
                 val size: Int
-                if (passthrough) {
+                if (nativeRate == config.sampleRate && nativeChannels == config.channels) {
                     data = readBuffer
                     size = count
                 } else {
@@ -382,6 +443,22 @@ internal class MicrophoneUplink(
                             diagnostics?.invoke(
                                 "Microphone level window frames=$windowFrames peak=$windowPeak",
                             )
+                            // e5t1：数字静默自愈——peak==0（真全零）连续 SILENT_HEAL_SECONDS 秒
+                            // 才触发；<300 的近静音是环境噪音，绝不触发（避免正常静场轮流拆建）。
+                            zeroPeakSeconds = if (windowFrames > 0 && windowPeak == 0) {
+                                zeroPeakSeconds + 1
+                            } else {
+                                0
+                            }
+                            if (zeroPeakSeconds >= SILENT_HEAL_SECONDS && !healExhausted) {
+                                zeroPeakSeconds = 0
+                                val rotated = rotateSilentRecorder(currentRecorder)
+                                if (rotated != null) {
+                                    currentRecorder = rotated
+                                }
+                                // rotated==null 时 rotateSilentRecorder 内部已置 healExhausted
+                                // 并落 QG DSP 嫌疑取证，此后静默只观察不再轮换。
+                            }
                             windowPeak = 0
                             windowFrames = 0
                         }
@@ -400,6 +477,74 @@ internal class MicrophoneUplink(
             running.set(false)
             release()
         }
+    }
+
+    /**
+     * e5t1：数字静默源轮换。当前源连续全零 5s（采集路径在 AudioFlinger 之下被静音）时，
+     * 换下一个未试过的音频源重建 AudioRecord 并热切换（采集线程内完成，RTP 发送不断流）。
+     * 无未试源可换时置 healExhausted 并落 QG DSP 嫌疑取证——EU5 实锤该层静音在 Android
+     * 全栈无错可报，App 层只能探测到并留证。
+     */
+    @Synchronized
+    private fun rotateSilentRecorder(old: AudioRecord): AudioRecord? {
+        if (!running.get()) return null
+        val exclude = synchronized(triedSources) { triedSources.toSet() }
+        val opened = openRecorder(excludeSources = exclude)
+        if (opened == null) {
+            healExhausted = true
+            diagnostics?.invoke(
+                "Microphone silent-source heal exhausted (all sources peak==0): capture path " +
+                    "digitally muted below AudioFlinger — suspect QG DSP arbitration " +
+                    "(com.qinggan.audiopolicy setMicMute). qg probe: ${probeQgDsp()}",
+            )
+            return null
+        }
+        synchronized(triedSources) { triedSources.add(opened.source) }
+        val previousEffects = "aec:${if (echoCanceler != null) "on" else "off"} " +
+            "ns:${if (noiseSuppressor != null) "on" else "off"}"
+        try {
+            old.stop()
+        } catch (_: Exception) {
+        }
+        try {
+            old.release()
+        } catch (_: Exception) {
+        }
+        recorder = opened.recorder
+        nativeRate = opened.rate
+        nativeChannels = opened.channels
+        resamplePos = 0.0
+        resampleTail = ShortArray(0)
+        val effects = attachAudioEffects(opened.recorder)
+        try {
+            opened.recorder.startRecording()
+        } catch (error: Exception) {
+            Log.e(TAG, "microphone heal restart failed", error)
+            diagnostics?.invoke(
+                "Microphone silent-source heal: rotated source=${opened.source} failed to start: " +
+                    "${error.message} (previous effects $previousEffects)",
+            )
+            return null
+        }
+        diagnostics?.invoke(
+            "Microphone silent-source heal: rotated to source=${opened.source} " +
+                "rate=${opened.rate} channels=${opened.channels} $effects",
+        )
+        return opened.recorder
+    }
+
+    /** e5t1：QG 情感科技 DSP 仲裁层存在性探测（无需 root，pm 查询包名即可）。 */
+    private fun probeQgDsp(): String = try {
+        val process = Runtime.getRuntime().exec(arrayOf("pm", "list", "packages", "qinggan"))
+        val output = process.inputStream.bufferedReader().use { reader -> reader.readText().trim() }
+        process.destroy()
+        if (output.isEmpty()) {
+            "com.qinggan.* absent"
+        } else {
+            output.lineSequence().take(5).joinToString(separator = ",", prefix = "found=[", postfix = "]")
+        }
+    } catch (error: Throwable) {
+        "probe failed: ${error.javaClass.simpleName}: ${error.message}"
     }
 
     /**
@@ -609,6 +754,13 @@ internal class MicrophoneUplink(
         const val TAG = "xcertplay-usb"
         const val MIN_READ_BYTES = 2_048
         const val CLOSE_JOIN_MILLIS = 500L
+        // e5t1：连续全零 5s 触发换源。秒级日志窗口本身就是约 1s 粒度，5s 兼顾响应速度
+        // 与误触发余量；换源成本=一次 AudioRecord 重建（~百 ms），误触发代价可接受。
+        const val SILENT_HEAL_SECONDS = 5
+        // vc87（fe6t5）：连续零读阈值——AudioRecord.read 恒返 0 的 HAL 出数失败形态
+        // （fe6t3 日志 uplink started 后无任何 level window/tx 心跳即此形态），凑不满
+        // 整帧连 e5t1 的 peak==0 静默自愈都触发不了。约 1s 内 50 次零读即按采集失效轮换源。
+        const val ZERO_READ_HEAL_THRESHOLD = 50
         val EMPTY_BYTES = ByteArray(0)
     }
 }

@@ -32,6 +32,14 @@ class Iap2WirelessControlClient(
         phoneOnAirPlay: () -> Boolean = { false },
         // [RELAY-TEST] 1.0.28-中继test 实验参数：(假SSID, 随机密码)。null = 实验关闭。
         relayTestFakeCredential: Pair<String, String>? = null,
+        // vc83 中继踢出（攻「iPhone 提前连到中继 WiFi 后 CarPlay 永远连不上」）：
+        // iPhone 已在目标网络时 0x5703 不触发 join 事件（no-op），重发全废，看门狗判死 →
+        // 重试死循环。中继模式传 >0：真凭证重发达到该次数（2 次≈10s 处）仍 0 TCP 即进入
+        // 踢出阶段（假 0x5703 → 1.5s → 真凭证恢复并持续重发 12×5s）。
+        // vc80 的 8 次（40s）+10s 恢复实证太晚：踢出后凭证真空期 iPhone 无凭证可回，
+        // 用户在恢复前就放弃（082530 日志 tap7：+47s 踢出、+53s 用户断开，恢复永远没到）。
+        // 踢出越早、踢出后立即补真凭证，给 iPhone 留足重扫描入网窗口。-1/0 = 实验旧行为。
+        relayKickAfterResends: Int = -1,
     ): Iap2WirelessControlResult {
         require(identification.wireless != null) {
             "Wireless control requires an Iap2IdentificationConfig with wireless transport"
@@ -220,22 +228,31 @@ class Iap2WirelessControlClient(
                     // 就绝不再重发 0x5703/0x4301 —— 8815 实测（11:52 日志）：会话已建到 SETUP
                     // （cseq=6）后 100ms 又收到重发，iPhone 随即弃连。重发只服务于
                     // 「iPhone 还没收到凭证/还没入网」的场景。
+                    // vc83：中继踢出模式阈值提前到 2 次（~10s）；踢出恢复（phase 3）后
+                    // 恢复满额 12 次重发预算，让真凭证持续覆盖 iPhone 离网→重扫描的窗口，
+                    // 不再出现 8 次阈值掐断重发的真空期。
+                    val kickThreshold =
+                        when {
+                            relayTestPhase == 3 -> MAX_CREDENTIAL_RESENDS
+                            relayKickAfterResends > 0 -> relayKickAfterResends
+                            else -> MAX_CREDENTIAL_RESENDS
+                        }
                     if (
                         resendAt != null &&
-                        credentialResendsSent < MAX_CREDENTIAL_RESENDS &&
+                        credentialResendsSent < kickThreshold &&
                         System.nanoTime() >= resendAt &&
                         !phoneOnAirPlay()
                     ) {
                         send(accessoryWiFiConfiguration(endpoint), deadlineNanos)
-                        send(carPlayStartSession(endpoint), deadlineNanos)
                         wifiConfigurationsSent++
+                        send(carPlayStartSession(endpoint), deadlineNanos)
                         carPlayStartSessionsSent++
                         credentialResendsSent++
                         nextCredentialResendNanos =
-                            if (credentialResendsSent >= MAX_CREDENTIAL_RESENDS) {
+                            if (credentialResendsSent >= kickThreshold) {
                                 if (relayTestPhase == 0) {
-                                    // [RELAY-TEST] 阶段1 真凭证重发用尽且 iPhone 未上 AirPlay：
-                                    // 2s 后进入 phase1（假凭证诱导），保持 1s 轮询节奏
+                                    // 真凭证重发到达阈值且 iPhone 未上 AirPlay：
+                                    // 进入踢出阶段（假凭证诱导），保持 1s 轮询节奏
                                     relayTestPhase = 1
                                     System.nanoTime() + RELAY_TEST_PHASE2_DELAY_NANOS
                                 } else {
@@ -433,7 +450,9 @@ class Iap2WirelessControlClient(
         /** [RELAY-TEST] 1.0.28-中继test 实验总开关（CarPlayController 侧据此决定是否扫描选假 SSID）。正式包必须为 false。 */
         const val RELAY_TEST_ENABLED = false
         private const val RELAY_TEST_PHASE2_DELAY_NANOS = 2_000L * 1_000_000L
-        private const val RELAY_TEST_RESTORE_DELAY_NANOS = 10_000L * 1_000_000L
+        // vc83：10s→1.5s。踢出后立刻恢复真凭证——iPhone 离网后需要尽快拿到真凭证才能回连；
+        // 旧 10s 空窗实证用户在恢复前就放弃。恢复后的持续重发（12×5s）继续覆盖重扫描窗口。
+        private const val RELAY_TEST_RESTORE_DELAY_NANOS = 1_500L * 1_000_000L
         const val NO_TIMEOUT_MILLIS = Long.MAX_VALUE
         private const val DEFAULT_TIMEOUT_MILLIS = 60_000L
         private const val MAX_TIMEOUT_MILLIS = 24 * 60 * 60 * 1_000L

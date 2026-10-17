@@ -80,6 +80,32 @@ class AndroidMediaSink(
      * UI 层据此把 SurfaceView 等比适配，避免硬拉伸变形。
      */
     private val onVideoOutputSizeChanged: ((Int, Int) -> Unit)? = null,
+    /**
+     * 1.1.4（EU5 电话无收音排查）：麦克风上行启动全败时的音频系统现场快照
+     * （audio mode / SCO / A2DP 状态等），由持有 Context 的上层注入。sink 不持
+     * Context，故用取值回调；空串表示上层未提供。
+     */
+    private val microphoneSystemSnapshot: () -> String = { "" },
+    /**
+     * 1.1.5/e5t1(vc85)：麦克风静音位检查/自动恢复，由持 Context 的上层注入（返回描述串
+     * 落诊断）。EU5 QG DSP 仲裁链可能在 Android 层留 mute 位，App 层可检测并解除；
+     * 未注入时跳过，其他平台零行为变化。
+     */
+    private val microphoneMuteRestore: (() -> String)? = null,
+    /**
+     * 1.1.4（ECARX 媒体中心冒充桥）：CarPlay 媒体流（audioType=media）首包到达时
+     * 触发，上层据此通知 EcarxMediaCenterBridge 显式抢占 ONLINE 音源。电话/导航/
+     * Siri 流不触发。
+     */
+    private val onMediaPlaybackStarted: (() -> Unit)? = null,
+    /**
+     * 1.1.6(vc76)：媒体断供看门狗——媒体音频（type=102）与主屏视频（type=110）都
+     * 建过流且**同时**静默超过 [MEDIA_STALL_SILENCE_NS] 时回调一次（恢复收流自动复位）。
+     * 形态 A 僵尸会话对策：iPhone 野蛮退出 CarPlay 不发 teardown（8815 整夜实测：
+     * CarPlay UI 已退、BT iAP2 心跳还活、RTSP 会话挂 ended=false 傻等 4 分钟+），
+     * 音视频双静默 = 会话实质死亡的媒质层判据（用户暂停音乐只停音频、视频仍在推）。
+     */
+    private val onMediaStall: (() -> Unit)? = null,
 ) : MediaSink {
     private val screenStateLock = Any()
     private val activeScreenTypes = mutableSetOf<Int>()
@@ -96,12 +122,68 @@ class AndroidMediaSink(
     private val audioStreamTypes =
         java.util.Collections.synchronizedSet(java.util.LinkedHashSet<String>())
     private val microphoneUplinks = ConcurrentHashMap<Int, MicrophoneUplink>()
+    /**
+     * 1.1.4（EU5 电话无收音）：上行启动失败后的延时重试。失败时 iPhone 已收到 SETUP 200
+     * 且不再重发，一锤定音=整通电话静音；而通话建立期 HAL 输入可能被短暂占用（EU5 疑点 B）。
+     * 重试节奏：800ms / 2s 各一次（重建 uplink 全矩阵再试），STOP/新一轮 SETUP 时取消。
+     * 独立调度器，不与视频恢复共用线程（recoveryExecutor 无 schedule 能力）。
+     */
+    private val microphoneRetryExecutor =
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor { task ->
+            Thread(task, "carplay-mic-retry").apply { isDaemon = true }
+        }
+    private val microphoneRetryFutures =
+        ConcurrentHashMap<Int, MutableList<java.util.concurrent.ScheduledFuture<*>>>()
     private val pendingVideoCodec = ConcurrentHashMap<Int, VideoCodec>()
     private val videoRecoveryHandlers = ConcurrentHashMap<Int, () -> Unit>()
     private val videoDiagnosticHandlers = ConcurrentHashMap<Int, (String) -> Unit>()
     private val recoveryPending = AtomicBoolean(false)
     private val recoveryExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "carplay-video-recovery").apply { isDaemon = true }
+    }
+    // 1.1.6(vc76)：媒体断供监视线程。5s 一查；判据 = 媒体音频与主屏视频都建过流、
+    // 且当前同时静默超阈值 → 一次性回调 onMediaStall（任一流恢复即复位，允许下次再判）。
+    private val mediaStallLatch = AtomicBoolean(false)
+    private val mediaStallMonitor = Thread({
+        while (true) {
+            try {
+                Thread.sleep(5_000)
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+            val callback = onMediaStall ?: continue
+            val renderer = audioRenderers[MEDIA_AUDIO_PAYLOAD_TYPE] ?: continue
+            if (renderer.format.audioType != MEDIA_AUDIO_TYPE) continue
+            val audioLastNs = renderer.lastArrivalNanos()
+            if (audioLastNs == 0L) continue // 本代从未收过音频包：没建过流，无从谈断供
+            val video = videoDecoders[MEDIA_VIDEO_PAYLOAD_TYPE] ?: continue // 纯音频场景不判死
+            val videoLastNs = video.lastArrivalNanos()
+            if (videoLastNs == 0L) continue
+            val now = System.nanoTime()
+            val bothSilent = now - audioLastNs > MEDIA_STALL_SILENCE_NS &&
+                now - videoLastNs > MEDIA_STALL_SILENCE_NS
+            if (bothSilent) {
+                if (mediaStallLatch.compareAndSet(false, true)) {
+                    Log.w(
+                        "xcertplay-usb",
+                        "media stall: audio+video silent >${MEDIA_STALL_SILENCE_NS / 1_000_000}ms " +
+                            "with streams established; reporting to orchestration",
+                    )
+                    callback()
+                }
+            } else {
+                mediaStallLatch.set(false)
+            }
+        }
+    }, "carplay-media-stall").apply { isDaemon = true; start() }
+
+    private companion object {
+        // 1.1.6(vc76)：媒体断供看门狗参数。20s 双静默远大于正常流间隙（视频 8fps 空闲
+        // 流 ~125ms/帧、音乐停顿由重传覆盖），且视频仍推 = 用户暂停音乐的合法场景。
+        const val MEDIA_AUDIO_PAYLOAD_TYPE = 102
+        const val MEDIA_VIDEO_PAYLOAD_TYPE = 110
+        const val MEDIA_AUDIO_TYPE = "media"
+        const val MEDIA_STALL_SILENCE_NS = 20_000_000_000L
     }
 
     override fun setVideoRecoveryHandler(type: Int, handler: () -> Unit) {
@@ -168,6 +250,7 @@ class AndroidMediaSink(
     override fun onAudioStarted(type: Int, format: AudioFormat, firstSample: Int) {
         noteAudioStreamType(type, format.audioType)
         audioRenderer(type, format).start()
+        if (format.audioType == "media") onMediaPlaybackStarted?.invoke()
     }
 
     /** 新出现的 audioType 才打一行汇总，避免刷屏。 */
@@ -186,17 +269,46 @@ class AndroidMediaSink(
     }
 
     override fun onMicrophoneStarted(type: Int, config: MicrophoneConfig) {
+        // iPhone 新一轮 onStarted：作废未决重试（参数以最新 SETUP 为准）。
+        cancelMicrophoneRetries(type)
+        startMicrophoneUplink(type, config, retriesLeft = 2)
+    }
+
+    /** 1.1.4：上行启动 + 失败延时重试（800ms→2s），重试时全新建 uplink 走完整兜底矩阵。 */
+    private fun startMicrophoneUplink(type: Int, config: MicrophoneConfig, retriesLeft: Int) {
         // API16 适配：ConcurrentHashMap.computeIfAbsent 是 API 24+，改两段式 get + putIfAbsent。
         var uplink = microphoneUplinks[type]
         if (uplink == null) {
-            val created = MicrophoneUplink(config, onAudioDiagnostic)
+            val created = MicrophoneUplink(config, onAudioDiagnostic, microphoneMuteRestore)
             val raced = microphoneUplinks.putIfAbsent(type, created)
             uplink = raced ?: created
         }
-        if (!uplink.start()) microphoneUplinks.remove(type, uplink)
+        if (uplink.start()) {
+            cancelMicrophoneRetries(type)
+            return
+        }
+        microphoneUplinks.remove(type, uplink)
+        if (retriesLeft <= 0) {
+            onAudioDiagnostic(
+                "Microphone uplink start failed after retries; " +
+                    "uplink stays silent until iPhone re-SETUP. snapshot: ${microphoneSystemSnapshot()}",
+            )
+            return
+        }
+        val delay = if (retriesLeft == 2) 800L else 2000L
+        val future = microphoneRetryExecutor.schedule({
+            startMicrophoneUplink(type, config, retriesLeft - 1)
+        }, delay, TimeUnit.MILLISECONDS)
+        microphoneRetryFutures.getOrPut(type) { mutableListOf() }.add(future)
+    }
+
+    /** 取消某流未决的上行重试（onMicrophoneStopped / 新 onStarted / 成功时调用）。 */
+    private fun cancelMicrophoneRetries(type: Int) {
+        microphoneRetryFutures.remove(type)?.forEach { it.cancel(false) }
     }
 
     override fun onMicrophoneStopped(type: Int) {
+        cancelMicrophoneRetries(type)
         microphoneUplinks.remove(type)?.close()
     }
 
@@ -215,6 +327,8 @@ class AndroidMediaSink(
         audioRenderers.clear()
         microphoneUplinks.values.forEach(MicrophoneUplink::close)
         microphoneUplinks.clear()
+        microphoneRetryFutures.clear()
+        microphoneRetryExecutor.shutdownNow()
     }
 
     private fun videoDecoder(type: Int): VideoDecoder {
@@ -329,6 +443,11 @@ private class VideoDecoder(
     // 1.1.3（绿线修复②）：恢复/重建/surface 重接后抑制渲染，直到下一个 IDR 真正喂进解码器，
     // 挡掉厂商 OMX flush 后吐出的残留脏缓冲（8815 短暂绿线的另一来源）。
     @Volatile private var renderHold = true
+    // 1.1.3（绿线修复③·渲染节奏限流）：render-latest 只在单次 drain 内去重，burst 时解码线程
+    // 每个 feed 调一次 drain、每次渲一帧，渲染速率仍跟着解码速度走（弱机瞬间 60~100fps），
+    // 8815 实测绿线仍在。加最小渲染间隔（≈一帧显示周期）：间隔内的帧跳过不上屏，
+    // 静态画面由 Surface 保留上一帧显示。仅解码线程访问，无需 volatile。
+    private var lastRenderRequestNs = 0L
     // M6k：最近一次喂入的帧是不是随机访问帧（IDR）。解码失败时落盘，用于判读"是否从 P 帧续解"。
     @Volatile private var lastFrameKeyFrame = true
     // 1.0.29（AC8227 倒车闪屏）：恢复看门狗计数——关键帧连发无渲染 = control 通道疑似死亡。
@@ -348,6 +467,9 @@ private class VideoDecoder(
         BandwidthMonitor.onVideoBytes(nalus.size)
         queue.offer(VideoJob.Frame(nalus))
     }
+
+    /** 1.1.6(vc76)：最近一次收帧时刻（媒体断供看门狗判「视频面死亡」用）。 */
+    fun lastArrivalNanos(): Long = stats.lastArrivalNanos()
 
     fun setSurface(surface: Surface?) {
         queue.offer(VideoJob.SurfaceChanged(surface))
@@ -769,8 +891,11 @@ private class VideoDecoder(
                 // 1.1.3 修复（8815 011235 无画面定案②）：**不得按 info.size 过滤**——Surface 输出模式下
                 // 高通 OMX 的输出 BufferInfo.size 恒为 0（数据直送 surface，size 无意义），
                 // 按 size>0 过滤会把每一帧都当"零长度填充"静默丢掉 → shown=0 全黑。
-                // 渲染判据只看 surface 与 renderHold。
-                val render = outputSurface != null && !renderHold
+                // 渲染判据只看 surface、renderHold 与渲染节奏间隔。
+                val nowNs = System.nanoTime()
+                val due = lastRenderRequestNs == 0L || nowNs - lastRenderRequestNs >= RENDER_MIN_INTERVAL_NS
+                val render = outputSurface != null && !renderHold && due
+                if (render) lastRenderRequestNs = nowNs
                 codec.releaseOutputBuffer(pendingIndex, render)
                 pendingIndex = -1
                 if (render) {
@@ -876,7 +1001,15 @@ private class VideoDecoder(
         // M6b：250ms → 350ms。C8815 上解码偶发被抢占（processMaxUs 峰值 111ms/包），250ms 会被
         // 误判成积压而频繁 forceKeyFrame（每次触发画面冻结到关键帧到达，主观上更卡）；
         // 350ms 留出余量，只在真积压（网络/渲染真的跟不上）时才丢帧。
-        const val MAX_FRAME_AGE_NS = 350_000_000L
+        // 1.1.3（运动噪块修复①）：8815 实测 Wi-Fi 每 ~0.9s 一次 radio gap（maxGap 普遍 830~980ms），
+        // 350ms 阈值让每个 gap 都触发「丢队列+flush+等 IDR」——运动段 backlog/flush 每 5s 窗口 1~2 次，
+        // 老 Adreno 203 档解码器在频繁 mid-GOP flush + 突发灌帧下会静默输出纠错噪块（不报错）。
+        // 解码实测 60~100fps 远超流速率，积压可自排空：阈值抬到 1100ms（>gap 周期），gap 后的
+        // 突发帧直接续解，不再清解码器——既消 flush churn，也消每次恢复的冻结等待。
+        const val MAX_FRAME_AGE_NS = 1_100_000_000L
+        // 1.1.3（绿线修复③）：最小渲染间隔 ≈ 一帧显示周期（60Hz→16.7ms）。
+        // burst 期间解码速度可到 60~100fps，超频渲染在老显示管线上出 scanout 异常（绿线）。
+        const val RENDER_MIN_INTERVAL_NS = 16_000_000L
         val START_CODE = byteArrayOf(0x00, 0x00, 0x00, 0x01)
     }
 }
@@ -1026,6 +1159,9 @@ private class AudioRenderer(
             }
         }
     }
+
+    /** 1.1.6(vc76)：最近一次收包时刻（媒体断供看门狗判「音频面死亡」用）。 */
+    fun lastArrivalNanos(): Long = lastArrivalNs.get()
 
     override fun close() {
         running = false

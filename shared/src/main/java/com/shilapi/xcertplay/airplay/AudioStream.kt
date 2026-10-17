@@ -232,6 +232,18 @@ class AudioStream(
                 }
                 stats.processed()
             }
+        } catch (error: Exception) {
+            // vc94：循环体兜底——下游（重排/交付/回调）抛 RuntimeException 时线程此前会静默死亡：
+            // socket 不关、无任何通知，会话假活挂死（ScreenStream 有全捕获，此处对齐）。
+            // 动作=落日志（logcat+诊断通道）+ close 自救（关数据/控制 socket、停 control 线程），
+            // 会话级响应交给既有媒体断供看门狗。
+            android.util.Log.w(
+                TAG,
+                "audio stream type=$streamType rx loop crashed: ${error.message}",
+                error,
+            )
+            onDiagnostic("Audio: rx loop crashed type=$streamType ${error.javaClass.simpleName}: ${error.message}")
+            runCatching { close() }
         } finally { stats.flush(ended = true) }
     }
 
@@ -367,6 +379,11 @@ class AudioStream(
                 val distance = (seq - expectedSeq) and 0xffff
                 when {
                     distance == 0 -> {
+                        // vc94：PT=86 注入线程只入 held 不触发 drainHeld，若同序号原始包随后
+                        // 走本分支先行交付，held 中的补传残帧会滞留——后续 MAX_HOLD 溢出或
+                        // 超时放行按 held.firstKey() 拨基准时会回拨到该序号，整段重复交付。
+                        // 交付前清掉同序号残帧即可（TreeMap.remove 缺键为 no-op），其余重排逻辑不动。
+                        held.remove(seq)
                         deliverNow = PendingFrame(rtp, sample)
                         expectedSeq = (expectedSeq + 1) and 0xffff
                     }

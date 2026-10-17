@@ -1,5 +1,7 @@
 package com.shilapi.xcertplay.airplay
 
+import android.os.Build
+
 enum class AirPlayPhysicalSizeBasis {
     WIDTH,
     HEIGHT,
@@ -25,8 +27,13 @@ object AirPlayDisplaySettings {
     const val MIN_REPORTED_PHYSICAL_MM = 1
     const val MAX_REPORTED_PHYSICAL_MM = 2_000
 
-    fun sanitizeFps(value: Int): Int =
-        snapToStep(value, MIN_FPS, MAX_FPS, FPS_STEP)
+    fun sanitizeFps(value: Int): Int {
+        val snapped = snapToStep(value, MIN_FPS, MAX_FPS, FPS_STEP)
+        // 1.1.3（8815 运动噪块修复②）：API<21 的老硬解（Adreno 203 档）在峰值 60fps+高码率
+        // 运动画面下会静默输出纠错噪块（不报错）。/info 协商层压到 30fps，iPhone 编码端直接
+        // 减半峰值负载——比在解码端补救有效得多。
+        return if (Build.VERSION.SDK_INT < 21) minOf(snapped, 30) else snapped
+    }
 
     fun sanitizeWidthPhysicalMm(value: Int): Int =
         snapToStep(

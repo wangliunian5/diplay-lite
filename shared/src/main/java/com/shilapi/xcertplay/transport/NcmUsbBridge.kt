@@ -41,6 +41,10 @@ class NcmUsbBridge internal constructor(
     private var queuedBytes = 0
     private var buffered = ByteArray(0)
     private var bufferedSize = 0
+    // vc72：NTB16 失步重同步累计计数；vc73 改窗口化——距上次错位 >30s 重置为 0，
+    // 窗口内超 RESYNC_STORM_LIMIT 才判真死。
+    private var resyncCount = 0
+    private var resyncStreakStartNanos = 0L
     private val readBuffer = ByteArray(READ_CHUNK_BYTES)
     // 1.0.25（3e 1.0.24 双会话实测 21:02:48/21:03:19）：EMUI 的 UsbRequest.queue() 会瞬时
     // 返回 false（21:02:48.685+48.999、21:03:19.875×2），原实现直接 failSession → NCM 读线程
@@ -72,6 +76,8 @@ class NcmUsbBridge internal constructor(
     fun send(frame: ByteArray, timeoutMillis: Int) = synchronized(writeLock) {
         checkOpen()
         require(timeoutMillis > 0) { "timeoutMillis must be positive" }
+        // fe6t1：出站 tap（车机→iPhone 完整以太网帧，发送意图即记录，写失败不影响判定）。
+        PcapTap.writeFrame(frame, PcapTap.DIR_OUTBOUND)
         val sequence = synchronized(stateLock) {
             checkOpenLocked()
             this.sequence.also { this.sequence = (this.sequence + 1) and 0xffff }
@@ -210,7 +216,27 @@ class NcmUsbBridge internal constructor(
         while (true) {
             if (bufferedSize < 12) return
             if (readU32(buffered, 0) != Ntb16Codec.NTH16_SIG) {
-                throw failSession("NCM read buffer does not begin with an NTB16 header")
+                // vc72（TS7 实测 19:57:28.081）：视频满流（~50pkt/s 全 1500B）时 MUSB RX 丢
+                // USB 包（FIFO overrun 嫌疑）→ 字节流错位 → 签名校验失败。原实现 failSession
+                // 自杀 → 桥拆 → control CHANNEL_CLOSED → 会话死（activeStreams=[110] 且画面
+                // 已出）。改为向前扫描重同步：丢错位前缀对齐到下一 NTH16 签名；无签名则保留
+                // 尾 3 字节等拼接。丢帧花屏由 keyframe recovery 兜底。
+                // vc73（TS7 实测 20:26:14）：静态画面期错位加速至 ~1-2 次/秒，vc72 的累计
+                // 上限 64 在 2.5 分钟内耗尽自拆。改为 30s 窗口化计数：距上次错位 >30s 重置，
+                // 窗口内 >256 次才判真死（错端点/错接口的垃圾流秒级触顶，正常丢包永不触顶）。
+                val nowNanos = System.nanoTime()
+                if (resyncStreakStartNanos == 0L ||
+                    nowNanos - resyncStreakStartNanos > RESYNC_STREAK_RESET_NANOS
+                ) {
+                    resyncCount = 0
+                    resyncStreakStartNanos = nowNanos
+                }
+                if (++resyncCount > RESYNC_STORM_LIMIT) {
+                    throw failSession("NTB16 resync storm ($resyncCount)")
+                }
+                val resynced = resyncToNth16Signature()
+                if (!resynced) return
+                continue
             }
             val blockLength = readU16(buffered, 8)
             if (blockLength < 28) throw failSession("Invalid NTB16 block length $blockLength")
@@ -230,6 +256,29 @@ class NcmUsbBridge internal constructor(
             buffered.copyInto(buffered, 0, wireLength, bufferedSize)
             bufferedSize = remaining
         }
+    }
+
+    /**
+     * vc72：NTB16 失步后向前扫描下一个 NTH16 签名并丢弃错位前缀。找到 → 丢弃并返回 true；
+     * 未找到 → 保留末尾 3 字节（可能是被读边界截断的签名前缀）并返回 false，等下一读块拼接。
+     */
+    private fun resyncToNth16Signature(): Boolean {
+        for (i in 1..bufferedSize - NTH16_SIG_BYTES) {
+            if (readU32(buffered, i) == Ntb16Codec.NTH16_SIG) {
+                Log.w(
+                    IphoneCarPlayConfiguration.TAG,
+                    "ncm ntb16 resync #$resyncCount: dropped $i misaligned bytes " +
+                        "(head=${buffered.hex(minOf(i, 8))})",
+                )
+                buffered.copyInto(buffered, 0, i, bufferedSize)
+                bufferedSize -= i
+                return true
+            }
+        }
+        val keep = minOf(NTH16_SIG_BYTES - 1, bufferedSize)
+        buffered.copyInto(buffered, 0, bufferedSize - keep, bufferedSize)
+        bufferedSize = keep
+        return false
     }
 
     private fun appendBuffered(source: ByteArray, length: Int) {
@@ -255,6 +304,8 @@ class NcmUsbBridge internal constructor(
     private fun pollFrame(): ByteArray {
         val frame = frames.removeFirst()
         queuedBytes -= frame.size
+        // fe6t1：入站 tap（iPhone→车机完整以太网帧，未启用时零开销直返）。
+        PcapTap.writeFrame(frame, PcapTap.DIR_INBOUND)
         return frame
     }
 
@@ -385,14 +436,22 @@ class NcmUsbBridge internal constructor(
         private const val NANOS_PER_MILLISECOND = 1_000_000L
         private const val ASYNC_QUEUE_FAILURE_LIMIT = 3
 
+        /** vc72/73：NTB16 重同步——签名 4 字节；30s 无错位重置计数；窗口内 256 次判真死。 */
+        private const val NTH16_SIG_BYTES = 4
+        private const val RESYNC_STORM_LIMIT = 256
+        private const val RESYNC_STREAK_RESET_NANOS = 30_000_000_000L
+
         /** 1.0.3：getAlternateSetting 是 API 24+，< 24 固定打 0（仅诊断日志用途）。 */
         private fun altOf(usbInterface: UsbInterface): Int =
             if (Build.VERSION.SDK_INT >= 24) usbInterface.alternateSetting else 0
 
         /** Claims and activates the NCM control/data interfaces; owns the connection on success. */
-        fun open(connection: UsbDeviceConnection, function: NcmFunctionDiscovery.NcmFunction): NcmUsbBridge {
+        fun open(
+            connection: UsbDeviceConnection,
+            function: NcmFunctionDiscovery.NcmFunction,
+            reopen: (() -> UsbDeviceConnection?)? = null,
+        ): NcmUsbBridge {
             // 1.1.3（root 抢回）：claim 失败且车机有 root 时，unbind 内核 cdc_ncm 后重试一次。
-            // 同一 connection 复用安全：失败路径已 releaseInterface，重试重新 claim。
             try {
                 return openOnce(connection, function)
             } catch (error: IphoneUsbException.DeviceUnavailable) {
@@ -404,7 +463,18 @@ class NcmUsbBridge internal constructor(
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
                 }
-                return openOnce(connection, function)
+                // vc94：openOnce 失败路径已 connection.close()（authoritative close），复用已关闭
+                // 连接重试 claim 必败——1.1.3 起 root 抢回实际整体失效。有 reopen 工厂（调用方
+                // 提供 usbManager.openDevice(device)）时重新打开；工厂返回 null 或缺省时显性失败。
+                val retryConnection = if (reopen != null) {
+                    reopen()
+                        ?: throw IphoneUsbException.DeviceUnavailable(
+                            "Could not reopen the iPhone NCM connection after root reclaim",
+                        )
+                } else {
+                    connection
+                }
+                return openOnce(retryConnection, function)
             }
         }
 

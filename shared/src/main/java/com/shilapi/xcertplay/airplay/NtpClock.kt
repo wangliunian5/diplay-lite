@@ -34,6 +34,9 @@ class NtpClock(private val log: (String) -> Unit = {}) : Closeable {
     private var pickOffset = 0.0
     private var pendingT1: BigInteger? = null
     private var synced = false
+    // vc94：offset 应用门控老化——低干扰期取到极小 RTT 后该值常驻延迟窗口，后续正常 RTT
+    // 永不满足 all{selectedRtt <= it}，offset 冻结、晶振漂移无界累积。记录上次应用时刻。
+    private var lastAppliedAtNanos = System.nanoTime()
 
     // 诊断计数（M4d）：确认时序交换是否真的发生（音频 RTP 依赖 NTP 时钟域）。
     private var requestsSent = 0
@@ -204,13 +207,25 @@ class NtpClock(private val log: (String) -> Unit = {}) : Closeable {
 
         synchronized(clockLock) {
             val useSample = delays.all { selectedRtt <= it }
+            // vc94：老化强制应用——OFFSET_AGING 内一次都没应用过 offset 时，无视门控采纳当前
+            // 样本并重置延迟窗口重新收敛，防极小 RTT 霸占窗口导致 offset 永久冻结。
+            val aged = System.nanoTime() - lastAppliedAtNanos >= OFFSET_AGING_NANOS
             delays[delayIndex] = selectedRtt
             delayIndex = (delayIndex + 1) % DELAY_WINDOW
-            if (useSample) applyOffset(selectedOffset)
+            if (useSample || aged) {
+                if (!useSample) {
+                    delays.fill(Double.POSITIVE_INFINITY)
+                    delayIndex = 0
+                    pendingT1 = null
+                    log("clock offset applied after aging (rttMs=${selectedRtt * 1000.0})")
+                }
+                applyOffset(selectedOffset)
+            }
         }
     }
 
     private fun applyOffset(offsetSec: Double) {
+        lastAppliedAtNanos = System.nanoTime()
         val stepping = !synced || Math.abs(offsetSec) > STEP_THRESHOLD_SEC
         val applied = if (stepping) offsetSec else offsetSec * SLEW_GAIN
         clockOffsetNs += Math.round(applied * 1e9)
@@ -241,6 +256,8 @@ class NtpClock(private val log: (String) -> Unit = {}) : Closeable {
         const val SLEW_GAIN = 1.0 / 8.0
         const val DELAY_WINDOW = 8
         const val PICK_COUNT = 2
+        // vc94：offset 门控老化窗——60s 一次都没应用过则强制采纳当前样本重置窗口。
+        const val OFFSET_AGING_NANOS = 60_000_000_000L
         const val TWO32_DOUBLE = 0x1_0000_0000L.toDouble()
     }
 }
