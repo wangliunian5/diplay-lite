@@ -59,3 +59,6 @@ t3-root-debug/
 backup/
 hardware-stage/
 *.pcap
+
+# 本地流程文档（不入任何仓）
+GITHUB-提交操作规范.md
