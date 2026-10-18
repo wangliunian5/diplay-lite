@@ -47,7 +47,9 @@ release-signing.properties
 !apks/*.apk
 
 # 车主隐私与取证产物、反编译工作区、外部引用仓（仅本地留存，永不入仓）
+# 20261019 起统一归档至 local-archive/（旧根路径保留一段时间防回加）
 logs/
+local-archive/
 tmp-analysis/
 legacy-ref/
 log-repo/
