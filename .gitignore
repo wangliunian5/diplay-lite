@@ -64,3 +64,6 @@ hardware-stage/
 
 # 本地流程文档（不入任何仓）
 GITHUB-提交操作规范.md
+
+# 开源仓剔除项补充（本地文档归档）
+docs-local/
