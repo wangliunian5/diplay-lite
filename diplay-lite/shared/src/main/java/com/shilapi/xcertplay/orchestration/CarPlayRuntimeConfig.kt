@@ -45,7 +45,7 @@ enum class ManualHotspotSecurity {
  */
 class CarPlayRuntimeConfig(
     val hostMac: ByteArray = DEFAULT_HOST_MAC,
-    val linkLocal: String = "fe80::2",
+    val linkLocal: String = "fd00::2",
     val identification: Iap2IdentificationConfig,
     val availableCurrentMilliAmps: Int = 2400,
     val label: String = "xcertplay",
@@ -59,10 +59,21 @@ class CarPlayRuntimeConfig(
     val manualHotspotSecurity: ManualHotspotSecurity = ManualHotspotSecurity.WPA2,
     val wirelessBluetoothDeviceAddress: String? = null,
     val locationReportingEnabled: Boolean = false,
+    // 1.1.6(vc76)：有线 cdc_ncm 解绑守护开关（TS7 无 root 裁决实验）。默认 true=正式路径；
+    // false 时不启动 WiredNcmGuard，验证「仅 NTB16 重同步、无 root 无守护」能否稳住会话。
+    val wiredNcmGuardEnabled: Boolean = true,
+    // vc102 USB bootstrap 无线升级（实验）：有线 CSM 建好后不走 NCM/有线控制环，改走
+    // 「开热点 + AirPlay 监听 + mDNS + 识别帧 group16+24 + 无线控制环（0x5703 经 USB 隧道）」。
+    // Apple 官方「插 USB 弹提醒可无线」流程的配件侧实现；热点参数复用 wirelessHotspotMode 组。
+    val usbWirelessUpgrade: Boolean = false,
 ) {
     init {
         require(hostMac.size == 6) { "hostMac must be 6 bytes" }
-        require(isLinkLocalIpv6(linkLocal)) { "linkLocal must be a link-local IPv6 literal" }
+        // vc111（T3 KK 实测）：link-local（fe80）在 KK sunxi 内核的 tun 本地投递是坏的
+        // （dst=fe80::2 的包被当转发丢回出向，ICMP/TCP 全黑洞；本机 ping 实锤），
+        // ULA 全局地址 fd00::2 本地投递正常（echo reply 0% loss）。AirPlay 栈迁到
+        // ULA：校验放宽为 link-local 或 fd00::/8 ULA 皆可。
+        require(isValidTunIpv6(linkLocal)) { "linkLocal must be a link-local or ULA IPv6 literal" }
         require(availableCurrentMilliAmps in 0..0xffff) {
             "availableCurrentMilliAmps must be in 0..65535"
         }
@@ -121,11 +132,13 @@ class CarPlayRuntimeConfig(
 
     companion object {
         val DEFAULT_HOST_MAC = byteArrayOf(0x02, 0x00, 0x00, 0x00, 0x00, 0x02)
-        private fun isLinkLocalIpv6(value: String): Boolean {
+        private fun isValidTunIpv6(value: String): Boolean {
             if (value.contains('%') || '\u0000' in value || !value.contains(':')) return false
             return try {
                 val address = InetAddress.getByName(value)
-                address is Inet6Address && address.isLinkLocalAddress
+                // fd00::/8 ULA 不属于 Java 的 isSiteLocalAddress（那是 fec0::/10），按首字节判
+                address is Inet6Address &&
+                    (address.isLinkLocalAddress || address.address[0] == 0xfd.toByte())
             } catch (_: Exception) {
                 false
             }

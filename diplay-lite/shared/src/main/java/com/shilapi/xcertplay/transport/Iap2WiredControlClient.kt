@@ -53,23 +53,37 @@ class Iap2WiredControlClient(
         onProgress("iap2 power/subscriptions sent")
 
         var forwardedFrames = 0
+        // vc97①：流帧独立计数——forwardedFrames 被 iAP2 LinkControl 域帧（0x5001 心跳、
+        // 0x5201 会话控制）自增污染，心跳常驻时「零流帧」判据恒 false：0x4301 重发饿死
+        // （vc94 A1 只修了节拍位置没修判据），controller 侧 wedgeSuspect 同判据误判
+        // （TS7 46s 死窗根因链）。门控与 wedge 判定一律用 streamFrames（域外应用帧）。
+        var streamFrames = 0
         var carPlayStartSessions = 0
+        // vc93：0x4301 重建后重发预算（对齐无线模式多次重发思路）。iPhone 偶发忽略
+        // 首个 0x4301（TS7 083438：重建后 0x4301 无响应），有界重发给 iPhone 二次
+        // 响应窗口；建立期看门狗（controller 侧 8s）内按 2s 间隔补发。
+        var carPlayStartResends = 0
+        var lastCarPlayStartAtNanos = 0L
         var locationActive = false
         var locationSentLogged = false
         try {
             while (true) {
                 val remaining = remainingMillis(deadlineNanos)
                 if (remaining == 0L) {
-                    return Iap2WiredControlResult(Iap2WiredControlTerminal.TIMED_OUT, stage, forwardedFrames, carPlayStartSessions)
+                    return Iap2WiredControlResult(Iap2WiredControlTerminal.TIMED_OUT, stage, forwardedFrames, streamFrames, carPlayStartSessions)
                 }
                 if (locationActive && sendLatestLocation(locationProvider, deadlineNanos) && !locationSentLogged) {
                     locationSentLogged = true
                     onProgress("iap2 tx=0xfffb location-information")
                 }
-                val pollTimeout = if (locationActive) {
-                    min(remaining, LOCATION_POLL_INTERVAL_MILLIS)
-                } else {
-                    remaining
+                // vc93：0x4301 已发且零流帧、重发预算未耗尽 → recv 短轮询，让重发有节拍。
+                // vc97①：判据换 streamFrames（无流帧）——forwardedFrames 含心跳恒 >0。
+                val startResendPending = stage == Iap2WiredControlStage.CARPLAY_START_SENT &&
+                    streamFrames == 0 && carPlayStartResends < MAX_CARPLAY_START_RESENDS
+                val pollTimeout = when {
+                    locationActive -> min(remaining, LOCATION_POLL_INTERVAL_MILLIS)
+                    startResendPending -> min(remaining, CARPLAY_START_RESEND_INTERVAL_MILLIS)
+                    else -> remaining
                 }
                 val incoming = session.recv(pollTimeout)
                 if (incoming == null) {
@@ -78,6 +92,7 @@ class Iap2WiredControlClient(
                             Iap2WiredControlTerminal.CHANNEL_CLOSED,
                             stage,
                             forwardedFrames,
+                            streamFrames,
                             carPlayStartSessions,
                         )
                     }
@@ -86,47 +101,65 @@ class Iap2WiredControlClient(
                             Iap2WiredControlTerminal.TIMED_OUT,
                             stage,
                             forwardedFrames,
+                            streamFrames,
                             carPlayStartSessions,
                         )
                     }
-                    continue
-                }
+                } else {
+                    when (incoming.messageId) {
+                        CARPLAY_AVAILABILITY -> {
+                            onProgress("iap2 rx=0x4300 carplay-availability")
+                            onProgress(carPlayAvailabilitySummary(incoming.payload))
+                            // LIVI sends its wired answer on every availability notification; do not gate it on
+                            // the phone's advertised availability boolean.
+                            send(carPlayStartSession(endpoint), deadlineNanos)
+                            stage = Iap2WiredControlStage.CARPLAY_START_SENT
+                            onStage(stage)
+                            carPlayStartSessions++
+                            lastCarPlayStartAtNanos = System.nanoTime()
+                            onProgress("iap2 tx=0x4301 carplay-start-session")
+                        }
 
-                when (incoming.messageId) {
-                    CARPLAY_AVAILABILITY -> {
-                        onProgress("iap2 rx=0x4300 carplay-availability")
-                        onProgress(carPlayAvailabilitySummary(incoming.payload))
-                        // LIVI sends its wired answer on every availability notification; do not gate it on
-                        // the phone's advertised availability boolean.
-                        send(carPlayStartSession(endpoint), deadlineNanos)
-                        stage = Iap2WiredControlStage.CARPLAY_START_SENT
-                        onStage(stage)
-                        carPlayStartSessions++
-                        onProgress("iap2 tx=0x4301 carplay-start-session")
-                    }
+                        Iap2LocationMessages.START_LOCATION_INFORMATION -> {
+                            onProgress("iap2 rx=0xfffa start-location-information")
+                            locationActive = startLocationUpdates(locationProvider, onProgress)
+                            locationSentLogged = false
+                            if (locationActive && sendLatestLocation(locationProvider, deadlineNanos)) {
+                                locationSentLogged = true
+                                onProgress("iap2 tx=0xfffb location-information")
+                            }
+                        }
 
-                    Iap2LocationMessages.START_LOCATION_INFORMATION -> {
-                        onProgress("iap2 rx=0xfffa start-location-information")
-                        locationActive = startLocationUpdates(locationProvider, onProgress)
-                        locationSentLogged = false
-                        if (locationActive && sendLatestLocation(locationProvider, deadlineNanos)) {
-                            locationSentLogged = true
-                            onProgress("iap2 tx=0xfffb location-information")
+                        Iap2LocationMessages.STOP_LOCATION_INFORMATION -> {
+                            onProgress("iap2 rx=0xfffc stop-location-information")
+                            locationActive = false
+                            locationSentLogged = false
+                            locationProvider?.stop()
+                        }
+
+                        else -> {
+                            onProgress("iap2 rx=0x${incoming.messageId.toString(16).padStart(4, '0')}")
+                            onIncoming(incoming)
+                            forwardedFrames++
+                            // vc97①：LinkControl 域（0x5000..0x5FFF）非流帧，不计 streamFrames。
+                            if (incoming.messageId !in LINK_CONTROL_MESSAGE_ID_RANGE) streamFrames++
                         }
                     }
-
-                    Iap2LocationMessages.STOP_LOCATION_INFORMATION -> {
-                        onProgress("iap2 rx=0xfffc stop-location-information")
-                        locationActive = false
-                        locationSentLogged = false
-                        locationProvider?.stop()
-                    }
-
-                    else -> {
-                        onProgress("iap2 rx=0x${incoming.messageId.toString(16).padStart(4, '0')}")
-                        onIncoming(incoming)
-                        forwardedFrames++
-                    }
+                }
+                // vc94：重发节拍检查移出 recv-null 分支——TS7 实锤形态是 iAP2 链路活着且心跳常驻
+                //（CSM 帧不断浮出，recv 永不返回 null），vc93 把检查放在 null 分支内会被心跳
+                // 饿死、一次都不触发。移到每轮循环尾按 elapsed 判定后，链路静默与心跳常驻两种
+                // 形态均正确；有流帧后 forwardedFrames>0，startResendPending 自然转 false 停发。
+                if (startResendPending &&
+                    elapsedSinceNanos(lastCarPlayStartAtNanos) >= CARPLAY_START_RESEND_INTERVAL_MILLIS
+                ) {
+                    send(carPlayStartSession(endpoint), deadlineNanos)
+                    carPlayStartResends += 1
+                    lastCarPlayStartAtNanos = System.nanoTime()
+                    onProgress(
+                        "iap2 tx=0x4301 carplay-start-session " +
+                            "resend=$carPlayStartResends/$MAX_CARPLAY_START_RESENDS",
+                    )
                 }
             }
         } finally {
@@ -169,11 +202,25 @@ class Iap2WiredControlClient(
         const val NO_TIMEOUT_MILLIS = Long.MAX_VALUE
         private const val CARPLAY_AVAILABILITY = 0x4300
         private const val CARPLAY_START_SESSION = 0x4301
+        // vc97①：iAP2 LinkControl/SessionControl 域——域内帧（0x5001 心跳、0x5201）非流帧。
+        private val LINK_CONTROL_MESSAGE_ID_RANGE = 0x5000..0x5FFF
         private const val LOCATION_POLL_INTERVAL_MILLIS = 1_000L
+        // vc93：0x4301 重发预算——2s 间隔、最多 6 次（覆盖 controller 侧建立期看门狗
+        // 8s 窗口内约 3 次补发，重建代际内给足 iPhone 二次响应机会）。
+        private const val CARPLAY_START_RESEND_INTERVAL_MILLIS = 2_000L
+        private const val MAX_CARPLAY_START_RESENDS = 6
         private const val DEFAULT_TIMEOUT_MILLIS = 60_000L
         private const val MAX_TIMEOUT_MILLIS = 24 * 60 * 60 * 1_000L
         private const val MAX_RECV_TIMEOUT_MILLIS = 5 * 60 * 1_000L
         private const val NANOS_PER_MILLISECOND = 1_000_000L
+
+        /** vc93：距 [startNanos] 的毫秒数；未发送过（0）返回 MAX_VALUE 阻止立即重发。 */
+        private fun elapsedSinceNanos(startNanos: Long): Long =
+            if (startNanos == 0L) {
+                Long.MAX_VALUE
+            } else {
+                (System.nanoTime() - startNanos) / NANOS_PER_MILLISECOND
+            }
 
         /** Exact LIVI wired PowerSourceUpdate encoding: current and the charge-if-powered flag. */
         fun powerSourceUpdate(availableCurrentMilliAmps: Int): Iap2Frame =
@@ -263,5 +310,7 @@ data class Iap2WiredControlResult(
     val terminal: Iap2WiredControlTerminal,
     val stage: Iap2WiredControlStage,
     val forwardedFrames: Int,
+    /** vc97①：域外应用帧（流帧）计数，wedgeSuspect 判据专用——forwardedFrames 含心跳已污染。 */
+    val streamFrames: Int,
     val carPlayStartSessionsSent: Int,
 )

@@ -13,6 +13,7 @@ import android.graphics.drawable.RippleDrawable
 import android.hardware.usb.UsbManager
 import android.net.VpnService
 import android.os.Build
+import android.util.Log
 import android.os.Bundle
 import android.os.Handler
 import android.text.TextUtils
@@ -181,6 +182,16 @@ class MainActivity : Activity() {
             WindowManager.LayoutParams.FLAG_FULLSCREEN,
             WindowManager.LayoutParams.FLAG_FULLSCREEN,
         )
+        // vc101（at8317 用户反馈）：会话期系统栏常驻占用画面顶部（AC822X ROM 定制
+        // 导航/状态合一栏，FLAG_FULLSCREEN 压不住）。挂 systemUiVisibility 三标志：
+        // HIDE_NAVIGATION 收导航栏、FULLSCREEN 收状态栏、LOW_PROFILE 弱化残余控件。
+        // API 17 无 IMMERSIVE_STICKY（API 19+），触摸/焦点变化会唤回——监听变化 +
+        // onWindowFocusChanged 里 1.5s 后自动重藏。车机触摸少（方控为主），可接受。
+        window.decorView.setOnSystemUiVisibilityChangeListener { vis ->
+            val hidden = vis and View.SYSTEM_UI_FLAG_HIDE_NAVIGATION != 0
+            if (!hidden) handler.postDelayed(rehideSystemBars, 1_500)
+        }
+        hideSystemBars()
         // M4l：车机屏绝不能休眠（API16 无 setOutputSurface，Surface 重建 = 解码器重配）。
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         applyOrientationMode(this, LiteConfig.load(this).orientationMode)
@@ -195,6 +206,12 @@ class MainActivity : Activity() {
             runOnUiThread { applyVideoFit(width, height) }
         }
         LiteLog.log("ui", "主界面就绪（原版式视觉：page 路由 + render 整页重建）")
+        // vc102 副屏探测：仪表/HUD 投射路线判生死，默认日志检测（无按钮），结果写 LiteLog cluster 标签。
+        ClusterDisplayProbe.probe(this)
+        // vc102 状态栏探针（AC822X 反馈 vc101 隐藏无效）：onCreate 立即 + t+3s 两次取证对比
+        // （systemUiVisibility 是否被 ROM 改回 + dumpsys window 看顶栏归属），结果写 statusbar 标签。
+        StatusBarProbe.probe(this, "onCreate")
+        handler.postDelayed({ StatusBarProbe.probe(this, "t+3s") }, 3_000)
         bootstrapNetworkAdb()
     }
 
@@ -222,6 +239,8 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         LiteLog.log("ui", "onResume")
+        // vc101（at8317）：每次回前台重新压系统栏（设置页等场景会唤回）。
+        hideSystemBars()
         // M6k24：设置页可能改过横竖屏 —— 回主页立即按最新设置强制窗口方向。
         applyOrientationMode(this, LiteConfig.load(this).orientationMode)
         // 1.0.29：设置页可能改过分辨率设定 —— 回主页刷新拉伸模式标志。
@@ -236,42 +255,95 @@ class MainActivity : Activity() {
         super.onPause()
         LiteLog.log("ui", "onPause")
         handler.removeCallbacks(refreshTask)
+        handler.removeCallbacks(rehideSystemBars)
     }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // vc101（at8317）：焦点回归（弹窗关闭/权限对话框等）后系统栏会回来，重压。
+        if (hasFocus) hideSystemBars()
+    }
+
+    /** vc101（at8317）：API17 兼容的系统栏隐藏——HIDE_NAVIGATION+FULLSCREEN+LOW_PROFILE。 */
+    private fun hideSystemBars() {
+        // vc104（AC822X/at8317 反编译定案）：高德「系统状态栏」开关的实现就是
+        // FLAG_FULLSCREEN 的动态 add/clear + 每次焦点回归重放（无特权接口）。
+        // 我们 onCreate 一次性 setFlags 后若被 FORCE_NOT_FULLSCREEN（权限弹窗等）
+        // 盖过或被系统清掉就回不来——这里幂等重放：清 FORCE 标志 + 重设 FULLSCREEN。
+        window.clearFlags(WindowManager.LayoutParams.FLAG_FORCE_NOT_FULLSCREEN)
+        window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+        window.decorView.systemUiVisibility =
+            View.SYSTEM_UI_FLAG_LOW_PROFILE or
+                View.SYSTEM_UI_FLAG_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+        setVendorFullScreen(true)
+    }
+
+    /**
+     * vc108（AC822X 正版高德反编译定案，tmp-analysis/amap-decomp2/）：该 ROM 的厂商
+     * launcher/systemui 监听 `sys.force_full_screen` 系统属性自行藏栏——正版高德的
+     * setFullScreenState 就是反射 SystemProperties.set 写它（SDK<=19 另发云OS广播，
+     * extras：properties=属性名、value=true/false），本机实锤高德在前台时栏消失。
+     * 1:1 抄作业：进前台写 true，退出写 false 还原车机栏。写失败（sepolicy 拦截）
+     * 静默降级——标准 flag 仍在，行为不劣于 vc107。
+     */
+    private fun setVendorFullScreen(enabled: Boolean) {
+        val value = if (enabled) "true" else "false"
+        try {
+            Class.forName("android.os.SystemProperties")
+                .getMethod("set", String::class.java, String::class.java)
+                .invoke(null, "sys.force_full_screen", value)
+            Log.i("StatusBarProbe", "vc108 sys.force_full_screen=$value set ok")
+        } catch (error: Throwable) {
+            Log.i("StatusBarProbe", "vc108 sys.force_full_screen set failed: $error")
+        }
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.KITKAT) {
+            try {
+                sendBroadcast(
+                    Intent("com.yunos.service.ACTION_SET_SYSTEM_PROPERTY")
+                        .putExtra("properties", "sys.force_full_screen")
+                        .putExtra("value", value),
+                )
+            } catch (_: Throwable) {
+                // 非 YunOS ROM 无接收方，静默
+            }
+        }
+    }
+
+    /** 系统栏被唤回后的自动重藏任务（监听器/postDelayed 复用，重复 post 无害需幂等）。 */
+    private val rehideSystemBars = Runnable { hideSystemBars() }
 
     override fun onDestroy() {
         LiteLog.log("ui", "onDestroy（Activity 被销毁，下一次进入会重建 Surface 与解码器）")
         LiteVideoBridge.setVideoSizeListener(null)
         detachCurrentPage()
+        // vc108：退出时还原车机栏（写回 false），否则车机桌面栏被永久藏住
+        setVendorFullScreen(false)
         super.onDestroy()
     }
 
     /**
      * 1.0.11（FE-6 拉伸）：按解码器实际输出尺寸把 SurfaceView 等比适配到容器内并居中。
      * width/height<=0 表示流已结束，恢复铺满。触摸映射（forwardTouch）基于 video 视图
-     * 尺寸，等比适配后映射自动正确。
+     * 尺寸，等比适配后映射自动正确。vc111：底部失灵区已由系统层（1024x500+触摸上限）
+     * 全局规避，画面直接按系统给定分辨率渲染，App 内不再做缩进映射。
      */
     private fun applyVideoFit(width: Int, height: Int) {
         val parent = video.parent as? android.view.ViewGroup ?: return
         // 1.0.29：分辨率设定=自动（拉伸）时跳过等比 letterbox，恢复铺满容器。
         if (videoStretchMode) {
-            val lp = video.layoutParams
-            if (lp.width == FrameLayout.LayoutParams.MATCH_PARENT &&
-                lp.height == FrameLayout.LayoutParams.MATCH_PARENT
-            ) return
-            lp.width = FrameLayout.LayoutParams.MATCH_PARENT
-            lp.height = FrameLayout.LayoutParams.MATCH_PARENT
-            video.layoutParams = lp
+            if (lpIsFullMatch()) return
+            video.layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT,
+            )
             video.requestLayout()
             return
         }
         if (width <= 0 || height <= 0) {
-            val lp = video.layoutParams
-            if (lp.width == FrameLayout.LayoutParams.MATCH_PARENT &&
-                lp.height == FrameLayout.LayoutParams.MATCH_PARENT
-            ) return
-            lp.width = FrameLayout.LayoutParams.MATCH_PARENT
-            lp.height = FrameLayout.LayoutParams.MATCH_PARENT
-            video.layoutParams = lp
+            if (lpIsFullMatch()) return
+            video.layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT,
+            )
             video.requestLayout()
             return
         }
@@ -290,7 +362,17 @@ class MainActivity : Activity() {
         }
         video.layoutParams = lp
         video.requestLayout()
-        LiteLog.log("ui", "视频等比适配 coded=${width}x${height} → view=${fitW}x${fitH} panel=${pw}x${ph}")
+        LiteLog.log(
+            "ui",
+            "视频等比适配 coded=${width}x${height} → view=${fitW}x${fitH} panel=${pw}x${ph}",
+        )
+    }
+
+    /** video 当前 LayoutParams 是否已是全铺（MATCH_PARENT x MATCH_PARENT）。 */
+    private fun lpIsFullMatch(): Boolean {
+        val lp = video.layoutParams ?: return false
+        return lp.width == FrameLayout.LayoutParams.MATCH_PARENT &&
+            lp.height == FrameLayout.LayoutParams.MATCH_PARENT
     }
 
     // ---------- M6k25：单 Activity 页面路由 ----------
@@ -348,6 +430,37 @@ class MainActivity : Activity() {
             steeringPage?.let { if (it.consumeKeyDown(keyCode, event)) return true }
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    /**
+     * fe6t2 方控监听（FE-6「方控上/下一首无效」取证）：全量 KeyEvent 落日志，
+     * 只观察不改分发。MediaSession/logcat/广播三条通路日志里零触发记录，先确认
+     * 车机方控按键是否以窗口 KeyEvent 形态进 App、键码/来源为何，再定映射修复。
+     *
+     * vc87（fe6t5）方控派发接通：fe6t3 日志实锤按键确实以窗口 KeyEvent 形态进 App
+     * （code=87/88 dev=-1 src=0），学习绑定能建立但标准派发只有 MediaSession 与
+     * logcat/广播两条通路，窗口 KeyEvent 永不派发——「方控按键 sent=」零记录。
+     * 观察侧升级为观察+派发：非学习页把事件转发给 LiteSteeringKeys 窗口派发入口，
+     * 仍不改变 super 分发（返回键/页面导航行为不变）。
+     */
+    override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
+        if (event != null &&
+            (event.action == KeyEvent.ACTION_UP || (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0))
+        ) {
+            LiteLog.log(
+                "ui",
+                "方控监听 code=${event.keyCode} action=${event.action} scan=${event.scanCode} " +
+                    "repeat=${event.repeatCount} dev=${event.deviceId} src=${event.source}",
+            )
+            // 学习页自己消费 onKeyDown 捕获，转发会造成双重上报；其余页面统一派发。
+            // DOWN(非 repeat) 命中学习绑定（event=ACTION_DOWN 存储），UP 命中标准媒体键。
+            if (page != "steering") {
+                val forward = (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) ||
+                    event.action == KeyEvent.ACTION_UP
+                if (forward) LiteSteeringKeys.onWindowKeyEvent(event.keyCode, event.action)
+            }
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     /**
@@ -942,18 +1055,69 @@ class MainActivity : Activity() {
                     LiteLog.log("ui", "USB 通道连接请求：未发现 Apple VID(0x05ac) USB 设备")
                     return
                 }
-                val consent = try {
-                    VpnService.prepare(this)
+                // vc93：三段式授权。部分 OEM ROM（235521 日志实锤）裁剪了
+                // com.android.vpndialogs，startActivityForResult 直接抛
+                // ActivityNotFoundException 崩溃主线程。顺序：标准对话框 →
+                // root appops 免对话框授权 → 明确报错，任何一步都不许崩。
+                var consent: Intent? = null
+                var prepareBroken = false
+                try {
+                    consent = VpnService.prepare(this)
                 } catch (error: Exception) {
-                    LiteLog.log("ui", "USB 通道：VpnService.prepare 失败 ${error.message}")
-                    null
+                    prepareBroken = true
+                    LiteLog.log("ui", "USB 通道：VpnService.prepare 异常 ${error.message}")
                 }
-                if (consent != null) {
-                    startActivityForResult(consent, REQUEST_VPN_PERMISSION)
-                    LiteLog.log("ui", "USB 通道：请求 VPN 授权")
+                if (!prepareBroken && consent != null) {
+                    var launched = false
+                    try {
+                        startActivityForResult(consent, REQUEST_VPN_PERMISSION)
+                        LiteLog.log("ui", "USB 通道：请求 VPN 授权")
+                        launched = true
+                    } catch (error: Exception) {
+                        LiteLog.log("ui", "USB 通道：VPN 授权对话框无法启动（ROM 疑似裁剪 vpndialogs）：${error.message}")
+                    }
+                    if (launched) return
+                    // 对话框路走不通 → root 兜底：免对话框写 appops 后复检。
+                    if (grantVpnConsentViaRoot()) {
+                        val after = try {
+                            VpnService.prepare(this)
+                        } catch (error: Exception) {
+                            null
+                        }
+                        if (after == null) {
+                            LiteLog.log("ui", "USB 通道：root appops 免对话框授权成功")
+                            startSession(config, key, "usb")
+                            return
+                        }
+                    }
+                    toast("车机 ROM 缺失 VPN 授权组件（vpndialogs），USB 有线模式不可用")
+                    LiteLog.log("ui", "USB 通道：VPN 授权链路全失败（无 root 或 appops 未生效）")
                     return
                 }
-                startSession(config, key, "usb")
+                if (!prepareBroken && consent == null) {
+                    // vc111（T3 排查定案）：KK 的 VPN 授权=mPackage 内存态，异常断开
+                    // （interfaceRemoved）后残留 → VpnService.prepare 返回 null，系统
+                    // 授权框被跳过。mPackage 无公开 API 可清（无 root 不可清），用户诉求
+                    // 「每次点 USB 连接都要人工确认 VPN」→ prepare 放行时弹自家确认框，
+                    // 点确定才开始 establish，语义与系统授权框一致，100% 可控。
+                    showVpnConfirmDialog(config, key)
+                    return
+                }
+                // prepare 本身异常 → 也尝试 root 兜底后复检。
+                if (grantVpnConsentViaRoot()) {
+                    val after = try {
+                        VpnService.prepare(this)
+                    } catch (error: Exception) {
+                        null
+                    }
+                    if (after == null) {
+                        LiteLog.log("ui", "USB 通道：root appops 授权成功（prepare 异常路径）")
+                        startSession(config, key, "usb")
+                        return
+                    }
+                }
+                toast("车机 VPN 授权组件异常，USB 有线模式不可用")
+                LiteLog.log("ui", "USB 通道：VpnService.prepare 异常且 root 兜底未生效")
             }
             else -> {
                 toast("未知连接通道")
@@ -962,11 +1126,61 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * vc111：USB 连接的 VPN 每次确认框（KK mPackage 残留场景，系统框被跳过时兜底）。
+     * 点确定才进入 startSession（真正 establish VPN），取消则中止本次连接。
+     */
+    private fun showVpnConfirmDialog(config: LiteConfig, videoKey: String) {
+        LiteLog.log("ui", "USB 通道：系统 VPN 授权被跳过（mPackage 残留），弹 app 内确认框")
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle("VPN 连接确认")
+            .setMessage("本次 USB 有线连接需要建立 VPN 网络通道，是否继续？")
+            .setPositiveButton("确定") { _, _ ->
+                LiteLog.log("ui", "USB 通道：VPN 确认框点确定，开始建立连接")
+                startSession(config, videoKey, "usb")
+            }
+            .setNegativeButton("取消") { _, _ ->
+                LiteLog.log("ui", "USB 通道：VPN 确认框点取消，中止连接")
+            }
+            .create()
+        dialog.show()
+    }
+
     /** 枚举 USB 设备看是否有 Apple VID（iPhone/iPad），无需任何权限。 */
     private fun hasAppleUsbDevice(): Boolean =
         (getSystemService(USB_SERVICE) as? UsbManager)?.deviceList?.values?.any {
             it.vendorId == APPLE_USB_VENDOR_ID
         } == true
+
+    /** vc93：root 免对话框写 appops 放行 ACTIVATE_VPN（授权组件被裁的 ROM 上绕过对话框）。
+     *  只负责尝试写 op，最终是否生效由调用方复检 VpnService.prepare 判定。
+     *  vc94：原 waitFor() 无超时——su 弹交互授权框无人应答会永久阻塞主线程直至 ANR；
+     *  Process.waitFor(timeout) 是 API24+（minSdk16 不可用），改轮询 exitValue，4s 无果即
+     *  destroy 走失败（低于 5s ANR 线；预授权车机 su 秒回不受影响）。 */
+    private fun grantVpnConsentViaRoot(): Boolean = try {
+        val su = Runtime.getRuntime().exec(arrayOf("su", "-c",
+            "appops set $packageName ACTIVATE_VPN allow"))
+        var exit: Int? = null
+        var waited = 0
+        while (exit == null && waited < 4_000) {
+            Thread.sleep(100)
+            waited += 100
+            try {
+                exit = su.exitValue()
+            } catch (_: IllegalThreadStateException) {
+            }
+        }
+        if (exit == null) {
+            su.destroy()
+            LiteLog.log("ui", "USB 通道：root 免对话框授权超时（4s）")
+            false
+        } else {
+            true
+        }
+    } catch (error: Exception) {
+        LiteLog.log("ui", "USB 通道：root 免对话框授权失败：${error.message}")
+        false
+    }
 
     /** VpnService 授权 / CarIconPage 图库选择的系统回调。 */
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {

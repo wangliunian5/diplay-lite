@@ -328,6 +328,72 @@ class IphoneUsbHost(
                     "alt=${if (Build.VERSION.SDK_INT >= 24) usbMux.alternateSetting else -1} " +
                     "out=0x${endpoints.first.address.toString(16)} in=0x${endpoints.second.address.toString(16)}",
             )
+            // vc106（AC822X 175935 实测定案）：vc103r 共享 fd 后 usbmux claim 先于 NCM
+            // 配置对齐执行，内核按"本 fd 已有 claim"判 EBUSY（suspend release 还失败
+            // ok=false），配置 6 从未切过去（kernelAligned=false）→ NCM 数据面死 →
+            // AirPlay attach 无网。对齐 Legacy 顺序：在 usbmux claim 之前的全新 fd 上
+            // （零 claim 可挡）直接 native SETCONFIGURATION(6)（用户定案硬编码 6）+
+            // GET_CONFIGURATION 回读；之后 NCM 发现层按内核活动配置对齐（vc103o 护栏
+            // 自然跳过重复切配置），EBUSY 分支整体不再走到。
+            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.KITKAT && LegacyUsbHostNative.available) {
+                val preFd = runCatching { connection.fileDescriptor }.getOrDefault(-1)
+                if (preFd >= 0) {
+                    // vc111（T3 两次整机死锁定案）：KK sunxi 内核在重枚举未收敛时收到
+                    // SETCONFIGURATION ioctl 会死锁（卡死点=ioctl 内部，与 legacy 同款，
+                    // 随机竞速）。发 ioctl 前先等枚举收敛：GET_CONFIGURATION 是内核态纯读
+                    // （usbfs 缓存，不发总线事务）零风险，连续两次读数一致 + 至少
+                    // CONVERGE_SETTLE_MILLIS 落定窗才算收敛；已收敛且活动配置=目标值则
+                    // 完全跳过 ioctl（vc109 定稿方案）。
+                    val preReadback0 = NcmUsbBridge.kernelActiveConfiguration(connection)
+                    var converged = false
+                    var settleStart = 0L
+                    var lastRead = preReadback0
+                    val convergeDeadline = System.currentTimeMillis() + CONVERGE_TIMEOUT_MILLIS
+                    while (System.currentTimeMillis() < convergeDeadline) {
+                        Thread.sleep(CONVERGE_POLL_MILLIS)
+                        val now = NcmUsbBridge.kernelActiveConfiguration(connection)
+                        if (now != null && now == lastRead && now > 0) {
+                            if (settleStart == 0L) settleStart = System.currentTimeMillis()
+                            if (System.currentTimeMillis() - settleStart >= CONVERGE_SETTLE_MILLIS) {
+                                converged = true
+                                break
+                            }
+                        } else {
+                            settleStart = 0L
+                        }
+                        lastRead = now
+                    }
+                    NcmClaimTrace.trace(
+                        "vc111 converge wait: initial=$preReadback0 settled=$lastRead converged=$converged",
+                    )
+                    report(
+                        "vc111 converge wait: initial=$preReadback0 settled=$lastRead converged=$converged",
+                    )
+                    if (converged && lastRead == CARPLAY_USB_CONFIG_VALUE) {
+                        NcmClaimTrace.trace(
+                            "vc111 pre-usbmux-claim skip setConfiguration: readback=$lastRead==target",
+                        )
+                        report(
+                            "vc111 pre-usbmux-claim skip setConfiguration: readback=$lastRead==target",
+                        )
+                    } else {
+                        val preErrno = try {
+                            LegacyUsbHostNative.setConfiguration(preFd, CARPLAY_USB_CONFIG_VALUE)
+                        } catch (_: LinkageError) {
+                            -1
+                        }
+                        val preReadback = NcmUsbBridge.kernelActiveConfiguration(connection)
+                        NcmClaimTrace.trace(
+                            "vc111 pre-usbmux-claim setConfiguration($CARPLAY_USB_CONFIG_VALUE)" +
+                                " errno=$preErrno readback=$preReadback",
+                        )
+                        report(
+                            "vc111 pre-usbmux-claim setConfiguration($CARPLAY_USB_CONFIG_VALUE)" +
+                                " errno=$preErrno readback=$preReadback",
+                        )
+                    }
+                }
+            }
             if (!connection.claimInterface(usbMux, true)) {
                 throw IphoneUsbException.DeviceUnavailable(
                     "Android could not claim USBMUX interface ${usbMux.id} (attempt#$attempt)",
@@ -335,7 +401,8 @@ class IphoneUsbHost(
             }
             report("attempt#$attempt usbmux interface claimed")
             // claim 生命周期由 Iap2UsbSession（close 释放接口+关连接）接管。
-            Iap2UsbSession(connection, endpoints.first, endpoints.second, debugSink)
+            // vc103q：传入接口对象供 suspend/resume claim（NCM 强切配置时临时让路）。
+            Iap2UsbSession(connection, endpoints.first, endpoints.second, usbMux, debugSink)
         }
 
     /**
@@ -419,6 +486,12 @@ class IphoneUsbHost(
         private const val CARPLAY_CONFIGURATION_REQUEST = 0x52
         private const val CARPLAY_CONFIGURATION_INDEX = 0x0004
         private const val VENDOR_RESPONSE_LENGTH = 1
+        // vc106：CarPlay 配置值（用户定案硬编码，T3/AC822X 实测该值承载 NCM 功能）
+        private const val CARPLAY_USB_CONFIG_VALUE = 6
+        // vc111（T3 死锁防护）：重枚举收敛等待参数。
+        private const val CONVERGE_POLL_MILLIS = 100L
+        private const val CONVERGE_SETTLE_MILLIS = 300L
+        private const val CONVERGE_TIMEOUT_MILLIS = 5000L
         private const val CONTROL_TRANSFER_TIMEOUT_MILLIS = 1_000
 
         // 1.0.2：USBMUX 会话打开的落定等待与重试——重枚举 attach 后立即
@@ -439,12 +512,58 @@ class Iap2UsbSession internal constructor(
     private val connection: UsbDeviceConnection,
     private val outEndpoint: UsbEndpoint,
     private val inEndpoint: UsbEndpoint,
+    private val usbMuxInterface: UsbInterface?,
     private val debugSink: ((String) -> Unit)? = null,
 ) : Closeable {
     private val stateLock = Any()
     private val readLock = Any()
     private val writeLock = Any()
     private var closed = false
+
+    /**
+     * vc103q（T3 终审）：NCM 打开前强切 CarPlay 配置时，usbfs 全设备级 EBUSY 由本会话的
+     * usbmux claim 挡路（跨 fd 无法释放，只能本 fd 自己放）。挂起=临时 releaseInterface，
+     * 恢复=重新 claim（force=true）+ SET_INTERFACE(1,2)（配置 6 下 usbmux 0x04/0x85 端点
+     * 在接口 1 的 alt-2，重 claim 后必须显式切 alt 才能继续收发）。
+     * 挂起期间读写会失败——仅在 NCM 打开的同步窗口内使用，窗口外禁止调用。
+     */
+    fun suspendUsbmuxClaim(): Boolean {
+        val usbInterface = usbMuxInterface ?: return false
+        return try {
+            connection.releaseInterface(usbInterface).also { ok ->
+                debugSink?.invoke("vc103q suspendUsbmuxClaim releaseInterface(${usbInterface.id}) ok=$ok")
+            }
+        } catch (error: Throwable) {
+            debugSink?.invoke("vc103q suspendUsbmuxClaim error=${error.message}")
+            false
+        }
+    }
+
+    /**
+     * vc103r（Legacy 对齐）：NCM 复用本会话的同一 USB 连接 fd——Legacy 要求 usbmux 与
+     * NCM 共享 fd（内核 claim 位图按 fd 记账，双 fd 状态割裂；KK 第二 fd claim 恒 ENOENT）。
+     * 仅供 transport/orchestration 内部使用；连接生命周期仍归本会话（close 时统一关闭）。
+     */
+    internal fun sharedConnection(): UsbDeviceConnection = connection
+
+    fun resumeUsbmuxClaim(): Boolean {
+        val usbInterface = usbMuxInterface ?: return false
+        return try {
+            val claimed = connection.claimInterface(usbInterface, true)
+            if (claimed && LegacyUsbHostNative.available) {
+                val fd = runCatching { connection.fileDescriptor }.getOrDefault(-1)
+                if (fd >= 0) {
+                    val errno = LegacyUsbHostNative.setInterface(fd, usbInterface.id, 2)
+                    debugSink?.invoke("vc103q resumeUsbmuxClaim SET_INTERFACE(${usbInterface.id},2) errno=$errno")
+                }
+            }
+            debugSink?.invoke("vc103q resumeUsbmuxClaim claimInterface(${usbInterface.id}) ok=$claimed")
+            claimed
+        } catch (error: Throwable) {
+            debugSink?.invoke("vc103q resumeUsbmuxClaim error=${error.message}")
+            false
+        }
+    }
 
     /** 1.0.5：EMUI 等 ROM 的异步读（requestWait(timeout)）不可用时置位，读全部走同步。 */
     @Volatile private var asyncReadBroken = false

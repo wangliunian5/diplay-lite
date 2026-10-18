@@ -128,6 +128,9 @@ class AirPlayTcpServer {
             // attachment.config 同步为实际端口，下游（会话/诊断）读到的 port 恒为真值。
             attachment = replacement.copy(config = replacement.config.copy(port = port))
             serverSocket = server
+            // vc94：bindOnce 失败路径的 releaseLocked() 会把 active 置 false——回退绑定成功后
+            // 必须复位，否则 acceptLoop 首判即退，iPhone 连入无会话（Started(port) 已返回，假活）。
+            active.set(true)
             val generation = ++attachGeneration
             Thread(
                 { acceptLoop(generation, server) },

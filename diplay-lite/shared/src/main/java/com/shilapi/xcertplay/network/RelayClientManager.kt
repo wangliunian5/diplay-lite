@@ -29,14 +29,39 @@ class RelayClientManager(
 
     private val appContext = context.applicationContext
 
+    // vc81 中继链路抗抖动：中继模式下本机是随身WiFi 的 STA 客户端，Android 默认省电轮询
+    // 会造成 100~900ms 级突发断供（C8815 实测：视频 rx=6.8fps、音频输入 maxGap 389~934ms、
+    // queuedMs 180~1427ms 震荡，听感一卡一卡）。持高性能 Wi-Fi 锁禁用省电，会话期间持有。
+    @Volatile
+    private var wifiLock: WifiManager.WifiLock? = null
+
     @Volatile
     private var closed = false
 
     override fun start(timeoutMillis: Long): WirelessHotspotInfo {
         val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             ?: throw IOException("Wi-Fi service is unavailable on this device")
+        // vc83：发起即自动开 WiFi——车机 WiFi 开关关闭时旧路径直接抛「Wi-Fi is off」，
+        // 用户第一次点击永远白点、必须手开 WiFi 后点第二次（082530 日志 tap1 实证）。
         if (!wifi.isWifiEnabled) {
-            throw IOException("Wi-Fi is off. Turn on Wi-Fi to use the relay channel.")
+            onDiagnostic("relay: Wi-Fi is off, enabling automatically")
+            @Suppress("DEPRECATION")
+            wifi.setWifiEnabled(true)
+            val enableDeadline = System.currentTimeMillis() + WIFI_ENABLE_WAIT_MILLIS
+            while (!wifi.isWifiEnabled && System.currentTimeMillis() < enableDeadline) {
+                try {
+                    Thread.sleep(WIFI_ENABLE_POLL_MILLIS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
+            if (!wifi.isWifiEnabled) {
+                throw IOException(
+                    "Wi-Fi could not be enabled automatically. Turn on Wi-Fi to use the relay channel.",
+                )
+            }
+            onDiagnostic("relay: Wi-Fi enabled")
         }
 
         val netId = attachNetwork(wifi)
@@ -63,6 +88,7 @@ class RelayClientManager(
                         val gw = intToInetAddress(dhcp.gateway)?.hostAddress ?: "none"
                         onDiagnostic("relay: joined ssid='$ssid' host=$hostAddress gw=$gw")
                         verifyGatewayReachable(dhcp.gateway)
+                        acquireWifiLock(wifi)
                         return buildInfo(wifi, info, hostAddress)
                     }
                 }
@@ -83,6 +109,26 @@ class RelayClientManager(
         closed = true
         // 故意不断开 Wi-Fi：连接外部网络是用户可感知的系统状态，teardown 后保留连接，
         // 重试（ensure 幂等）与用户查看网络都不受影响。
+        // WifiLock 同理随会话释放（失败重试 keepForReuse 时 ensure 幂等会重新走 start）。
+        try {
+            wifiLock?.release()
+        } catch (_: Exception) {
+        }
+        wifiLock = null
+    }
+
+    /** 幂等持锁：WIFI_MODE_FULL_HIGH_PERF（API12+，本模块最低 API16 可用），失败降级不抛。 */
+    private fun acquireWifiLock(wifi: WifiManager) {
+        if (wifiLock != null) return
+        try {
+            val lock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "diplay-relay")
+            lock.setReferenceCounted(false)
+            lock.acquire()
+            wifiLock = lock
+            onDiagnostic("relay: WifiLock FULL_HIGH_PERF acquired")
+        } catch (e: Exception) {
+            onDiagnostic("relay: WifiLock acquire failed (non-fatal): ${e.message}")
+        }
     }
 
     /** 已配置过的同名网络直接复用；否则新增一条（WPA2 或开放）。返回生效的 networkId。 */
@@ -93,7 +139,45 @@ class RelayClientManager(
             null
         }
         val netId = if (existing != null) {
-            onDiagnostic("relay: reusing configured network id=${existing.networkId}")
+            // vc94：命中同名网络时校验 PSK 一致性——用户改中继热点密码后，存量配置仍指向
+            // 旧密码，无条件复用会让 join 恒超时（无法自愈）。不一致即就地 updateNetwork 覆盖。
+            val pskChanged = if (passphrase.isNotEmpty()) {
+                existing.preSharedKey != quoted(passphrase)
+            } else {
+                // 本次配置为开放网络，但存量带 PSK → 需清空才能转开放。
+                !existing.preSharedKey.isNullOrEmpty()
+            }
+            if (!pskChanged) {
+                onDiagnostic("relay: reusing configured network id=${existing.networkId}")
+            } else {
+                onDiagnostic(
+                    "relay: configured network id=${existing.networkId} PSK mismatch " +
+                        "(stored=${existing.preSharedKey?.length ?: 0} chars) — updating",
+                )
+                val config = WifiConfiguration().apply {
+                    SSID = quoted(ssid)
+                    networkId = existing.networkId
+                    if (passphrase.isNotEmpty()) preSharedKey = quoted(passphrase) else preSharedKey = ""
+                }
+                val updated = wifi.updateNetwork(config)
+                if (updated < 0) {
+                    onDiagnostic("relay: updateNetwork failed (code=$updated); falling back to add")
+                    wifi.removeNetwork(existing.networkId)
+                    val added = wifi.addNetwork(
+                        WifiConfiguration().apply {
+                            SSID = quoted(ssid)
+                            if (passphrase.isNotEmpty()) preSharedKey = quoted(passphrase)
+                        },
+                    )
+                    if (added < 0) {
+                        throw IOException(
+                            "Updating relay network '$ssid' password failed (code=$added)",
+                        )
+                    }
+                    onDiagnostic("relay: re-added network id=$added with current password")
+                    return finishJoin(wifi, added)
+                }
+            }
             existing.networkId
         } else {
             val config = WifiConfiguration().apply {
@@ -109,6 +193,11 @@ class RelayClientManager(
             onDiagnostic("relay: added network id=$added")
             added
         }
+        return finishJoin(wifi, netId)
+    }
+
+    /** enableNetwork + reconnect + DHCP 轮询共用尾段（vc94 从 attachNetwork 拆出）。 */
+    private fun finishJoin(wifi: WifiManager, netId: Int): Int {
         wifi.disconnect()
         if (!wifi.enableNetwork(netId, true)) {
             throw IOException("Enabling relay network '$ssid' failed")
@@ -119,11 +208,11 @@ class RelayClientManager(
         return netId
     }
 
-    /** AP 隔离/连错网自检：网关 2s×2 次 ping 不通 → 显性报错（归类确定性失败，不烧重试额度）。 */
+    /** AP 隔离/连错网自检：网关 3s×4 次 ping 不通 → 显性报错（归类确定性失败，不烧重试额度）。 */
     private fun verifyGatewayReachable(gateway: Int) {
         val gatewayAddress = intToInetAddress(gateway)
             ?: throw IOException("RELAY_UNREACHABLE: relay network returned no gateway")
-        for (attempt in 1..2) {
+        for (attempt in 1..REACHABLE_ATTEMPTS) {
             if (closed) throw IOException("Relay client closed during reachability check")
             try {
                 if (gatewayAddress.isReachable(REACHABLE_TIMEOUT_MILLIS)) {
@@ -203,7 +292,14 @@ class RelayClientManager(
 
     private companion object {
         private const val POLL_INTERVAL_MILLIS = 500L
-        private const val REACHABLE_TIMEOUT_MILLIS = 2_000
-        private const val REACHABLE_RETRY_DELAY_MILLIS = 300L
+        // vc95：网关探测放宽 2s×2 → 3s×4（间隔 1s）——手机热点（小米等）DHCP 出租后
+        // AP 数据面有几秒到几十秒启动窗口，ICMP 不回属瞬时假阴性，2s×2（实际 ~4.3s
+        // 全程）太短，用户被迫手动重试；放宽后覆盖窗口期，总上限 ~15s。
+        private const val REACHABLE_TIMEOUT_MILLIS = 3_000
+        private const val REACHABLE_RETRY_DELAY_MILLIS = 1_000L
+        private const val REACHABLE_ATTEMPTS = 4
+        // vc83：自动开 WiFi 的等待上限与轮询步长。
+        private const val WIFI_ENABLE_WAIT_MILLIS = 8_000L
+        private const val WIFI_ENABLE_POLL_MILLIS = 200L
     }
 }

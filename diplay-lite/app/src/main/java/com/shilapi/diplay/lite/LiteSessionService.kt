@@ -146,6 +146,11 @@ class LiteSessionService : Service() {
 
         override fun onDebugLog(message: String) {
             LiteLog.log("airplay", message)
+            // vc96（FE-6 断链取证）：wedge/断链事件触发内核级快照（sysfs 设备树 + dmesg 尾部），
+            // 回答「谁先动手」（iPhone 侧复位 vs host 端口楔死）。探针未启用（无 root）时 no-op。
+            if (message.contains("ncm inbound stalled") || message.contains("wired NCM bridge error")) {
+                Thread { WiredUsbForensics.snapshot(reason = message.take(120)) }.start()
+            }
         }
     }
 
@@ -174,6 +179,13 @@ class LiteSessionService : Service() {
         // M6k16：通道由主页 Intent 带入（car/relay）；START_STICKY 自启 intent 为 null 时沿用上一轮。
         intent?.getStringExtra(EXTRA_CHANNEL)?.let { requestedChannel = it }
         registerBtProbe()
+        // vc96（FE-6 断链取证）：root 可用则启动内核 USB 事件探针（dmesg 增量进 LiteLog）；
+        // 无 root 静默关闭。断链/wedge 时 WiredUsbForensics.snapshot 抓设备树快照。
+        WiredUsbForensics.start()
+        // vc102 副屏探测：会话启动时再查一次（捕捉倒车屏/仪表投射屏等动态副屏），写日志无 UI。
+        ClusterDisplayProbe.probe(this)
+        // vc102 状态栏探针：会话期顶栏占用正是用户报的场景，session-start 取全局窗口清单。
+        StatusBarProbe.probe(this, "session-start")
         startController()
         return START_STICKY
     }
@@ -186,6 +198,8 @@ class LiteSessionService : Service() {
         // （stopService 后新实例启动 / 进程内重建重启后立即重连）先等它关闭 —— 否则残留的
         // 7000 监听/解码器会让新会话起不来、UI 永远停在"连接中"（10-02 EADDRINUSE 跨实例形态）。
         LiteSteeringKeys.detach()
+        // vc96：停 root USB 取证探针（幂等，未启动时 no-op）。
+        WiredUsbForensics.stop()
         unregisterBtProbe()
         controller?.let { closingController = it; it.close() }
         controller = null
@@ -233,10 +247,10 @@ class LiteSessionService : Service() {
         if (usb) {
             // U4 USB 有线：不走 Wi-Fi/蓝牙段，热点凭据校验全部跳过。
         } else if (relay && config.relaySsid.isBlank()) {
-            fail("中继热点 SSID 未配置")
+            fail("当前是中继热点模式，未配置SSID，无法连接")
             return
         } else if (!relay && config.ssid.isBlank()) {
-            fail("车机热点 SSID 未配置")
+            fail("当前是车机热点模式，未配置SSID，无法连接")
             return
         }
         val ssid = if (usb) "" else if (relay) config.relaySsid else config.ssid
@@ -263,6 +277,16 @@ class LiteSessionService : Service() {
         val full = if (config.resolutionMode == "manual") manualMetrics(config) else screenMetrics()
         val fps = if (config.limit30Fps) AirPlayDisplaySettings.MIN_FPS else AirPlayDisplaySettings.DEFAULT_FPS
         val size = scaleDisplay(full, config.videoScalePercent)
+        // fe6t1（FE-6 黑边/拉伸规避试验）：/info 声明官方支持比例。真实屏 1920x620（96:31）
+        // 在 MFi 官方列表外——iOS 首连接受声明（全屏无黑边但图标拉伸）、重连回退 16:9
+        // （keep-aspect 黑边 409px/侧）。改为声明官方超宽 8:3（高 snap 到 宽*3/8）：
+        // iOS 对官方比例稳定输出且 UI 正常排布，渲染层 keep-aspect 后黑边收窄到
+        // ~133px/侧。仅当声明纵横比比 8:3 更宽时才 snap，正常 16:9/8:3 屏不受影响。
+        val declared = if (size.second * 8 < size.first * 3) {
+            val snapped = size.first * 3 / 8
+            LiteLog.log("service", "fe6t1 声明覆盖: ${size.first}x${size.second} -> ${size.first}x${snapped} (官方 8:3)")
+            size.first to snapped
+        } else size
         LiteLog.log(
             "service",
             "构造 CarPlayController deviceId=$deviceId btMac=$btMac " +
@@ -280,8 +304,8 @@ class LiteSessionService : Service() {
         ecarxBridge = bridge
         bridge.activate()
         val sink = AndroidMediaSink(
-            videoWidth = size.first,
-            videoHeight = size.second,
+            videoWidth = declared.first,
+            videoHeight = declared.second,
             // M6e：强制软件解码视频（默认关）。重连即生效（解码器每次建流都会重建）。
             preferSoftwareHevcDecoder = config.softwareVideoDecoder,
             onAudioDiagnostic = { LiteLog.log("media", it) },
@@ -310,8 +334,24 @@ class LiteSessionService : Service() {
                 "mode=${am.mode} scoOn=${am.isBluetoothScoOn} a2dpOn=${am.isBluetoothA2dpOn} " +
                     "wiredHeadset=${am.isWiredHeadsetOn} speakerphoneOn=${am.isSpeakerphoneOn}"
             },
+            // 1.1.5/e5t1(vc85)：麦克风静音位检查/自动恢复——EU5 QG DSP 仲裁链可能在
+            // Android 层留 mute 位（setMicMute 全栈无错可报），上行启动前检测并解除。
+            microphoneMuteRestore = {
+                val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+                if (am.isMicrophoneMute) {
+                    @Suppress("DEPRECATION") am.setMicrophoneMute(false)
+                    // 复检确认（个别 HAL 解除异步，读回仍 mute 也要留证）。
+                    val after = am.isMicrophoneMute
+                    "was-muted→unmute issued, readback=${if (after) "still-muted" else "clean"}"
+                } else {
+                    "clean"
+                }
+            },
             // 1.1.4：CarPlay 媒体流首包 → ECARX 桥显式抢源。
             onMediaPlaybackStarted = { bridge.onCarPlayMediaStarted() },
+            // 1.1.6(vc76)：媒体断供看门狗（音视频双静默 20s）→ 编排层整代回收。
+            // sink 先于 controller 构造，经 service 字段间接引用（调用时已就绪）。
+            onMediaStall = { this@LiteSessionService.controller?.notifyWirelessMediaStall() },
         )
         // 麦克风上行：RECORD_AUDIO 在 targetSdk19 下安装即授予，原生分支同样按“可用”声明。
         val engine = CarPlayMediaEngine(sink = sink, microphoneEnabled = true)
@@ -345,8 +385,7 @@ class LiteSessionService : Service() {
                     // 会话永远建不起来）。C8815 之所以"碰巧"正常，是因为 API16 的
                     // NetworkInterface.getIndex 取不到（回退 0），IPv6 分支被跳过而落到 IPv4。
                     // RELAY：双 client 接随身WiFi，manualHotspotSsid/Passphrase 字段复用为中继凭据。
-                    wirelessHotspotMode =
-                        if (relay && !usb) WirelessHotspotMode.RELAY else WirelessHotspotMode.MANUAL_IPV4,
+                    wirelessHotspotMode = if (relay && !usb) WirelessHotspotMode.RELAY else WirelessHotspotMode.MANUAL_IPV4,
                     manualHotspotSsid = if (usb) null else ssid,
                     manualHotspotPassphrase = when {
                         usb -> null
@@ -363,6 +402,8 @@ class LiteSessionService : Service() {
                     // （0=自动）；relay 复用凭据字段不吃信道、usb 无热点，均保持 0。
                     manualHotspotChannel = if (usb || relay) 0 else config.carIpv4Channel,
                     wirelessBluetoothDeviceAddress = config.bluetoothAddress.takeIf { it.isNotBlank() },
+                    // 1.1.6(vc76)：TS7 无 root 裁决实验——本包关闭有线 cdc_ncm 解绑守护。
+                    wiredNcmGuardEnabled = BuildConfig.WIRED_NCM_GUARD_ENABLED,
                 ),
                 airPlayConfig = AirPlayConfig(
                     // 1.0.17：显示名称可自定义（自定义返回图标页），默认 DiPlay；流向 /info name + Bonjour 服务名。
@@ -371,8 +412,8 @@ class LiteSessionService : Service() {
                     btMac = btMac,
                     sourceVersion = "950.7.1",
                     main = AirPlayDisplayConfig(
-                        widthPixels = size.first,
-                        heightPixels = size.second,
+                        widthPixels = declared.first,
+                        heightPixels = declared.second,
                         fps = fps,
                     ),
                     manufacturer = "DiPlay",
@@ -483,12 +524,12 @@ class LiteSessionService : Service() {
             }
             "could not join relay network" in m ->
                 "加入中继网络超时：请核对随身WiFi名称/密码，确认车机Wi-Fi已开启"
-            "relay ssid is not configured" in m -> "中继SSID未配置，请先在「中继热点 → 配置」填写"
+            "relay ssid is not configured" in m -> "当前是中继热点模式，未配置SSID，无法连接"
             "adding relay network" in m -> "添加中继网络失败：请核对随身WiFi密码"
             "enabling relay network" in m -> "启用中继网络失败，请重试"
             "wi-fi is off" in m -> "车机Wi-Fi未开启：中继模式需先打开Wi-Fi"
             "car hotspot is off" in m -> "车机热点未开启：请到车机设置打开热点后重试"
-            "manual hotspot ssid is not configured" in m -> "车机热点SSID未配置，请先在「车机热点 → 配置」填写"
+            "manual hotspot ssid is not configured" in m -> "当前是车机热点模式，未配置SSID，无法连接"
             "could not establish" in m && "hotspot" in m ->
                 "建立网络失败：${message.substringAfterLast(": ", message)}"
             "bluetooth adapter is unavailable" in m -> "蓝牙适配器不可用"

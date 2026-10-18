@@ -54,7 +54,13 @@ object AirPlayInfoPlist {
                 config.opusEncoderAvailable,
             )
         }
-        info["extendedFeatures"] = listOf("vocoderInfo", "enhancedRequestCarUI")
+        // fe6t5 试验（vc92，无开关直接关）：移除 "enhancedRequestCarUI" —— 它是 /info 层唯一
+        // 主动宣告「支持增强式 Siri 请求车机 UI」的声明位，疑为 FE-6 Siri 后无声
+        // （iPhone 进 Siri 拆媒体音频流、结束后不再重发 SETUP，diplay-20261015-110554 实证）
+        // 的协商载体。注意：SETUP 响应的 enabledFeatures 本就只回基础能力（不回 enhancedSiri），
+        // TS7/8815 与 FE-6 在该通路上完全一致，故关闭点收敛到 extendedFeatures。
+        // 若试验导致会话被拒/回退，恢复值为 listOf("vocoderInfo", "enhancedRequestCarUI")。
+        info["extendedFeatures"] = listOf("vocoderInfo")
         info["displays"] = displays
         info["hidDevices"] = listOf(
             AirPlayHid.touchHidDevice(config.main.widthPixels, config.main.heightPixels, MAIN_UUID),

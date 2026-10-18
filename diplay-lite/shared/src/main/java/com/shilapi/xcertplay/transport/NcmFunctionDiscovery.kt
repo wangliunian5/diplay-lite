@@ -29,6 +29,8 @@ object NcmFunctionDiscovery {
         val statusIn: UsbEndpoint?,
         val bulkIn: UsbEndpoint,
         val bulkOut: UsbEndpoint,
+        // vc103o：true = 已按内核真实活动配置（sysfs）对齐发现，openOnce 无需再切配置。
+        val kernelAligned: Boolean = false,
     )
 
     /** API16 适配：UsbConfiguration 是 API 21+；< 21 走 [findLegacy]（默认配置接口扫描）。 */
@@ -94,8 +96,132 @@ object NcmFunctionDiscovery {
                 }
             }
         } else {
+            // vc103p：findKernelAligned 需要 rawDescriptors（connection 才有），调用点上移至
+            // CarPlayController.openNcmOnce（openDevice 后调）；此处维持 legacy 扫描。
             findLegacy(device)
         }
+
+    /**
+     * vc103p（T3 终审·第三版）：KK 上 framework 接口缓存 = 设备添加时刻的活动配置布局，
+     * 之后内核被切配置（legacy 残留/RESET/重试）即错位——实测 T3：framework=配置 5 布局
+     * （control=2/data=3/EP 0x87+0x05），内核停配置 6（IF3=NCM control 0x87 INTR、
+     * IF4=NCM data 0x88/0x06），App 拿 5 的地图走 6 的路：claim(2) 误中 AppleEthernet、
+     * SET_INTERFACE(3,1) 撞 control 无 alt1（EINVAL=22）、裸 URB 0x87 打在 INTR 端点上
+     * 假阳性存活、数据面全程死读 → iPhone mDNS 无应答 → 0x4301 静默。
+     *
+     * 数据源（T3 实测定案）：
+     * - sysfs bConfigurationValue = 内核真实活动配置值（KK 可读，实测=6）；
+     * - 接口目录下**无 ep_* 子目录**（KK sunxi 内核未导出）→ 端点拓扑改从
+     *   [rawDescriptors] 解析（/dev/bus/usb 节点 blob，实测 858B 含全部 6 个配置）。
+     *
+     * 返回按「内核活动配置拓扑 + framework 对象」拼装的 NcmFunction：UsbInterface 仅按
+     * id 用于 claim ioctl（class 标签错位无碍）；UsbEndpoint 按地址跨接口搜索（usbfs
+     * bulkTransfer 仅按地址构造 URB，端点类型以内核表为准）。kernelAligned=true 时
+     * NcmUsbBridge.openOnce 跳过 pre-claim 切配置。sysfs 不可读/拓扑缺失返 null 走 legacy。
+     */
+    fun findKernelAligned(device: UsbDevice, rawDescriptors: ByteArray?): NcmFunction? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) return null
+        if (rawDescriptors == null || rawDescriptors.size < 18 + 9) return null
+        return try {
+            val root = File("/sys/bus/usb/devices")
+            val vendor = "%04x".format(device.vendorId)
+            val product = "%04x".format(device.productId)
+            val dirs = root.listFiles() ?: return null
+            val devDir = dirs.firstOrNull { dir ->
+                !dir.name.contains(":") &&
+                    runCatching {
+                        File(dir, "idVendor").readText().trim().equals(vendor, ignoreCase = true) &&
+                            File(dir, "idProduct").readText().trim().equals(product, ignoreCase = true)
+                    }.getOrDefault(false)
+            } ?: return null
+            val kernelConfig = File(devDir, "bConfigurationValue").readText().trim().toIntOrNull()
+                ?: return null
+            // 解析 rawDescriptors 中 bConfigurationValue==kernelConfig 的配置段拓扑。
+            val raw = rawDescriptors
+            var off = 18
+            var cfgVal = -1
+            var curIface = -1
+            var ctrlId = -1
+            var statusAddr = -1
+            var dataId = -1
+            var inAddr = -1
+            var outAddr = -1
+            var ctrlIdHit = -1
+            var statusAddrHit = -1
+            var dataIdHit = -1
+            var inAddrHit = -1
+            var outAddrHit = -1
+            while (off + 2 <= raw.size) {
+                val len = raw[off].toInt() and 0xff
+                if (len < 2 || off + len > raw.size) break
+                when (raw[off + 1].toInt() and 0xff) {
+                    0x02 -> if (len >= 9) {
+                        if (cfgVal == kernelConfig && ctrlId >= 0 && dataId >= 0 && inAddr >= 0) {
+                            ctrlIdHit = ctrlId; statusAddrHit = statusAddr
+                            dataIdHit = dataId; inAddrHit = inAddr; outAddrHit = outAddr
+                        }
+                        cfgVal = raw[off + 5].toInt() and 0xff
+                        curIface = -1; ctrlId = -1; statusAddr = -1
+                        dataId = -1; inAddr = -1; outAddr = -1
+                    }
+                    0x04 -> if (len >= 9) {
+                        curIface = raw[off + 2].toInt() and 0xff
+                        val cls = raw[off + 5].toInt() and 0xff
+                        val sub = raw[off + 6].toInt() and 0xff
+                        if (cfgVal == kernelConfig) {
+                            if (cls == CONTROL_CLASS && sub == CONTROL_SUBCLASS && ctrlId < 0) ctrlId = curIface
+                            if (cls == DATA_CLASS && dataId < 0) dataId = curIface
+                        }
+                    }
+                    0x05 -> if (len >= 7 && cfgVal == kernelConfig) {
+                        val addr = raw[off + 2].toInt() and 0xff
+                        val epType = raw[off + 3].toInt() and 0x03
+                        when {
+                            epType == 2 && (addr and 0x80) != 0 && curIface == dataId && inAddr < 0 -> inAddr = addr
+                            epType == 2 && (addr and 0x80) == 0 && curIface == dataId && outAddr < 0 -> outAddr = addr
+                            epType == 3 && (addr and 0x80) != 0 && curIface == ctrlId && statusAddr < 0 -> statusAddr = addr
+                        }
+                    }
+                }
+                off += len
+            }
+            if (cfgVal == kernelConfig && ctrlId >= 0 && dataId >= 0 && inAddr >= 0) {
+                ctrlIdHit = ctrlId; statusAddrHit = statusAddr
+                dataIdHit = dataId; inAddrHit = inAddr; outAddrHit = outAddr
+            }
+            if (ctrlIdHit < 0 || dataIdHit < 0 || inAddrHit < 0) return null
+            val allIfs = (0 until device.interfaceCount).map(device::getInterface)
+            val control = allIfs.firstOrNull { it.id == ctrlIdHit } ?: return null
+            val data = allIfs.firstOrNull { it.id == dataIdHit } ?: return null
+            var bulkIn: UsbEndpoint? = null
+            var bulkOut: UsbEndpoint? = null
+            var statusIn: UsbEndpoint? = null
+            for (iface in allIfs) {
+                for (i in 0 until iface.endpointCount) {
+                    val ep = iface.getEndpoint(i)
+                    if (ep.address == inAddrHit &&
+                        ep.direction == UsbConstants.USB_DIR_IN &&
+                        ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK
+                    ) bulkIn = ep
+                    if (outAddrHit >= 0 &&
+                        ep.address == outAddrHit &&
+                        ep.direction == UsbConstants.USB_DIR_OUT &&
+                        ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK
+                    ) bulkOut = ep
+                    if (statusAddrHit > 0 &&
+                        ep.address == statusAddrHit &&
+                        ep.direction == UsbConstants.USB_DIR_IN &&
+                        ep.type == UsbConstants.USB_ENDPOINT_XFER_INT
+                    ) statusIn = ep
+                }
+            }
+            bulkIn ?: return null
+            bulkOut ?: return null
+            NcmFunction(control, data, statusIn, bulkIn, bulkOut, kernelAligned = true)
+        } catch (_: Throwable) {
+            null
+        }
+    }
 
     /**
      * 1.0.3：UsbInterface.getAlternateSetting() 是 API 24+（at8317 实测 API17

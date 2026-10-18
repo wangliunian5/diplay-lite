@@ -13,4 +13,4 @@ dependencyResolutionManagement {
     }
 }
 rootProject.name = "diplay-lite"
-include(":app", ":shared")
+include(":app", ":shared", ":blackbar")

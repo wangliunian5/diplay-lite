@@ -48,13 +48,131 @@ class WiredVpnService : VpnService() {
             Log.w(TAG, "wired vpn establish failed: ${error.message}")
             null
         }
+        if (tun != null) {
+            ensureFe80Route()
+            ensureTunMulticast()
+        }
         synchronized(lock) {
+            // vc94：快速重连二次 startService 而 request() 未再调用时（或并发竞态），旧 fd 会被
+            // 直接覆盖泄漏——establish 前先关存量 fd（request() 路径此时已置 null，no-op）。
+            established?.let { runCatching { it.close() } }
             established = tun
             latch.countDown()
         }
         // 不常驻：fd 交付后即可停止；控制器持有 fd 的所有权。
         stopSelf(startId)
         return START_NOT_STICKY
+    }
+
+    /**
+     * vc109（T3/KK 3.10 实测定案，pcap+ipv6_route 双证据）：KK 的 ConnectivityService
+     * 会把 addRoute("fe80::",64) **静默丢弃**（/proc/net/ipv6_route 无任何 tun 条目，
+     * API29 上正常）——后果链：iPhone SYN 到达 TUN → 内核 TCP 回 SYN-ACK 查不到去往
+     * 对端 fe80:: 的路由 → 落到 wlan0 出真实网络 → AirPlay 永不建链（零 TCP 出向帧）。
+     * 建立 TUN 后校验内核路由表，缺失且有 root（T3 有 /system/xbin/su）时补挂；
+     * 无 root 仅记录不阻塞（FE-6 等 5.1+ 机型 addRoute 生效，不会走到这里）。
+     */
+    private fun ensureFe80Route() {
+        try {
+            val dev = findTunInterface()
+            if (dev == null) {
+                Log.w(TAG, "wired vpn route check: no tun interface found")
+                return
+            }
+            if (hasFe80Route(dev)) {
+                Log.i(TAG, "wired vpn fe80 route present on $dev")
+                return
+            }
+            val add = "ip -6 route add fe80::/64 dev $dev"
+            var repaired = false
+            for (shell in arrayOf(arrayOf("su", "-c", add), arrayOf("/system/xbin/su", "-c", add))) {
+                try {
+                    val proc = Runtime.getRuntime().exec(shell)
+                    val exit = proc.waitFor()
+                    val out = proc.inputStream.bufferedReader().use { it.readText() }.trim()
+                    proc.destroy()
+                    if (hasFe80Route(dev)) {
+                        Log.i(TAG, "wired vpn fe80 route repaired via $shell exit=$exit out=$out")
+                        repaired = true
+                        break
+                    }
+                } catch (error: Throwable) {
+                    Log.w(TAG, "wired vpn route repair attempt failed: ${error.message}")
+                }
+            }
+            if (!repaired) {
+                Log.w(TAG, "wired vpn fe80 route still missing on $dev; AirPlay connect will stall")
+            }
+        } catch (error: Throwable) {
+            Log.w(TAG, "wired vpn route check failed: ${error.message}")
+        }
+    }
+
+    /**
+     * vc123（T3/KK 实测定案）：VpnService 建出的 tun 接口**缺 MULTICAST 标志**
+     * （<POINTOPOINT,UP,LOWER_UP>，igmp6 组成员已 join 但内核不向成员投递组播），
+     * iPhone 的 mDNS 组播查询永远到不了应答器 socket（pcap 实锤查询刷屏零应答）。
+     * root 补 `ip link set <dev> multicast on`；无 root 仅记录（FE-6 等 5.1+ 正常）。
+     */
+    private fun ensureTunMulticast() {
+        try {
+            val dev = findTunInterface()
+            if (dev == null) return
+            if (hasMulticastFlag(dev)) {
+                Log.i(TAG, "wired vpn multicast flag present on $dev")
+                return
+            }
+            for (shell in arrayOf(
+                arrayOf("su", "-c", "ip link set $dev multicast on"),
+                arrayOf("/system/xbin/su", "-c", "ip link set $dev multicast on"),
+            )) {
+                try {
+                    val proc = Runtime.getRuntime().exec(shell)
+                    proc.waitFor()
+                    proc.destroy()
+                    if (hasMulticastFlag(dev)) {
+                        Log.i(TAG, "wired vpn multicast flag repaired on $dev")
+                        return
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            Log.w(TAG, "wired vpn multicast flag still missing on $dev; mdns queries undeliverable")
+        } catch (error: Throwable) {
+            Log.w(TAG, "wired vpn multicast check failed: ${error.message}")
+        }
+    }
+
+    private fun hasMulticastFlag(dev: String): Boolean {
+        return try {
+            val proc = Runtime.getRuntime().exec(arrayOf("ip", "link", "show", dev))
+            val out = proc.inputStream.bufferedReader().use { it.readText() }
+            proc.waitFor()
+            out.contains("MULTICAST")
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun findTunInterface(): String? {
+        val dev = java.io.File("/proc/net/dev")
+        return dev.takeIf { it.canRead() }?.bufferedReader()?.useLines { lines ->
+            lines.map { it.substringBefore(':').trim() }
+                .firstOrNull { it.startsWith("tun") }
+        }
+    }
+
+    private fun hasFe80Route(dev: String): Boolean {
+        val route = java.io.File("/proc/net/ipv6_route")
+        return route.takeIf { it.canRead() }?.bufferedReader()?.useLines { lines ->
+            lines.any { line ->
+                val fields = line.trim().split(Regex("\\s+"))
+                fields.size >= 10 &&
+                    fields[0] == "fe800000000000000000000000000000" &&
+                    fields[1] == "40" &&
+                    fields[9] == dev
+            }
+        } ?: false
     }
 
     companion object {

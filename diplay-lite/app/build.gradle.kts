@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -78,19 +80,178 @@ android {
         // unbind，无 root 降级）——替代电脑侧外置循环，脱离电脑可独立工作。
         // 1.1.5/vc75：守护收窄为只解绑 6.3——解绑已 claim 的 6.4 会触发 alt 复位打死
         // bulk-out（20:56 实测两窗口全超时），外置守护成功行为就是只动 6.3。
-        versionName = "1.1.5"
-        versionCode = 75
+        // 1.1.5/vc76：①WiredNcmGuard 守护关闭裁决版（WIRED_NCM_GUARD_ENABLED=false，
+        // TS7 无 root A/B 实验：仅 NTB16 重同步能否稳住会话，vc77 按裁决回 true/false）；
+        // ②无线媒体断供看门狗（音 102/视频 110 双静默 20s → 拆栈重试，攻 iPhone 野蛮
+        // 退出无 teardown 的僵尸会话）；③失败重试路径保留热点附着（形态 B：BT 中止
+        // teardown 后 5/5 SDP 全灭的根因是热点被释放，iPhone 掉网重入网恶性循环）；
+        // ④BYD-HUD bindService 指数退避（8815 每 250ms 风暴实测）。
+        // 1.1.5/vc77：①WIRED_NCM_GUARD_ENABLED=false 定案——vc76 guard-off 裁决通过
+        // （TS7 无守护健康 80+ 分钟零异常，内核绑定 6.3 全程未解绑），正式支持无 root
+        // 运行，守护代码保留作未来 root 平台的开关项；②触摸/控制通道 TCP_NODELAY
+        // （eventSocket accept 侧补齐，对齐上游 0.2.13 触摸修复，降低 touch2frame 延迟）。
+        // 1.1.5/fe6t1(vc78)：FE-6 外测专用试验包——①超宽屏声明覆盖：1920x620（96:31，
+        // MFi 官方列表外）导致 iOS 首连接受（图标拉伸）重连回退 16:9（黑边 409px/侧），
+        // 改声明官方超宽 8:3（高 snap 宽*3/8），keep-aspect 后黑边收窄 ~133px/侧且
+        // 重连分辨率预期稳定（仅纵横比宽于 8:3 的屏受影响）；②应用层 pcap 抓包（无 root）：
+        // NcmUsbBridge 入/出站以太网帧经 PcapTap 环形落盘（3 文件×32MB），设置页开关，
+        // 文件在 Android/data/<pkg>/files/pcap/，攻 wedge/黑边类数据面取证。
+        // 1.1.5/fe6t2(vc79)：方控监听——FE-6「方控上/下一首无效」，MediaSession/logcat/广播
+        // 三条通路零触发记录，dispatchKeyEvent 全量 KeyEvent 落日志（只观察不改分发），
+        // 确认车机按键是否以窗口 KeyEvent 形态进 App 及键码/来源，再定映射修复。
+        // 1.1.5/vc80(relayfix)：中继踢出转正——攻「iPhone 提前连到中继 WiFi 后 CarPlay 永远
+        // 连不上」。根因：iPhone 已在目标网络时 0x5703 不触发 join 事件（no-op），12 次重发
+        // 全废，First TCP 看门狗 30s+35s 宽限判死 → 重试死循环。修复：中继模式恒启用假凭证
+        // 踢出（原 [RELAY-TEST] 实验分支，曾因看门狗 65s < 三阶段 134s 而废弃，00:28 日志
+        // phase2 从未触达），真凭证重发 8 次（40s）仍 0 TCP → 假 0x5703 踢出当前 AP → 10s
+        // 后真凭证恢复 → 强制新鲜 join → ~62s 前完成，全程在 65s 看门狗窗口内。
+        // 1.1.5/vc81(wifilock)：中继链路抗抖动——C8815 实测无线会话视频 rx=6.8fps、音频输入
+        // maxGap 389~934ms、queuedMs 180~1427ms 震荡（听感一卡一卡），为 WiFi 省电轮询突发
+        // 断供特征，App 此前全程未持 WifiLock。中继入网成功即持 WIFI_MODE_FULL_HIGH_PERF
+        // 锁（RelayClientManager 幂等获取，close 释放），失败重试 keepForReuse 下重新持锁。
+        // 1.1.5/vc83(relaykick2)：攻「中继热点要点两次连接才能配上」（082530 日志 8 次点击
+        // 定案）。三根因三修：①踢出后 10s 凭证真空期 iPhone 无凭证可回、用户在恢复前放弃
+        // →恢复延迟 10s→1.5s，且恢复后重发预算恢复满额 12×5s；②踢出时机 8 次重发(40s)太晚
+        // →2 次重发(~10s)即踢，踢出→回连全程压缩 35s；③车机 WiFi 关闭态中继发起秒失败
+        // →RelayClientManager 自动 setWifiEnabled(true)（等 8s）。④First TCP 看门狗 30s→60s
+        // （082530 tap2 实证热点直连慢入网 39s，30s 判死差 9s；总上限 60+35=95s）。
+        // 1.1.5/fe6t3(vc84)：Siri 后无声恢复——FE-6 USB 有线会话（fe6t2/vc79 日志实证）iPhone
+        // 进 Siri 拆媒体音频流（TEARDOWN type=100 ended=true）→ SETUP speechrecognition 上行
+        // → Siri 结束后第二个 TEARDOWN，此后 iPhone 不再重发媒体音频 SETUP，音乐静音到用户
+        // 手动断开（会话其余全健康，enhancedSiri 会话特有，TS7/8815 无复现）。AirPlaySession
+        // 层检测「speechrecognition 音频流已现 + 音频流被 TEARDOWN 且会话内无音频流」→ 10s
+        // 看门狗（期间任一音频 SETUP 即撤销）→ onSiriAudioStall 回调；wired 编排层 close 会话
+        // （先补发 best-effort TEARDOWN，iPhone 当真结束）→ 既有 wired 自动重试链全量重建。
+        // 1.1.5/e5t1(vc85)：EU5 通话收音修复/取证——三招打「上行无声」：①数字静默自愈
+        // （核心）：采集 peak==0（真全零，DSP 静音路径特征；<300 近静音是环境噪音绝不触发）
+        // 连续 5s → 采集线程内热换下一个未试音频源（沿 6→1→7 逐个排除，RTP 不断流），
+        // 全源轮完仍全零 → 停轮换并落 QG DSP 嫌疑取证；②麦克风静音位自动恢复：上行启动
+        // 前检测 AudioManager mute 位，为 true 自动解除并复检落证（App 层能修的静音路径）；
+        // ③QG DSP 存在性探测（pm list packages qinggan，无 root）附在取证里。
+        // 1.1.5/fe6t4(vc86 sirirestore2)：Siri 看门狗装弹判据修复——fe6t3 实测
+        // （diplay-20261015-185536）看门狗零触发、测试者仍手动重连两次（Siri 后静音 117s）。
+        // 根因：Siri speech TEARDOWN 时 101/default 控制音频流残存（本就反复 flap），
+        // 「会话内无任何音频流」判据永不满足。改用 type→audioType 映射（activeAudioKinds）
+        // 跟踪活跃音频流，判据改为「无 audioType=media 音频流」；到期收会话走 wired
+        // 重试链全量重建，预期 Siri 后 ~15s 音乐自动恢复。
+        // 1.1.5/fe6t4(vc86)：Siri 恢复看门狗判据修正——fe6t3(185536 日志) 实测看门狗零触发
+        // （Siri speech TEARDOWN 时 101/default 控制流残存，其本就反复 flap，「无任何音频流」
+        // 判据永不满足，用户仍手动两次点击），判据改为「无 audioType=media 音频流」。
+        // 1.1.5/fe6t5(vc87)：FE-6 三问题修复/取证——①方控派发接通：fe6t3 实锤按键以窗口
+        // KeyEvent 形态进 App（code=87/88 dev=-1 src=0，MediaSession/logcat/广播三通路零触发），
+        // 学习绑定建得起但永不派发；dispatchKeyEvent 观察侧升级观察+派发（DOWN 命中学习绑定、
+        // UP 命中标准媒体键，不改 super 分发）。②掉线取证：fe6t3 实锤一次掉线=用户点断开、
+        // 一次根因=iPhone 关 event 连接（Siri 结束后整 60s）→ wedge 看门狗连锁误判拆桥 →
+        // auto-retry 其实跑通全量重建并重发 0x4301，但 iPhone 无响应且用户 29s 手动打断；
+        // closeWiredStack 全调用点 reason 落盘 + event 连接关闭区分对端 EOF/空闲时长。
+        // ③收音无：fe6t3 日志 uplink started 后无任何 level window/tx 心跳=AudioRecord.read
+        // 恒返 0 的 HAL 出数失败形态（凑不满整帧连 e5t1 静默自愈都不触发），补零读换源自愈。
+        // 1.1.5/fe6t5(vc87)：FE-6 三项修复（fe6t3 视频+日志定案）。①方控无响应：按键以窗口
+        // KeyEvent 形态进 App（code=87/88 dev=-1 src=0），MediaSession/logcat/广播三通路零触发；
+        // 学习绑定经 onKeyDown 能建立但标准派发只有 MediaSession+logcat/广播两条路，窗口 KeyEvent
+        // 永不派发 → dispatchKeyEvent 加观察+派发（DOWN 命中学习绑定 event=ACTION_DOWN、
+        // UP 命中标准媒体键）。②掉线取证：closeWiredStack 全调用点 reason 落盘 + event 连接
+        // 关闭区分对端 EOF/空闲时长。③收音无：fe6t3 日志 uplink started 后无任何 level window/tx
+        // 心跳=AudioRecord.read 恒返 0 的 HAL 出数失败形态（凑不满整帧连 e5t1 静默自愈都不触发），
+        // 补零读换源自愈。
+        // 1.1.5/direct1-3(vc88-90)：客户端直连实验（已终止并回退）——车机 STA 加入 iPhone 个人
+        // 热点拓扑三轮实测（不带组/带组/全套 0x5703+0x4301=中继同款）均被 iPhone 完全忽略
+        // （tcpAccepted=0，60s 看门狗判死）。终案：iOS 硬限制——拒绝对自身个人热点的端点声明，
+        // 不会在自己热点接口上发起 CarPlay 会话，App 层无解。实验资产归档：apks/DiPlay-1.1.5-direct*。
+        // 1.1.6(vc91)：①车标页全品牌选择器（assets/car-logos 141 品牌：搜索过滤/中文名/列数
+        // 自适应/点选即补方 256 存 CarIconStore+名称替换，素材源 FreeAuto-Car-1.2.4 解包精选+小米补绘）；
+        // ②WiredNcmGuard 解绑严谨化（借鉴 legacy-ref）：解绑前读 driver/uevent 驱动名，仅放行
+        // cdc_ncm/cdc_ether，usbfs/未知驱动拒绝并落盘取证——不再无差别解绑。
+        // 1.1.6(vc92)：未配 SSID 报错文案明确化（fe6 102301 日志：服务自启走默认通道秒失败弹窗
+        // 误导测试者）——「当前是车机热点模式，未配置SSID，无法连接」/中继同款；手动点击路径原有
+        // 引导 toast 不变；0x4301 重建后忽略问题（fe6 185536 日志二次实锤，57s 死窗主因）另案处理。
+        // 1.1.6-fe6t5(vc92)：enhancedSiri 根治实验（用户拍板无开关直接关）：/info extendedFeatures
+        // 移除 "enhancedRequestCarUI"（增强式 Siri 请求车机 UI 的唯一声明位）。SETUP 请求里
+        // iPhone 确实带 enhancedSiri，但 SETUP 响应各平台本就一致不回（TS7/8815 同），关闭点
+        // 收敛到 /info extendedFeatures。判据：Siri 后媒体流是否自动重发 SETUP（不再触发
+        // onSiriAudioStall/60s 重建）；风险：若会话被拒则恢复双元素声明。
+        // 1.1.7(vc93)：①VPN 授权三段式（ECARX 235521 实锤 ROM 裁剪 vpndialogs 致 USB 点击
+        // 闪退）：startActivityForResult catch + root appops ACTIVATE_VPN 免对话框 + 明确报错；
+        // ②车机热点状态三证据源（235233 实锤 ECARX state=11 但 ap0 存活）：state/isWifiApEnabled/
+        // AP 专用接口交叉验证，不设机型判断；③蓝牙开关双证据源+自动补开（同车实锤 adapter
+        // 失灵）：adapter ∥ Settings.Secure bluetooth_on，双关时 enable+轮询 8s；
+        // ④楔死重建全量复位兜底（TS7 083438 实锤 self-heal 短路后 iPhone 无视 0x4301）：
+        // wedge/watchdog/usbmux-reset 重试置 wiredFullResetPending 走 0x52+setConfiguration
+        // 全量复位路径 + 0x4301 建立期重发预算（2s×6）。B 组安全项（ADB 开关/PIN 门禁）缓行。
+        // 1.1.8(vc94)：全库逻辑审查 12 项修复（A 组 9 机械 + B 组 3 行为）——
+        // ①A1 0x4301 重发检查移出 recv-null 分支（心跳常驻形态下 vc93 预算逻辑零触发）；
+        // ②A2 fullReset 消费时重置重枚举预算（wedge 多轮重建后 attempts 耗尽落 self-heal 短路）；
+        // ③A3 蓝牙补开 elvis-throw 死代码修复（ensureBluetoothEnabled 非空 Boolean，throw 不可达）；
+        // ④A4 AirPlayTcpServer 回退绑定成功后 active 复位（bindOnce 失败释放 active 置 false，
+        //   回退路径 acceptLoop 首判即退，iPhone 连入无会话假活）；
+        // ⑤A5 音频 rx 循环兜底 catch（下游 RuntimeException 线程静默死亡，对齐 ScreenStream）；
+        // ⑥A6 NcmUsbBridge root 抢回重试前经工厂重新 openDevice（openOnce 失败已 close connection，
+        //   复用必败，1.1.3 起 root 抢回整体失效）；
+        // ⑦A7 中继热点 PSK 一致性校验（改密后 configuredNetworks 命中同名即复用，join 恒超时）；
+        // ⑧A8 三处 su 执行加超时（MainActivity/WiredNcmGuard/Diagnostics，exitValue 轮询，
+        //   API16 兼容不用 waitFor(timeout)，超时 destroy 按失败处理）；
+        // ⑨A9 WiredVpnService 快速重连旧 TUN fd 覆盖泄漏（establish 前关存量 fd）；
+        // ⑩B10 NTP offset 应用门控加 60s 老化（极小 RTT 霸占延迟窗口致 offset 冻结、晶振漂移无界累积）；
+        // ⑪B11 Ipv6NcmBridge close 写 ff02::1 哑包唤醒阻塞 TUN read 的出站线程（僵尸线程随重连累积）；
+        // ⑫B12 音频重排 distance==0 交付前清 held 同序号残帧（PT=86 注入与原包竞速滞留，
+        //   firstKey 回拨基准致整段重复交付）。
+        // 1.1.9(vc95)：①中继网关探测放宽 2s×2→3s×4/间隔1s（SM-T210 实锤手机热点数据面启动
+        //   窗口期 isReachable 假阴性致 RELAY_UNREACHABLE，用户需手动重试；全程上限 ~15s 消除
+        //   误报）；②日志抬头新增 ROM 版本行（Build.DISPLAY→Build.ID→Build.TIME 三层兜底，
+        //   ROM 版本+车机型号辨识测试机防日志混淆）；③车标选择改 5×2 横向滑动栏内联直选
+        //   （厂家预置行+「全部品牌」跳页合并，部分车机网格页无法预览清单用户裁定；BEI JING/
+        //   Stellantis raw 独有置顶+assets 141 品牌，独立网格页 BrandAdapter 机制移除）。
+        // 1.1.9(vc96)（FE-6 断链分析定案，全部 app 层）：①WaitingForIphone 打 USB 总线拓扑
+        //   快照（首拍+每5拍，区分设备掉总线 vs pid 变化退出 CarPlay 模式）；②黑等超 10s
+        //   UI 提示「请拔插 USB 线」（实测 94s 无反馈车主以为 App 死）；③no_audio 会话
+        //   wedge fatal 阈值 6s→15s（无音频恒流垫底，画面静止断流属正常防误杀）；④root
+        //   USB 取证探针 WiredUsbForensics（会话期 dmesg USB 线增量进 LiteLog + wedge 时
+        //   sysfs 设备树快照，内核级回答「谁先动手」；无 root 静默关闭）。
+        // vc97：①A1 重发门控换「无流帧」判据（streamFrames 独立计数，0x5001/0x5201
+        //   心跳污染 forwardedFrames 致重发饿死+wedge 误判——TS7 46s 死窗根因链闭合）；
+        //   ②wedgeSuspect 接通后 wedge 重建置位真正生效；③wedge 判别器（usbmux 控制面
+        //   活=端点真楔死按变体阈值快拆 / 同停=iPhone 停发型宽限 20s）；⑤usbfx 内核
+        //   时间戳水位去重（T3 全量重放治）+snapshot 去 tail 依赖（toybox 无管道）；
+        //   ④蓝牙多源枚举 BondedDevicesResolver（FE-6 getBondedDevices 失灵族）随包。
+        //   vc98（T3 当晚续）：KK(API<21) 无 setInterface——旧 runCatching 兜底在 T3 上
+        //   必然 NoSuchMethodError→false，设备侧 NCM alt 恒 0，iPhone 数据面零包、60s
+        //   看门狗必触发（协议栈 claim/MFi/0x4301 全通只差 iPhone 第一个包）。改发
+        //   SET_INTERFACE 类请求（claim 后可发，无需 root），App 自闭环不依赖外部时序。
+        //   vc99（T3 当晚续2）：claim 失败 root 抢回根治——unbind 后内核 67ms re-probe 绑回
+        //   （dmesg 实锤），unbind 必败竞速。改先扫 sysfs 取 iPhone PID → cdc_ncm remove_id
+        //   （本开机周期内核失明，重启自动复原）→ 再 unbind 踢绑定 → 重试 claim 必成。
+        //   vc100（T3 定案）：SuperSU 2.82 su -c 长命令静默降权缺陷（含重定向/分号整体
+        //   降为 shell，uid 短命令 10 连测全过 vs 同串 id=2000 实锤）——reclaim 改脚本
+        //   文件模式：写 filesDir/ncm-reclaim.sh → su -c "sh <path>" 单短命令 → stdout 判定。
+        //   vc101（T3 定案2，借鉴 legacy-ref usb_host_compat）：root reclaim 竞速根治——
+        //   remove_id+unbind 后内核 67ms re-probe 绑回（22:09 会话 dmesg 实锤两轮 unregister
+        //   →register），sysfs 路线在 T3 静态 ID 表下必败。改 usbfs 原子路径（免 root）：
+        //   ①NCM claim 失败先走 USBDEVFS_DISCONNECT_CLAIM ioctl（内核锁下一步「断驱动+claim」，
+        //   消除竞速窗口，legacy-ref forceClaim 同款）；②vc98 SET_INTERFACE 升级为
+        //   USBDEVFS_SETINTERFACE ioctl 优先（内核 usb_set_interface 同步 ep 启用表，
+        //   controlTransfer 只切设备侧不更新内核，bulk URB 可能提交失败），controlTransfer
+        //   兜底。NDK libusb_host_compat.so（v7a/v8a，API21 编译 API19 可运行）随包，
+        //   加载失败自动降级原路径。已知遗留：KK 重插线内核选错配置（无 setConfiguration
+        //   API+快照陈旧）留 vc102（KitKatUsbDescriptors+native setConfiguration）。
+        // vc103r（Legacy 对齐三改动，目标 T3/AC822X「入向零帧」）：
+        //   ①SET_INTERFACE 改描述符驱动 alt + 5次×100ms 重试（cdc_ncm claim/SET 间抢绑竞速）
+        //   ②NCM 复用 usbmux 会话同一 fd（内核 claim 位图按 fd 记账，双 fd 割裂=KK ENOENT 根因）
+        //   ③SETCONFIGURATION(6) 后 GET_CONFIGURATION 回读验证（errno=0≠内核真切过去）。
+        versionName = "1.2.0"
+        versionCode = 137
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties
     // 注入（GITEE_LOG_TOKEN=...，该文件已被 .gitignore 排除，永不入仓）。
     // 未配置时为空串：Gitee 上传按钮自动降级为「生成文件后手动发送」路径。
     defaultConfig {
-        val localProps = java.util.Properties().apply {
+        val localProps = Properties().apply {
             val f = rootProject.file("local.properties")
             if (f.exists()) f.inputStream().use { load(it) }
         }
         buildConfigField("String", "GITEE_LOG_TOKEN", "\"${localProps.getProperty("GITEE_LOG_TOKEN") ?: ""}\"")
+        // vc77 定案：有线 NCM 守护恒关（vc76 guard-off 裁决通过，无 root 正式支持）。
+        buildConfigField("boolean", "WIRED_NCM_GUARD_ENABLED", "false")
     }
 
     buildFeatures {

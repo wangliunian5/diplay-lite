@@ -690,11 +690,31 @@ internal object Diagnostics {
     private fun toast(context: Context, msg: String) =
         Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
 
-    /** sh -c 执行（支持管道），失败返回空串。 */
+    /** sh -c 执行（支持管道），失败返回空串。
+     *  vc94：原 readText+waitFor 无超时——命令挂起（su 弹框/设备僵死）会永久卡住调用线程；
+     *  pump 线程收流 + 轮询 exitValue（waitFor(timeout) 需 API24+），8s 无果 destroy 返回已读输出。 */
     private fun exec(command: String): String = runCatching {
         val process = ProcessBuilder("sh", "-c", command).redirectErrorStream(true).start()
-        val out = process.inputStream.bufferedReader().use { it.readText() }
-        process.waitFor()
-        out
+        val out = StringBuilder()
+        val pump = Thread({
+            runCatching { process.inputStream.bufferedReader().forEachLine { out.appendLine(it) } }
+        }, "diag-exec-pump").apply {
+            isDaemon = true
+            start()
+        }
+        var exited = false
+        var waited = 0
+        while (!exited && waited < 8_000) {
+            Thread.sleep(100)
+            waited += 100
+            try {
+                process.exitValue()
+                exited = true
+            } catch (_: IllegalThreadStateException) {
+            }
+        }
+        if (!exited) process.destroy()
+        pump.join(500)
+        out.toString()
     }.getOrDefault("")
 }

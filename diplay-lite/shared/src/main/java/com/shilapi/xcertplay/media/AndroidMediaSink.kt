@@ -87,11 +87,25 @@ class AndroidMediaSink(
      */
     private val microphoneSystemSnapshot: () -> String = { "" },
     /**
+     * 1.1.5/e5t1(vc85)：麦克风静音位检查/自动恢复，由持 Context 的上层注入（返回描述串
+     * 落诊断）。EU5 QG DSP 仲裁链可能在 Android 层留 mute 位，App 层可检测并解除；
+     * 未注入时跳过，其他平台零行为变化。
+     */
+    private val microphoneMuteRestore: (() -> String)? = null,
+    /**
      * 1.1.4（ECARX 媒体中心冒充桥）：CarPlay 媒体流（audioType=media）首包到达时
      * 触发，上层据此通知 EcarxMediaCenterBridge 显式抢占 ONLINE 音源。电话/导航/
      * Siri 流不触发。
      */
     private val onMediaPlaybackStarted: (() -> Unit)? = null,
+    /**
+     * 1.1.6(vc76)：媒体断供看门狗——媒体音频（type=102）与主屏视频（type=110）都
+     * 建过流且**同时**静默超过 [MEDIA_STALL_SILENCE_NS] 时回调一次（恢复收流自动复位）。
+     * 形态 A 僵尸会话对策：iPhone 野蛮退出 CarPlay 不发 teardown（8815 整夜实测：
+     * CarPlay UI 已退、BT iAP2 心跳还活、RTSP 会话挂 ended=false 傻等 4 分钟+），
+     * 音视频双静默 = 会话实质死亡的媒质层判据（用户暂停音乐只停音频、视频仍在推）。
+     */
+    private val onMediaStall: (() -> Unit)? = null,
 ) : MediaSink {
     private val screenStateLock = Any()
     private val activeScreenTypes = mutableSetOf<Int>()
@@ -126,6 +140,50 @@ class AndroidMediaSink(
     private val recoveryPending = AtomicBoolean(false)
     private val recoveryExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "carplay-video-recovery").apply { isDaemon = true }
+    }
+    // 1.1.6(vc76)：媒体断供监视线程。5s 一查；判据 = 媒体音频与主屏视频都建过流、
+    // 且当前同时静默超阈值 → 一次性回调 onMediaStall（任一流恢复即复位，允许下次再判）。
+    private val mediaStallLatch = AtomicBoolean(false)
+    private val mediaStallMonitor = Thread({
+        while (true) {
+            try {
+                Thread.sleep(5_000)
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+            val callback = onMediaStall ?: continue
+            val renderer = audioRenderers[MEDIA_AUDIO_PAYLOAD_TYPE] ?: continue
+            if (renderer.format.audioType != MEDIA_AUDIO_TYPE) continue
+            val audioLastNs = renderer.lastArrivalNanos()
+            if (audioLastNs == 0L) continue // 本代从未收过音频包：没建过流，无从谈断供
+            val video = videoDecoders[MEDIA_VIDEO_PAYLOAD_TYPE] ?: continue // 纯音频场景不判死
+            val videoLastNs = video.lastArrivalNanos()
+            if (videoLastNs == 0L) continue
+            val now = System.nanoTime()
+            val bothSilent = now - audioLastNs > MEDIA_STALL_SILENCE_NS &&
+                now - videoLastNs > MEDIA_STALL_SILENCE_NS
+            if (bothSilent) {
+                if (mediaStallLatch.compareAndSet(false, true)) {
+                    Log.w(
+                        "xcertplay-usb",
+                        "media stall: audio+video silent >${MEDIA_STALL_SILENCE_NS / 1_000_000}ms " +
+                            "with streams established; reporting to orchestration",
+                    )
+                    callback()
+                }
+            } else {
+                mediaStallLatch.set(false)
+            }
+        }
+    }, "carplay-media-stall").apply { isDaemon = true; start() }
+
+    private companion object {
+        // 1.1.6(vc76)：媒体断供看门狗参数。20s 双静默远大于正常流间隙（视频 8fps 空闲
+        // 流 ~125ms/帧、音乐停顿由重传覆盖），且视频仍推 = 用户暂停音乐的合法场景。
+        const val MEDIA_AUDIO_PAYLOAD_TYPE = 102
+        const val MEDIA_VIDEO_PAYLOAD_TYPE = 110
+        const val MEDIA_AUDIO_TYPE = "media"
+        const val MEDIA_STALL_SILENCE_NS = 20_000_000_000L
     }
 
     override fun setVideoRecoveryHandler(type: Int, handler: () -> Unit) {
@@ -221,7 +279,7 @@ class AndroidMediaSink(
         // API16 适配：ConcurrentHashMap.computeIfAbsent 是 API 24+，改两段式 get + putIfAbsent。
         var uplink = microphoneUplinks[type]
         if (uplink == null) {
-            val created = MicrophoneUplink(config, onAudioDiagnostic)
+            val created = MicrophoneUplink(config, onAudioDiagnostic, microphoneMuteRestore)
             val raced = microphoneUplinks.putIfAbsent(type, created)
             uplink = raced ?: created
         }
@@ -409,6 +467,9 @@ private class VideoDecoder(
         BandwidthMonitor.onVideoBytes(nalus.size)
         queue.offer(VideoJob.Frame(nalus))
     }
+
+    /** 1.1.6(vc76)：最近一次收帧时刻（媒体断供看门狗判「视频面死亡」用）。 */
+    fun lastArrivalNanos(): Long = stats.lastArrivalNanos()
 
     fun setSurface(surface: Surface?) {
         queue.offer(VideoJob.SurfaceChanged(surface))
@@ -1098,6 +1159,9 @@ private class AudioRenderer(
             }
         }
     }
+
+    /** 1.1.6(vc76)：最近一次收包时刻（媒体断供看门狗判「音频面死亡」用）。 */
+    fun lastArrivalNanos(): Long = lastArrivalNs.get()
 
     override fun close() {
         running = false

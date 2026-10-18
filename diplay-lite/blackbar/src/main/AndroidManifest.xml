@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- T3 底部死区遮蔽（系统级独立微应用，与 DiPlayLite 无关联）：
+     开机自启后常驻一条 100px 黑条盖住屏幕底部（1024x600→有效区 1024x500 的配套遮蔽）。 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.shilapi.blackbar">
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application
+        android:label="BlackBar"
+        android:allowBackup="false">
+
+        <receiver android:name=".BootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service android:name=".BarService" android:exported="false" />
+    </application>
+</manifest>

@@ -2,6 +2,8 @@ package com.shilapi.xcertplay.network
 
 import android.content.Context
 import android.net.wifi.WifiManager
+import java.net.Inet4Address
+import java.net.NetworkInterface
 
 /**
  * Reads whether the head unit's own Wi-Fi hotspot is on, for the "Car hotspot" link.
@@ -33,4 +35,22 @@ object CarHotspotStatus {
             WifiManager::class.java.getMethod("getWifiApState").invoke(wifi) as Int
         }.getOrNull()
     }
+
+    /**
+     * vc93：AP 专用接口探测（235233 实锤 ECARX state=11 但 ap0 存活带地址）。
+     * 只认 AP 专用命名（ap 前缀、swlan、softap、swla 前缀），不认 wlan1 —— BYD
+     * 未开热点也保持 wlan1 带地址，会假阳性（沿用 M6k24 结论）。仅作状态判死前的兜底证据。
+     */
+    fun hasDedicatedApInterface(): Boolean = runCatching {
+        NetworkInterface.getNetworkInterfaces().asSequence()
+            .filter { it.isUp }
+            .any { iface ->
+                val name = iface.name.lowercase()
+                val apNamed = name.startsWith("ap") || name.startsWith("swlan") ||
+                    name.startsWith("softap") || name.startsWith("swla")
+                apNamed && iface.inetAddresses.asSequence().any { addr ->
+                    addr is Inet4Address && !addr.isLoopbackAddress
+                }
+            }
+    }.getOrDefault(false)
 }

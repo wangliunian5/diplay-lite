@@ -48,6 +48,12 @@ data class Iap2IdentificationConfig(
     val externalAccessoryProtocol: String = "com.shilapi.xcertplay",
     /** Non-null selects the wireless Bluetooth and WirelessCarPlay transport components. */
     val wireless: Iap2WirelessIdentification? = null,
+    /**
+     * vc102 USB bootstrap 无线升级：非空时识别帧带 group16(USB 传输) + group24(SSID) 双宣告——
+     * iAP2 会话承载在 USB 隧道，但向 iPhone 宣告本配件具备无线 CarPlay 能力（Apple 官方
+     * 「插 USB 弹提醒无线连接」流程）。与 [wireless] 互斥：wireless 走蓝牙承载，本字段走 USB。
+     */
+    val usbWirelessUpgradeSsid: String? = null,
     /** Advertises and enables iAP2 LocationInformation from the accessory to the phone. */
     val locationInformationEnabled: Boolean = false,
 ) {
@@ -94,6 +100,13 @@ data class Iap2IdentificationConfig(
         }
         require(carPlayUsbInterfaceNumber in 0..0xff) {
             "carPlayUsbInterfaceNumber must be in 0..255"
+        }
+        usbWirelessUpgradeSsid?.let {
+            require(it.isNotBlank()) { "USB wireless upgrade SSID must not be blank" }
+            require('\u0000' !in it) { "USB wireless upgrade SSID must not contain U+0000" }
+        }
+        require(usbWirelessUpgradeSsid == null || wireless == null) {
+            "usbWirelessUpgradeSsid and wireless are mutually exclusive transports"
         }
     }
 }
@@ -158,15 +171,27 @@ class Iap2IdentificationClient(private val session: Iap2Session) {
         /** Builds the smallest honest LIVI-compatible wired or wireless IdentificationInformation. */
         fun identificationInformation(config: Iap2IdentificationConfig): Iap2Frame {
             val wireless = config.wireless
-            val sentMessages = if (config.locationInformationEnabled) {
-                MESSAGES_SENT_BY_ACCESSORY + LOCATION_INFORMATION
+            // vc102：USB bootstrap 形态——USB 承载 + 无线能力双宣告。供电通告 0xae03 保留
+            //（USB 线在给 iPhone 供电，与纯无线蓝牙承载的「删 0xae03」语义不同）。
+            val usbUpgrade = config.usbWirelessUpgradeSsid != null
+            val sentMessages = when {
+                config.locationInformationEnabled -> MESSAGES_SENT_BY_ACCESSORY + LOCATION_INFORMATION
+                else -> MESSAGES_SENT_BY_ACCESSORY
+            }
+            val sentMessagesFinal = if (usbUpgrade) {
+                sentMessages + ACCESSORY_WIFI_CONFIGURATION_INFORMATION
             } else {
-                MESSAGES_SENT_BY_ACCESSORY
+                sentMessages
             }
             val receivedMessages = if (config.locationInformationEnabled) {
                 MESSAGES_RECEIVED_FROM_PHONE + START_LOCATION_INFORMATION + STOP_LOCATION_INFORMATION
             } else {
                 MESSAGES_RECEIVED_FROM_PHONE
+            }
+            val receivedMessagesFinal = if (usbUpgrade) {
+                receivedMessages.asIterable() + WIRELESS_PHONE_MESSAGES.asIterable()
+            } else {
+                receivedMessages.asIterable()
             }
             return Iap2Messages.build(Iap2Endpoints.IDENTIFICATION_INFORMATION) {
                 string(0, config.name)
@@ -178,16 +203,16 @@ class Iap2IdentificationClient(private val session: Iap2Session) {
                 u16List(
                     6,
                     if (wireless == null) {
-                        sentMessages.asIterable()
+                        sentMessagesFinal.asIterable()
                     } else {
-                        sentMessages.filterNot { it == POWER_SOURCE_UPDATE }.toIntArray().asIterable() +
+                        sentMessagesFinal.filterNot { it == POWER_SOURCE_UPDATE }.toIntArray().asIterable() +
                             ACCESSORY_WIFI_CONFIGURATION_INFORMATION
                     },
                 )
                 u16List(
                     7,
                     if (wireless == null) {
-                        receivedMessages.asIterable()
+                        receivedMessagesFinal
                     } else {
                         receivedMessages.asIterable() + WIRELESS_PHONE_MESSAGES.asIterable()
                     },
@@ -208,6 +233,18 @@ class Iap2IdentificationClient(private val session: Iap2Session) {
                         void(2)
                         u8(3, config.carPlayUsbInterfaceNumber)
                         void(4)
+                    }
+                    // vc102：USB bootstrap 追加 group24——iPhone 收到「USB 在线 + 无线 SSID」
+                    // 双宣告，是官方「下次连接可无线」提醒的识别帧基础。
+                    config.usbWirelessUpgradeSsid?.let { ssid ->
+                        group(24) {
+                            u16(0, 1)
+                            string(1, ssid)
+                            void(2)
+                            u16(3, 1)
+                            void(4)
+                            void(5)
+                        }
                     }
                 } else {
                     group(17) {

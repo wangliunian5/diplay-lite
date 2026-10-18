@@ -50,6 +50,9 @@ internal class VideoStats(
 
     @Synchronized fun onFlush() { flushes++ }
 
+    /** 1.1.6(vc76)：最近一次收帧时刻（媒体断供看门狗判「视频面死亡」用）。 */
+    @Synchronized fun lastArrivalNanos(): Long = lastArrivalNs
+
     @Synchronized fun logIfDue(): String? {
         val now = nanoTime()
         val elapsedNs = now - windowStartNs

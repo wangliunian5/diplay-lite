@@ -7,6 +7,7 @@ import android.content.Intent
 import android.provider.Settings
 import android.widget.EditText
 import android.widget.Toast
+import com.shilapi.xcertplay.vehicle.BondedDevicesResolver
 
 /**
  * M6k24：系统设置直达 + iPhone 蓝牙选择，主页快捷入口与热点配置页共用。
@@ -82,25 +83,23 @@ object SystemSettingsJumps {
             toast(activity, "本机没有蓝牙适配器，请手动输入地址")
             return
         }
-        val devices = adapter.bondedDevices.orEmpty()
-            .sortedWith(compareBy({ it.name?.lowercase() ?: "" }, { it.address }))
-        if (devices.isEmpty()) {
-            LiteLog.log("ui", "蓝牙选择：无已配对设备")
+        // vc97：多源枚举——ECARX 平台 bondedDevices 失灵（FE-6 已配对却返回空）时
+        // root bt_config.conf 兜底，弹窗从「只剩手动输入」变回「已配对设备可选」。
+        val entries = BondedDevicesResolver.resolve(adapter) { LiteLog.log("ui", it) }
+        if (entries.isEmpty()) {
+            LiteLog.log("ui", "蓝牙选择：无已配对设备（含 root 兜底）")
             toast(activity, "没有已配对的蓝牙设备，请先在系统设置里与 iPhone 配对")
         }
-        val labels = ArrayList<String>(devices.size + 2)
-        devices.forEach { labels.add("${it.name ?: "未知设备"}\n${it.address}") }
+        val labels = ArrayList<String>(entries.size + 2)
+        entries.forEach { labels.add("${it.name ?: "未知设备"}\n${it.address}") }
         labels.add("手动输入地址…")
         labels.add("清除选择（恢复自动）")
         AlertDialog.Builder(activity)
             .setTitle("选择 iPhone 蓝牙设备")
             .setItems(labels.toTypedArray()) { _, which ->
                 when {
-                    which < devices.size -> {
-                        val device = devices[which]
-                        onPicked(device.address, device.name ?: "")
-                    }
-                    which == devices.size -> promptManualBluetoothAddress(activity, onPicked)
+                    which < entries.size -> onPicked(entries[which].address, entries[which].name ?: "")
+                    which == entries.size -> promptManualBluetoothAddress(activity, onPicked)
                     else -> onPicked("", "")
                 }
             }

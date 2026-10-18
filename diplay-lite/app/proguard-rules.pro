@@ -7,3 +7,9 @@
 # JmDNS
 -keep class javax.jmdns.** { *; }
 -dontwarn javax.jmdns.**
+
+# vc101（T3）：JNI native 方法名与 libusb_host_compat.so 符号一一对应，混淆即 NoSuchMethodError
+-keepclasseswithmembernames class com.shilapi.xcertplay.transport.LegacyUsbHostNative {
+    native <methods>;
+}
+-keep class com.shilapi.xcertplay.transport.LegacyUsbHostNative { *; }

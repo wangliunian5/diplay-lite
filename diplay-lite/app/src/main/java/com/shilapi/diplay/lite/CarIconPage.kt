@@ -13,6 +13,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
@@ -49,16 +50,36 @@ class CarIconPage(private val activity: MainActivity) {
     /** true = 处于裁剪视图（选图后进入），buildRoot 据此分发主视图/裁剪视图。 */
     private var cropping = false
 
+    // 1.1.6：全品牌车标库（assets/car-logos，141 品牌）。
+    // vc95：原「全部品牌」独立网格页在部分车机无法预览清单（用户裁定），改为图标主页
+    // 内联 5×2 横向滑动栏直选；独立网格页机制（brandPicker/BrandAdapter）整体移除。
+    private var brandIndex: List<BrandEntry> = emptyList()
+    private val brandIconCache = HashMap<String, Bitmap>()
+
+    /** 车标索引行：assets 文件名 key / 英文名 / 中文名。 */
+    private data class BrandEntry(val key: String, val en: String, val cn: String)
+
+    /** 滑动栏单元：raw 预置（rawResId 非空）或 assets 品牌（entry 非空）。 */
+    private data class BrandTile(val en: String, val cn: String, val rawResId: Int?, val entry: BrandEntry?)
+
     private companion object {
         const val MAX_DECODE_EDGE = 2048
+        const val BRAND_ASSET_DIR = "car-logos"
     }
 
-    fun buildRoot(): View = if (cropping) buildCropRoot() else buildMainRoot()
+    fun buildRoot(): View = when {
+        cropping -> buildCropRoot()
+        else -> buildMainRoot()
+    }
 
     /** 页面离开时调用（原 onDestroy）：停解码线程并回收裁剪位图。 */
     fun cleanup() {
         executor.shutdownNow()
         if (::cropView.isInitialized) cropView.bitmap?.recycle()
+        synchronized(brandIconCache) {
+            for (bmp in brandIconCache.values) bmp.recycle()
+            brandIconCache.clear()
+        }
     }
 
     /** MainActivity.onActivityResult（requestCode=1001）转发：选图成功即进入裁剪页。 */
@@ -68,13 +89,17 @@ class CarIconPage(private val activity: MainActivity) {
     }
 
     /**
-     * 系统返回键（1.1.1）：裁剪态先回图标主页（消费事件），主页态返回 false 交由
-     * MainActivity 走「三级页 → 设置页」层级。
+     * 系统返回键（1.1.1）：裁剪态先回图标主页（消费事件），主页态返回
+     * false 交由 MainActivity 走「三级页 → 设置页」层级。
      */
     fun onBackKey(): Boolean {
-        if (!cropping) return false
-        backToMain()
-        return true
+        when {
+            cropping -> {
+                backToMain()
+                return true
+            }
+            else -> return false
+        }
     }
 
     // ---------- 主页（预览 + 选图 + 品牌 + 默认） ----------
@@ -173,61 +198,163 @@ class CarIconPage(private val activity: MainActivity) {
             (layoutParams as LinearLayout.LayoutParams).topMargin = Ui.dip(activity, 8)
         })
 
-        // 品牌 logo 预置行（自设置页迁入）
+        // 品牌车标滑动栏（vc95）：5 列×2 行横向滑动直选，取代原单行厂家预置 + 「全部品牌」
+        // 跳页——部分车机网格页无法预览清单（用户裁定改内联）。BEI JING / Stellantis 为
+        // raw 独有（assets 索引无此二品牌）置顶，其余取 assets/car-logos 索引（141 品牌，
+        // 原预置的 BMW/BYD/Toyota 等直接用 assets 版本，不重复出牌）。
+        // 1.0.17 语义保留：选中即替换显示名称（用户手动改过也可再次覆盖）。
         column.addView(TextView(activity).apply {
-            text = "厂家预置"
+            text = "品牌车标（左右滑动，点按应用）"
             setTextColor(Ui.TEXT)
             textSize = 16f
             setPadding(0, Ui.dip(activity, 20), 0, Ui.dip(activity, 6))
         })
-        val brandRow = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
-        // 1.0.17：预置图标与厂家名成对 —— 选中即替换显示名称（原缺陷：只换图不换名）。
-        // 1.1.1：新增 BEIJING 车标（北汽 EU5 用户请求，仅预置可选，非默认）。
-        val brands = listOf(
-            R.raw.logo_beijing to "BEI JING",
-            R.raw.logo_bmw to "BMW",
-            R.raw.logo_byd to "BYD",
-            R.raw.logo_ford to "Ford",
-            R.raw.logo_honda to "Honda",
-            R.raw.logo_hyundai to "Hyundai",
-            R.raw.logo_nissan to "Nissan",
-            R.raw.logo_stellantis to "Stellantis",
-            R.raw.logo_toyota to "Toyota",
-            R.raw.logo_volkswagen to "Volkswagen",
+        if (brandIndex.isEmpty()) {
+            brandIndex = loadBrandIndex()
+            if (brandIndex.isEmpty()) {
+                // 取证点：车机报「无法预览清单」时优先核对这条——索引加载失败即资源缺失。
+                LiteLog.log("ui", "车标资源缺失：assets/car-logos 索引为空，滑动栏仅显示 raw 预置")
+            }
+        }
+        val tiles = mutableListOf(
+            BrandTile("BEI JING", "北京", R.raw.logo_beijing, null),
+            BrandTile("Stellantis", "Stellantis", R.raw.logo_stellantis, null),
         )
-        for ((id, brandName) in brands) {
-            brandRow.addView(ImageView(activity).apply {
-                scaleType = ImageView.ScaleType.FIT_CENTER
-                layoutParams = LinearLayout.LayoutParams(Ui.dip(activity, 44), Ui.dip(activity, 44)).apply {
-                    rightMargin = Ui.dip(activity, 8)
+        for (entry in brandIndex) tiles.add(BrandTile(entry.en, entry.cn, null, entry))
+        val tileRows = 2
+        val tileWidth = activity.windowManager.defaultDisplay.width / 5
+        val tileHeight = Ui.dip(activity, 72)
+        val tileColumns = ceil(tiles.size / tileRows.toDouble()).toInt()
+        val strip = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
+        for (c in 0 until tileColumns) {
+            val colBox = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
+            for (r in 0 until tileRows) {
+                val index = c * tileRows + r
+                val cell = LinearLayout(activity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER
+                    layoutParams = LinearLayout.LayoutParams(tileWidth, tileHeight)
                 }
-                setImageResource(id)
-                setOnClickListener {
-                    val bytes = try {
-                        activity.resources.openRawResource(id).use { it.readBytes() }
-                    } catch (_: Exception) {
-                        ByteArray(0)
+                if (index < tiles.size) {
+                    val tile = tiles[index]
+                    val icon = ImageView(activity).apply {
+                        scaleType = ImageView.ScaleType.FIT_CENTER
+                        layoutParams = LinearLayout.LayoutParams(Ui.dip(activity, 44), Ui.dip(activity, 44))
                     }
-                    if (bytes.isEmpty() || !CarIconStore.save(activity, bytes)) {
-                        toast("该图标不合规：需正方形 PNG 且 ≤1024px")
-                    } else {
-                        // 名称随图标替换为厂家名（用户在输入框手动改过也可再次覆盖）。
-                        val cfg = LiteConfig.load(activity)
-                        LiteConfig.save(activity, cfg.copy(carIconName = brandName))
-                        nameInput.setText(brandName)
-                        refreshPreview()
-                        toast("已应用：$brandName（重新连接后生效）")
+                    val label = TextView(activity).apply {
+                        text = tile.cn
+                        setTextColor(Ui.SUB)
+                        textSize = 10f
+                        maxLines = 1
+                    }
+                    cell.addView(icon)
+                    cell.addView(label)
+                    val rawResId = tile.rawResId
+                    val entry = tile.entry
+                    if (rawResId != null) {
+                        icon.setImageResource(rawResId)
+                        cell.setOnClickListener { applyRawPreset(rawResId, tile.en, nameInput) }
+                    } else if (entry != null) {
+                        icon.setImageBitmap(brandIcon(entry))
+                        cell.setOnClickListener { applyBrand(entry) { nameInput.setText(tile.en) } }
                     }
                 }
-            })
+                colBox.addView(cell)
+            }
+            strip.addView(colBox)
         }
         column.addView(HorizontalScrollView(activity).apply {
             isHorizontalScrollBarEnabled = false
-            addView(brandRow)
+            addView(strip)
         })
         return android.widget.ScrollView(activity).apply {
             isFillViewport = true
             addView(column)
+        }
+    }
+
+    // ---------- 品牌车标滑动栏（vc95，取代 1.1.6 独立网格页） ----------
+
+    /** 应用 raw 预置车标：读 raw 资源 → CarIconStore 校验落盘 + 名称替换（1.0.17 配对语义）。 */
+    private fun applyRawPreset(rawResId: Int, brandName: String, nameInput: EditText) {
+        val bytes = try {
+            activity.resources.openRawResource(rawResId).use { it.readBytes() }
+        } catch (_: Exception) {
+            ByteArray(0)
+        }
+        if (bytes.isEmpty() || !CarIconStore.save(activity, bytes)) {
+            toast("该图标不合规：需正方形 PNG 且 ≤1024px")
+        } else {
+            val cfg = LiteConfig.load(activity)
+            LiteConfig.save(activity, cfg.copy(carIconName = brandName))
+            nameInput.setText(brandName)
+            refreshPreview()
+            toast("已应用：$brandName（重新连接后生效）")
+        }
+    }
+
+    /** assets 车标解码（带缓存；滑动栏直接复用，避免每次滑动重解码）。 */
+    private fun brandIcon(entry: BrandEntry): Bitmap? {
+        synchronized(brandIconCache) { brandIconCache[entry.key] }?.let { return it }
+        return try {
+            val bitmap = BitmapFactory.decodeStream(activity.assets.open("$BRAND_ASSET_DIR/${entry.key}.png"))
+            synchronized(brandIconCache) { brandIconCache[entry.key] = bitmap }
+            bitmap
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** 读 assets/car-logos/index.tsv（key\ten\tcn，UTF-8）；容错跳过畸形行。 */
+    private fun loadBrandIndex(): List<BrandEntry> {
+        return try {
+            activity.assets.open("$BRAND_ASSET_DIR/index.tsv").bufferedReader(Charsets.UTF_8).readLines()
+                .mapNotNull { line ->
+                    val cols = line.split('\t')
+                    if (cols.size < 3) null else BrandEntry(cols[0].trim(), cols[1].trim(), cols[2].trim())
+                }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /** 应用品牌车标：assets 解码 → 中心补方 256×256 → CarIconStore 落盘 + 名称替换；onApplied 在应用成功后回调（UI 线程）。 */
+    private fun applyBrand(entry: BrandEntry, onApplied: () -> Unit = {}) {
+        executor.execute {
+            val encoded = try {
+                val bytes = activity.assets.open("$BRAND_ASSET_DIR/${entry.key}.png").use { it.readBytes() }
+                val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    ?: return@execute
+                val side = max(bitmap.width, bitmap.height)
+                val padded = Bitmap.createBitmap(side, side, Bitmap.Config.ARGB_8888)
+                Canvas(padded).drawBitmap(
+                    bitmap,
+                    ((side - bitmap.width) / 2f),
+                    ((side - bitmap.height) / 2f),
+                    null,
+                )
+                bitmap.recycle()
+                val output = ByteArrayOutputStream().use { stream ->
+                    padded.compress(Bitmap.CompressFormat.PNG, 100, stream)
+                    stream.toByteArray()
+                }
+                padded.recycle()
+                output
+            } catch (_: Exception) {
+                ByteArray(0)
+            }
+            activity.runOnUiThread {
+                if (activity.isFinishing) return@runOnUiThread
+                if (encoded.isEmpty() || !CarIconStore.save(activity, encoded)) {
+                    toast("应用失败：${entry.en}")
+                } else {
+                    val cfg = LiteConfig.load(activity)
+                    LiteConfig.save(activity, cfg.copy(carIconName = entry.en))
+                    refreshPreview()
+                    toast("已应用：${entry.en} / ${entry.cn}（重新连接后生效）")
+                    onApplied()
+                }
+            }
         }
     }
 

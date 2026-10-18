@@ -26,6 +26,7 @@ object LiteLog {
     private var writer: FileWriter? = null
     private var logDirectory: File? = null
     private var fileBytes = 0L
+    private var unflushed = 0
     @Volatile private var currentFile: File? = null
 
     /** 挂载文件持久化；失败静默降级为仅内存日志，绝不影响主流程。 */
@@ -69,8 +70,13 @@ object LiteLog {
             try {
                 w.write(line)
                 w.write("\n")
-                w.flush()
+                // vc136 审查节流：逐条 flush 在 KK eMMC 上单条可拖几十 ms（iPhone 高频
+                // mDNS 查询时日志风暴直接拖卡 UI 线程）——改攒 8 条或轮转时统一 flush
                 fileBytes += line.length + 1
+                if (++unflushed >= 8 || fileBytes > FILE_MAX_BYTES) {
+                    unflushed = 0
+                    w.flush()
+                }
                 if (fileBytes > FILE_MAX_BYTES) rotateLocked()
             } catch (_: Exception) {
                 // 写入失败不影响主流程

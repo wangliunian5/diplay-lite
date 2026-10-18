@@ -27,6 +27,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
+import com.shilapi.xcertplay.transport.PcapTap
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -472,6 +473,43 @@ class SettingsPage(private val activity: MainActivity) {
             addView(smallOutlineButton("上传") { showGiteeUploadDialog() }.also { giteeUploadButton = it }, sideMargin())
         }
         column.addView(logRow, block(top = dip(14)))
+
+        // fe6t1：数据流抓包（应用层 pcap，无 root）——NCM 桥入/出站以太网帧环形落盘
+        //（3 文件 × 32MB 滚动覆盖），供 wedge/黑边等数据面问题取证。文件在
+        // Android/data/<pkg>/files/pcap/，文件管理器可直接取出，Wireshark 打开即读。
+        val pcapStatus = TextView(activity).apply {
+            text = if (PcapTap.isActive()) "抓包中：${PcapTap.currentFile()}" else "未抓包"
+            setTextColor(Ui.SUB)
+            textSize = 11f
+        }
+        val pcapRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(
+                TextView(activity).apply {
+                    text = "数据流抓包（试验）"
+                    setTextColor(Ui.TEXT)
+                    textSize = 13f
+                },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+            )
+            addView(smallOutlineButton("开始") {
+                val dir = File(activity.getExternalFilesDir(null), "pcap")
+                val path = PcapTap.start(dir)
+                pcapStatus.text = "抓包中：$path"
+                LiteLog.log("service", "pcap capture started: $path")
+                Toast.makeText(activity, "开始抓包（NCM 入/出站），文件在 files/pcap/", Toast.LENGTH_SHORT).show()
+            }, sideMargin())
+            addView(smallOutlineButton("停止") {
+                val s = PcapTap.stats()
+                PcapTap.stop()
+                pcapStatus.text = "已停止（$s）"
+                LiteLog.log("service", "pcap capture stopped: $s")
+                Toast.makeText(activity, "已停止抓包", Toast.LENGTH_SHORT).show()
+            }, sideMargin())
+        }
+        column.addView(pcapRow, block(top = dip(14)))
+        column.addView(pcapStatus, block(top = dip(2)))
 
         // 关于：M15 纪律，真实 versionName
         column.addView(divider(), block(top = dip(14)))
@@ -1136,6 +1174,13 @@ class SettingsPage(private val activity: MainActivity) {
             append("分辨率：").append(metrics.widthPixels).append("x").append(metrics.heightPixels)
                 .append(" density=").append(metrics.density).append("\n")
             append("系统版本：").append(systemVersion).append("（release ").append(Build.VERSION.RELEASE).append("）\n")
+            // vc95：ROM 标识 + ROM 编译时间——同 Android 版本的白牌车机大量雷同（鼎微多台
+            // 同为 4.4.2、FE-6 各车 5.1），仅凭 MODEL 无法定位到具体一台测试机；display.id
+            // 缺失/雷同（generic）时回退 Build.ID，再以 ROM 编译时间兜底区分。
+            val romDisplay = Build.DISPLAY?.trim().orEmpty().ifEmpty { Build.ID }
+            append("ROM版本：").append(romDisplay)
+                .append("（built ").append(SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(Build.TIME)))
+                .append("）\n")
             append("软件版本：").append(versionName).append("\n")
             append("上传时间：").append(stamp).append("\n")
             append("──── 运行日志 ────\n")

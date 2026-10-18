@@ -45,3 +45,17 @@ release-signing.properties
 
 # Allow archived release APKs (keep only the last 3)
 !apks/*.apk
+
+# 车主隐私与取证产物、反编译工作区、外部引用仓（仅本地留存，永不入仓）
+logs/
+tmp-analysis/
+legacy-ref/
+log-repo/
+log-collection/
+log-collection-tmp/
+gitee-logs/
+gitee-logs-已排查-20261007/
+t3-root-debug/
+backup/
+hardware-stage/
+*.pcap

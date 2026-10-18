@@ -41,9 +41,23 @@ object LockdownTlsEngineFactory {
                 load(null, password)
                 setKeyEntry(KEY_ALIAS, privateKey, password, arrayOf(certificate))
             }
-            val keyManagers = KeyManagerFactory.getInstance("PKIX").apply {
-                init(keyStore, password)
-            }.keyManagers
+            // vc105（AC822X 4.2.2 精简 ROM 实测）：KeyManagerFactory "PKIX" 算法被砍
+            // （KeyManagerFactory PKIX implementation not found，carkit TLS 建链死于此），
+            // 按 PKIX → X509 降级尝试——"X509" 是 4.x BouncyCastle/Conscrypt 都有的
+            // 旧别名，功能等价（KeyManager 只是装载体内的私钥+证书）。
+            val keyManagers = run {
+                var lastError: GeneralSecurityException? = null
+                for (algorithm in arrayOf("PKIX", "X509")) {
+                    try {
+                        return@run KeyManagerFactory.getInstance(algorithm).apply {
+                            init(keyStore, password)
+                        }.keyManagers
+                    } catch (error: GeneralSecurityException) {
+                        lastError = error
+                    }
+                }
+                throw lastError ?: GeneralSecurityException("No KeyManagerFactory algorithm available")
+            }
             val context = SSLContext.getInstance("TLS").apply {
                 init(keyManagers, arrayOf(UsbLockdownTrustManager), null)
             }

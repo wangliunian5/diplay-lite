@@ -151,6 +151,17 @@ internal object LiteSteeringKeys {
         if (ready) sendOperation(binding.operation, key.source)
     }
 
+    /**
+     * vc87（fe6t5）窗口 KeyEvent 派发入口：FE-6 方控以窗口 KeyEvent 形态进 App
+     * （fe6t2/fe6t3 日志：code=87/88 dev=-1 src=0，MediaSession/logcat/广播三通路
+     * 零触发），学习绑定建得起但永不派发——「方控按键 sent=」零记录。
+     * dispatchKeyEvent 观察侧转调本入口：DOWN 命中学习绑定（学习页按 ACTION_DOWN
+     * 存储），UP 命中标准媒体键/默认映射；复用既有 binding 匹配与 180ms 去重。
+     */
+    fun onWindowKeyEvent(keyCode: Int, event: Int) {
+        onSessionKeyEvent(keyCode, event)
+    }
+
     /** MediaSession 回调/学习共用入口：source 固定 "session"。 */
     private fun onSessionKeyEvent(keyCode: Int, event: Int) {
         val learner = synchronized(lock) {

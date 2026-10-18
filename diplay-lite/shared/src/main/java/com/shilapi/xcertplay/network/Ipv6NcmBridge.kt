@@ -28,6 +28,13 @@ class Ipv6NcmBridge(
     // 1.0.26 的原生日志（xcertplay-usb TAG）在采集文件里 0 条，clear-halt 是否
     // 触发过完全无法取证。
     private val onDiagnostic: (String) -> Unit = {},
+    // vc96（FE-6 断链分析）：wedge fatal 判定阈值可调——no_audio 会话无音频恒流垫底，
+    // 画面静止时入向断流属正常形态，构造方按变体放宽；默认维持 6s。
+    private val stallFatalMillis: Long = STALL_FATAL_MILLIS,
+    // vc97③：wedge 判别器探针——NCM 数据面断流时，控制面（usbmux）是否仍活着。
+    // 控制口活而数据口死=端点级真楔死→按 stallFatalMillis 快拆（clear halt 已救过一次）；
+    // 控制口同停=iPhone 整体停发型（FE-6 形态，数秒后自愈）→宽限 20s 防误拆好桥。
+    private val usbmuxAlive: () -> Boolean = { false },
 ) : Closeable {
     init {
         require(hostMac.size == EthernetIpv6Codec.MAC_BYTES) { "hostMac must be 6 bytes" }
@@ -46,9 +53,21 @@ class Ipv6NcmBridge(
     private val running = AtomicBoolean(false)
     private lateinit var ncmToTunThread: Thread
     private lateinit var tunToNcmThread: Thread
+    // vc94：close 时写哑包唤醒阻塞在 TUN read 的出站线程（部分内核/ROM 上 tun fd close
+    // 不唤醒阻塞中的 read，僵尸线程随重连累积）。
+    private var tunOutput: FileOutputStream? = null
+
+    /**
+     * vc125（KK 实测）：内核对 tun 设备的 IPv6 组播不投递给应用 socket（snmp6 计数
+     * 持续增长但 mDNS 应答器 socket 零收包）——进程内旁路：入向以太网帧在写 tun 前
+     * 喂给观察者（mDNS 应答器直取 UDP 5353 查询），绕开内核组播路径。
+     */
+    @Volatile
+    var inboundFrameTap: ((ByteArray) -> Unit)? = null
 
     fun start() {
         check(running.compareAndSet(false, true)) { "bridge is already started" }
+        tunOutput = FileOutputStream(tun.fileDescriptor)
         ncmToTunThread = Thread(::runNcmToTun, "ncm-ipv6-in").apply {
             isDaemon = true
             start()
@@ -61,8 +80,13 @@ class Ipv6NcmBridge(
 
     override fun close() {
         if (!running.compareAndSet(true, false)) return
-        ncm.close()
-        tun.close()
+        // vc94：先写哑包再关 fd——TUN 只有 fe80::/64 路由，目的地址 ff02::1（链路本地组播）
+        // 的包会被内核从 TUN 路由出去，read 侧必然醒来；reader 在 read 返回后检查 running
+        // 已 false 即退出，哑包不会被转发到 NCM。随后关 fd 并 join，防僵尸线程累积。
+        runCatching { tunOutput?.write(DUMMY_TUN_PACKET) }
+        runCatching { ncm.close() }
+        runCatching { tunOutput?.close() }
+        runCatching { tun.close() }
         join(ncmToTunThread)
         join(tunToNcmThread)
     }
@@ -93,9 +117,15 @@ class Ipv6NcmBridge(
                             onDiagnostic("ncm inbound stalled ${idleMs}ms mid-stream; attempting clear halt")
                             ncm.clearHaltInEndpoints()
                         }
-                        if (idleMs > STALL_FATAL_MILLIS) {
+                        // vc97③：wedge 判别器——控制面死则放宽到 20s（iPhone 停发型自愈窗），
+                        // 控制面活则维持变体阈值（真端点楔死快拆）。no_audio 15s 与 20s 取 max。
+                        val fatalThreshold =
+                            if (usbmuxAlive()) stallFatalMillis
+                            else maxOf(stallFatalMillis, STALL_GRACE_CONTROL_DEAD_MILLIS)
+                        if (idleMs > fatalThreshold) {
                             onDiagnostic(
-                                "ncm inbound stalled ${idleMs}ms mid-stream; closing bridge for full reconnect",
+                                "ncm inbound stalled ${idleMs}ms mid-stream; closing bridge " +
+                                    "(usbmuxAlive=${usbmuxAlive()} threshold=${fatalThreshold}ms)",
                             )
                             onError(IOException("ncm inbound stalled ${idleMs}ms mid-stream (usb wedge)"))
                             close()
@@ -139,6 +169,7 @@ class Ipv6NcmBridge(
                     inboundLogBudget--
                     Log.i(TAG, "ncm inbound ${frame.summary(ipv6.payloadOffset)}")
                 }
+                inboundFrameTap?.invoke(frame)
                 output.write(frame, ipv6.payloadOffset, ipv6.payloadLength)
             }
         } catch (error: IOException) {
@@ -165,6 +196,9 @@ class Ipv6NcmBridge(
                     continue
                 }
                 val tunPacket = buffer.copyOf(length)
+                // vc94：close() 写哑包唤醒本线程——read 返回后 running 已 false，直接退出，
+                // 哑包不进入编解码与 NCM 发送路径。
+                if (!running.get()) return
                 val ipv6 = EthernetIpv6Codec.addNeighborAdvertisementTargetMac(tunPacket, hostMac)
                 if (ipv6.size != tunPacket.size) {
                     Log.i(TAG, "ncm added target-link-layer option to neighbor advertisement")
@@ -238,6 +272,21 @@ class Ipv6NcmBridge(
         const val ZERO_READ_BACKOFF_NANOS = 1_000_000L
         const val JOIN_TIMEOUT_MILLIS = 2_000L
 
+        // vc94：close 唤醒哑包——最小 IPv6 头（40B），next header=59(No Next Header)、
+        // hop limit=1、src=fe80::2、dst=ff02::1。TUN 仅 fe80::/64 路由，链路本地组播包
+        // 内核必然从 TUN 发出 → 阻塞在 read 的线程醒来（只用于唤醒，reader 不转发）。
+        val DUMMY_TUN_PACKET = ByteArray(40).apply {
+            this[0] = 0x60
+            this[6] = 0x3b
+            this[7] = 0x01
+            this[8] = 0xfe.toByte() // src fe80::2
+            this[9] = 0x80.toByte()
+            this[23] = 0x02
+            this[24] = 0xff.toByte() // dst ff02::1
+            this[25] = 0x02
+            this[39] = 0x01
+        }
+
         // 1.0.26 入向楔死看门狗：armed 后静默先试 clear halt，仍死关桥重建。
         // 阈值依据：会话内音频 50pkt/s 恒流 + RTSP 秒级轮询，零入向远超正常空闲。
         // 1.0.27 提速：3e 1.0.26 实测用户在楔死后 ~5.3s 就手动断开（21:35:30.7 楔死 →
@@ -247,5 +296,8 @@ class Ipv6NcmBridge(
         const val STREAMING_FRAMES_PER_WINDOW = 40
         const val STALL_CLEAR_HALT_MILLIS = 2_500L
         const val STALL_FATAL_MILLIS = 6_000L
+        // vc97③：控制面（usbmux）同停时的宽限上限——iPhone 停发型断流数秒自愈（FE-6 实锤），
+        // 20s 给足自愈窗；超过即升级为会话级拆桥（此时大概率不是停发而是链路级死亡）。
+        const val STALL_GRACE_CONTROL_DEAD_MILLIS = 20_000L
     }
 }

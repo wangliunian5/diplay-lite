@@ -35,6 +35,9 @@ data class LiteConfig(
     val btAudioInfoVariant: String = "no_audio",
     // M6k19：音乐缓存毫秒数（10-4000，默认 300 = MediaAudioBuffer.DEFAULT_MILLIS）。
     val mediaBufferMillis: Int = 300,
+
+    /** vc109：底部触摸失灵区占比‰（0=关闭）。仅影响视频视图高度与触摸映射。 */
+    val touchTrimBottomPermille: Int = 0,
     // 1.0.29：分辨率设定三选一。fit=自动（保持纵横比，等比 letterbox）/
     // stretch=自动（拉伸铺满）/ manual=手动指定宽高。
     val resolutionMode: String = "fit",
@@ -145,6 +148,9 @@ data class LiteConfig(
                 avPathMode = prefs.getString("av_path_mode", "full") ?: "full",
                 btAudioInfoVariant = prefs.getString("bt_audio_info_variant", "no_audio") ?: "no_audio",
                 mediaBufferMillis = prefs.getInt("media_buffer_millis", 300),
+                // vc109（T3 触摸屏下沿物理失灵）：0=关闭；>0=底部失灵区占比‰（154≈1/6.5）。
+                // 视频视图缩进顶部有效区，触摸映射基于视图尺寸自动重映射，死区天然丢弃。
+                touchTrimBottomPermille = prefs.getInt("touch_trim_bottom_permille", 0),
                 resolutionMode = prefs.getString("video_resolution_mode", "fit") ?: "fit",
                 manualWidth = prefs.getInt("manual_resolution_w", 1024)
                     .coerceIn(MIN_MANUAL_RESOLUTION, MAX_MANUAL_RESOLUTION),
@@ -186,6 +192,7 @@ data class LiteConfig(
                 .putString("av_path_mode", config.avPathMode)
                 .putString("bt_audio_info_variant", config.btAudioInfoVariant)
                 .putInt("media_buffer_millis", config.mediaBufferMillis)
+                .putInt("touch_trim_bottom_permille", config.touchTrimBottomPermille)
                 // vc59 修复（8815 实测）：分辨率设定三键漏写——load 读 video_resolution_mode/
                 // manual_resolution_w/h，但 save 从未写入，导致「手动设定分辨率」确认重启后
                 // 落盘丢失，单选弹回「保持纵横比」、手动输入行不显示。
