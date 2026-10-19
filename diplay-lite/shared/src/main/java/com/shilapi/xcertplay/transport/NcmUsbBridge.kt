@@ -285,23 +285,25 @@ class NcmUsbBridge internal constructor(
             // NTB 的 NTH16 签名首字节 → 校验失败 failSession → NCM 读线程终止 → 视频
             // 冻结（rx=6fps shown=1fps，"Invalid NTB16 short-packet pad"×2）。改为 pad
             // 可选：块边界处等下一字节判别，0x00 才消费 pad，否则按 blockLength 原样解析。
-            val blockAligned = blockLength % USB_PACKET_SIZE == 0
-            if (blockAligned && bufferedSize <= blockLength) return
             // vc138（TS7 实测 13:07-13:10）：iPhone 的块定界短包实测为 4 字节全零，vc 原假设
             // 固定 1 字节 pad 时恒剩 3 字节垃圾 → 静态画面期每 1~2 秒假失步一次 resync
             // （dropped 3 head=000000），错位叠加向抖动时触发 audio gap compensated，
-            // 形成可感知的音乐卡顿。改为通用 pad 消费：块边界处跳过连续 0x00 至下一非零
-            // 字节（下一 NTH16 签名首字节 0x4E 恒非零、pad 恒全零，判别安全；上限一个
-            // USB 包）。1 字节/4 字节/ZLP 定界统一覆盖，vc72/73 失步扫描与风暴防护不动。
+            // 形成可感知的音乐卡顿。
+            // vc139（TS7 实测 13:45-13:46）：vc138 的 pad 消费被 blockAligned 限定只覆盖
+            // 512 倍数块，而实际失步块的 blockLength 非 512 倍数（pad 疑为 4 字节对齐填充）
+            // ——resync 照旧频发。改为 pad 扫描通用化：不限块对齐，块边界处一律跳过连续
+            // 0x00 至下一非零字节（下一 NTH16 签名首字节 0x4E 恒非零、pad 恒全零，判别
+            // 安全；上限一个 USB 包）。无 pad（下一字节即签名）时跳过 0 字节，行为不变；
+            // 1/4 字节、块尾对齐填充、ZLP 定界统一覆盖，vc72/73 失步扫描与风暴防护不动。
+            if (bufferedSize <= blockLength) return
             var wireLength = blockLength
-            if (blockAligned && buffered[blockLength].toInt() == 0) {
+            if (buffered[blockLength].toInt() == 0) {
                 var padEnd = blockLength
                 val padLimit = minOf(bufferedSize, blockLength + USB_PACKET_SIZE)
                 while (padEnd < padLimit && buffered[padEnd].toInt() == 0) padEnd++
                 if (padEnd >= bufferedSize) return
                 wireLength = padEnd
             }
-            if (bufferedSize < wireLength) return
             for (frame in Ntb16Codec.parse(buffered, 0, blockLength)) enqueueFrame(frame)
             val remaining = bufferedSize - wireLength
             buffered.copyInto(buffered, 0, wireLength, bufferedSize)
