@@ -287,8 +287,20 @@ class NcmUsbBridge internal constructor(
             // 可选：块边界处等下一字节判别，0x00 才消费 pad，否则按 blockLength 原样解析。
             val blockAligned = blockLength % USB_PACKET_SIZE == 0
             if (blockAligned && bufferedSize <= blockLength) return
-            val wireLength =
-                if (blockAligned && buffered[blockLength].toInt() == 0) blockLength + 1 else blockLength
+            // vc138（TS7 实测 13:07-13:10）：iPhone 的块定界短包实测为 4 字节全零，vc 原假设
+            // 固定 1 字节 pad 时恒剩 3 字节垃圾 → 静态画面期每 1~2 秒假失步一次 resync
+            // （dropped 3 head=000000），错位叠加向抖动时触发 audio gap compensated，
+            // 形成可感知的音乐卡顿。改为通用 pad 消费：块边界处跳过连续 0x00 至下一非零
+            // 字节（下一 NTH16 签名首字节 0x4E 恒非零、pad 恒全零，判别安全；上限一个
+            // USB 包）。1 字节/4 字节/ZLP 定界统一覆盖，vc72/73 失步扫描与风暴防护不动。
+            var wireLength = blockLength
+            if (blockAligned && buffered[blockLength].toInt() == 0) {
+                var padEnd = blockLength
+                val padLimit = minOf(bufferedSize, blockLength + USB_PACKET_SIZE)
+                while (padEnd < padLimit && buffered[padEnd].toInt() == 0) padEnd++
+                if (padEnd >= bufferedSize) return
+                wireLength = padEnd
+            }
             if (bufferedSize < wireLength) return
             for (frame in Ntb16Codec.parse(buffered, 0, blockLength)) enqueueFrame(frame)
             val remaining = bufferedSize - wireLength
