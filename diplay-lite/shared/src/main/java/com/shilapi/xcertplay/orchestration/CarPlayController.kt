@@ -337,6 +337,8 @@ class CarPlayController(
     @Volatile private var permissionCloseable: Closeable? = null
     @Volatile private var attachCloseable: Closeable? = null
     @Volatile private var wiredMux: Iap2UsbMuxHost? = null
+    // vc142：有线会话底层 USB session——close() 时立即关闭以打断阻塞中的 begin 并收回 fd。
+    @Volatile private var wiredUsbSession: Iap2UsbSession? = null
     @Volatile private var wiredCsm: Iap2Session? = null
     @Volatile private var wiredBridge: Ipv6NcmBridge? = null
     // vc68：有线 mDNS 应答器（iOS16.x 在 NCM 链路上 mDNS 发现 _airplay，无应答拒绝起会话）
@@ -645,6 +647,12 @@ class CarPlayController(
                 try {
                     if (config.transport == CarPlayTransport.WIRED) {
                         closeBestEffort("wired stack") { closeWiredStack(reason = "controller-close") }
+                        // vc142：立即关底层 USB session——打断阻塞在 Iap2UsbMuxHost.begin 的
+                        // bring-up 协程（最长 60s），并把 fd 归权收回 controller，防止其迟到
+                        // 的 finally 清理误伤下一次连接复用的 connection（openOnce 同 fd）。
+                        val activeSession = wiredUsbSession
+                        wiredUsbSession = null
+                        closeBestEffort("wired usb session") { activeSession?.close() }
                     } else {
                         // M6k24：控制器整体关闭时，保留待复用的热点附着也要一并释放。
                         val retained = retainedHotspot
@@ -2568,7 +2576,19 @@ class CarPlayController(
             debugLog("wired self-heal retry: same device instance streamed before; assuming CarPlay configuration")
         }
         onStatus(CarPlayStatus.SelectingConfiguration)
-        onStatus(CarPlayStatus.OpeningDataPaths)
+        // vc143：重试轮次可见。version-timeout 复位重试时，界面此前每轮被
+        // 「正在打开 USB 数据通道…」覆盖后进入长静默（观感=卡死，复位提示一闪
+        // 而过）。轮次>0 时把轮次带进文案，静默等待期始终可见。
+        val retryAttempt = wiredRetryCount.get()
+        if (retryAttempt > 0) {
+            onStatus(
+                CarPlayStatus.RecoveryHint(
+                    "正在打开 USB 数据通道…（自动重试第 $retryAttempt/$MAX_WIRED_RETRIES 轮）",
+                ),
+            )
+        } else {
+            onStatus(CarPlayStatus.OpeningDataPaths)
+        }
         iphoneHost?.openIap2UsbSessionAsync(
             target,
             executor,
@@ -2749,6 +2769,12 @@ class CarPlayController(
 
     private fun runWiredStack(usbSession: Iap2UsbSession, ncm: NcmUsbBridge) {
         phase = Phase.CONTROL
+        // vc142（TS7 实测 14:14-14:19）：USBMUX version 卡死时 begin 阻塞可达 60s，用户断开
+        // 后旧 bring-up 协程仍存活，超时退出后 finally 的 ncm.close() 会关掉已被下一次连接
+        // 复用的共享 fd（openOnce 同 device 复用 connection）→ 新会话全线 EBADF 崩溃。
+        // 修复①：session 挂到实例字段，close() 时立即关闭 → begin 内 bulk 读秒败退出，
+        // fd 归属始终清晰（close 时归 controller、运行期归会话），僵尸协程不再存活 60s。
+        wiredUsbSession = usbSession
         var ncmOwnedLocally = true
         try {
             if (closed) return
@@ -2877,7 +2903,38 @@ class CarPlayController(
                 startIphone()
             }, delayMs)
         } catch (error: Throwable) {
+            // vc142：controller 已关闭后的到达异常（含 close() 关 session 引发的 begin 秒败）
+            // 属于僵尸协程的迟到错误——直接丢弃，禁止再触碰 fail/重试/清栈（它们此时要么
+            // 无害要么误伤下一次连接的资源）。
+            if (closed) {
+                debugLog("wired bring-up error after close; stale error discarded", error)
+                return
+            }
             debugLog("wired bring-up failed", error)
+            // vc142：USBMUX version reply 超时 = iPhone 侧 CarPlay 会话僵死（13:39/14:14 两次
+            // 实证，拔插线才恢复）。归入自动重试并置全量复位——重试时 0x52+setConfiguration
+            // 强制 iPhone 重新枚举，等价于用户拔插线，不再傻等 60s 后终态失败。
+            if (error is IphoneUsbException.TimedOut &&
+                error.message.orEmpty().contains("USBMUX version reply", ignoreCase = true)
+            ) {
+                closeWiredStack(restoreNetwork = false, reason = "usbmux-version-timeout")
+                wiredFullResetPending = true
+                val attempt = wiredRetryCount.incrementAndGet()
+                if (attempt > MAX_WIRED_RETRIES) {
+                    debugLog("wired usbmux-version-timeout auto-retry exhausted")
+                    onStatus(CarPlayStatus.ControlEnded)
+                    return
+                }
+                onStatus(
+                    CarPlayStatus.RecoveryHint("iPhone 无响应，正在复位 USB 重连（第 $attempt 次）"),
+                )
+                debugLog("wired usbmux version timeout; full-reset auto-retry $attempt/$MAX_WIRED_RETRIES")
+                mainHandler.postDelayed({
+                    if (closed) return@postDelayed
+                    startIphone()
+                }, WIRED_RETRY_DELAY_BASE_MILLIS * attempt)
+                return
+            }
             // 1.0.29：看门狗关桥引发的底层异常（close 竞态）不做终态 fail，与 wedgeSuspect
             // 正常路径同节奏：清栈 + 30s 长退避后 startIphone 重建。
             if (wiredEstablishWatchdogFired && !closed) {

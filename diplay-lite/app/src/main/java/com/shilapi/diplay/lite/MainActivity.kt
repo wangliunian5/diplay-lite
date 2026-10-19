@@ -114,6 +114,12 @@ class MainActivity : Activity() {
     private var lastActive = false
     // 与设置页同步：记录当前渲染出的默认通道，tick 里比对 LiteConfig.activeChannel
     private var shownActiveChannel: String? = null
+    // vc145（C8815 实测 23:54 定案）：refreshTask 每 500ms 全量重绘，dalvik 低端机
+    // 每 tick 主线程 ~11ms 且持续制造分配——状态未变时短路全部 UI 写，降低空闲
+    // 主线程负载与 GC 压力（未连接期按钮响应的 app 侧放大器）。
+    private var shownPhase: LiteState.Phase? = null
+    private var shownRunning: Boolean? = null
+    private var shownStatus: String? = null
     // 自动连接一个进程生命周期只发起一次，避免用户断开后再被拉起
     private var autoConnectTried = false
 
@@ -1358,39 +1364,47 @@ class MainActivity : Activity() {
     private fun renderState() {
         val phase = LiteState.phase
         val running = LiteState.running
-        // 大状态卡状态点：总览实时状态。
-        (statusDot.background as? GradientDrawable)?.setColor(
-            when (phase) {
-                LiteState.Phase.ACTIVE -> Ui.GREEN
-                LiteState.Phase.CONNECTING -> DOT_CONNECTING
-                LiteState.Phase.FAILED -> DOT_FAILED
-                LiteState.Phase.IDLE -> Color.GRAY
-            },
-        )
-        statusLine.text = LiteState.statusText
+        val statusText = LiteState.statusText
+        // vc145：状态未变即短路（哨兵 null 保证首 tick 必跑）；activeChannel/面板
+        // 显隐有独立变化检测，保持每 tick 执行（设置页改动后回主页实时刷新依赖它）。
+        if (phase != shownPhase || running != shownRunning || statusText != shownStatus) {
+            shownPhase = phase
+            shownRunning = running
+            shownStatus = statusText
+            // 大状态卡状态点：总览实时状态。
+            (statusDot.background as? GradientDrawable)?.setColor(
+                when (phase) {
+                    LiteState.Phase.ACTIVE -> Ui.GREEN
+                    LiteState.Phase.CONNECTING -> DOT_CONNECTING
+                    LiteState.Phase.FAILED -> DOT_FAILED
+                    LiteState.Phase.IDLE -> Color.GRAY
+                },
+            )
+            statusLine.text = statusText
+            // M6k24：主按钮固定「立即连接」（连接中/激活置灰）；断开连接独立成键，仅连接中出现。
+            primaryActionButton.isEnabled = !running
+            primaryActionButton.alpha = if (running) 0.5f else 1f
+            disconnectButton.visibility = if (running) View.VISIBLE else View.GONE
+            // FAILED 态弹居中小卡片（标题+3行省略+重试）；其余状态收起。
+            val failed = phase == LiteState.Phase.FAILED
+            if (failed && errorCard.visibility != View.VISIBLE) {
+                errorTextView.text = statusText
+                errorCard.visibility = View.VISIBLE
+            } else if (!failed && errorCard.visibility == View.VISIBLE) {
+                errorCard.visibility = View.GONE
+            }
+            // 连接成功即自动收起面板 —— 此时用户要看的是 CarPlay 画面；断开后再自动展开。
+            val active = phase == LiteState.Phase.ACTIVE
+            if (active != lastActive) {
+                lastActive = active
+                setPanelVisible(!active)
+            }
+        }
         // 默认通道提示与设置页三选项同步（设置页改动后回到主页实时刷新）。
         val activeChannel = LiteConfig.load(this).activeChannel
         if (activeChannel != shownActiveChannel) {
             shownActiveChannel = activeChannel
             hintLabel.text = defaultChannelHint(activeChannel)
-        }
-        // M6k24：主按钮固定「立即连接」（连接中/激活置灰）；断开连接独立成键，仅连接中出现。
-        primaryActionButton.isEnabled = !running
-        primaryActionButton.alpha = if (running) 0.5f else 1f
-        disconnectButton.visibility = if (running) View.VISIBLE else View.GONE
-        // FAILED 态弹居中小卡片（标题+3行省略+重试）；其余状态收起。
-        val failed = phase == LiteState.Phase.FAILED
-        if (failed && errorCard.visibility != View.VISIBLE) {
-            errorTextView.text = LiteState.statusText
-            errorCard.visibility = View.VISIBLE
-        } else if (!failed && errorCard.visibility == View.VISIBLE) {
-            errorCard.visibility = View.GONE
-        }
-        // 连接成功即自动收起面板 —— 此时用户要看的是 CarPlay 画面；断开后再自动展开。
-        val active = phase == LiteState.Phase.ACTIVE
-        if (active != lastActive) {
-            lastActive = active
-            setPanelVisible(!active)
         }
     }
 

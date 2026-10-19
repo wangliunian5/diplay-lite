@@ -78,6 +78,11 @@ class NcmUsbBridge internal constructor(
     // 窗口内超 RESYNC_STORM_LIMIT 才判真死。
     private var resyncCount = 0
     private var resyncStreakStartNanos = 0L
+
+    // vc140 观测探针（只记录不干预）：最近消费的 NTB 块元数据 / 最近 USB 读块大小，
+    // 随 resync 日志带出，用于反推恒定 3 字节错位的真实来源。
+    private val recentBlocks = ArrayDeque<String>()
+    private val recentReads = ArrayDeque<Int>()
     private val readBuffer = ByteArray(READ_CHUNK_BYTES)
     // 1.0.25（3e 1.0.24 双会话实测 21:02:48/21:03:19）：EMUI 的 UsbRequest.queue() 会瞬时
     // 返回 false（21:02:48.685+48.999、21:03:19.875×2），原实现直接 failSession → NCM 读线程
@@ -306,6 +311,15 @@ class NcmUsbBridge internal constructor(
             }
             for (frame in Ntb16Codec.parse(buffered, 0, blockLength)) enqueueFrame(frame)
             val remaining = bufferedSize - wireLength
+            // vc140 观测探针：记录最近消费块的元数据（块长/消费长/pad 数），resync 时带出，
+            // 用于反推恒定 3 字节错位的来源（块间 pad？wBlockLength 与实际不符？读拼接丢字节？）。
+            // vc141：追加 NTH16 wSequence（offset 6）——resync 时新旧块序号对比，序号连续
+            // 无跳 = 字节流只多不缺（重复实锤），跳号 = 存在丢块，直接区分两类控制器 bug。
+            if (recentBlocks.size >= 8) recentBlocks.removeFirst()
+            recentBlocks.addLast(
+                "seq=${readU16(buffered, 6)} len=$blockLength wire=$wireLength " +
+                    "pad=${wireLength - blockLength} t=${System.nanoTime() / 1000_000 % 100_000}",
+            )
             buffered.copyInto(buffered, 0, wireLength, bufferedSize)
             bufferedSize = remaining
         }
@@ -314,6 +328,8 @@ class NcmUsbBridge internal constructor(
     /**
      * vc72：NTB16 失步后向前扫描下一个 NTH16 签名并丢弃错位前缀。找到 → 丢弃并返回 true；
      * 未找到 → 保留末尾 3 字节（可能是被读边界截断的签名前缀）并返回 false，等下一读块拼接。
+     * vc140：日志扩展观测现场——丢弃字节全文 hex、随后新块头 16B（可反解 wBlockLength）、
+     * 最近 8 个成功消费块元数据、最近 16 次 USB 读块大小。解析行为零改动。
      */
     private fun resyncToNth16Signature(): Boolean {
         for (i in 1..bufferedSize - NTH16_SIG_BYTES) {
@@ -321,7 +337,11 @@ class NcmUsbBridge internal constructor(
                 Log.w(
                     IphoneCarPlayConfiguration.TAG,
                     "ncm ntb16 resync #$resyncCount: dropped $i misaligned bytes " +
-                        "(head=${buffered.hex(minOf(i, 8))})",
+                        "(head=${buffered.hex(minOf(i, 32))}) " +
+                        "newSeq=${readU16(buffered, i + 6)} newLen=${readU16(buffered, i + 8)} " +
+                        "next16=${buffered.copyOfRange(i, minOf(i + 16, bufferedSize)).hex(16)} " +
+                        "recent=[${recentBlocks.joinToString("; ")}] " +
+                        "reads=$recentReads",
                 )
                 buffered.copyInto(buffered, 0, i, bufferedSize)
                 bufferedSize -= i
@@ -335,6 +355,8 @@ class NcmUsbBridge internal constructor(
     }
 
     private fun appendBuffered(source: ByteArray, length: Int) {
+        if (recentReads.size >= 16) recentReads.removeFirst()
+        recentReads.addLast(length)
         val required = bufferedSize + length
         if (required > buffered.size) {
             val capacity = maxOf(required, maxOf(READ_CHUNK_BYTES, buffered.size * 2))
@@ -374,7 +396,19 @@ class NcmUsbBridge internal constructor(
         } catch (error: RuntimeException) {
             throw failSession("NCM read failed", error)
         }
-        return if (transferred <= 0) null else transferred
+        if (transferred <= 0) return null
+        // vc144（TS7 vc143-snap-2008 定案）：丢块机理=MUSB 在「上一传输以 36B 短包结束 →
+        // 重新 arm 下一次传输」交界处吃掉下一 NTB 的第一个 512B 包——实证：每次块丢失
+        // resync 前必有一次 1060 读（=1572−512，块的头部包被丢后余量无 NTH16 签名，只能
+        // 走 resync 扫描），audio gap 与其一一对应。此处成功读后 settle 1ms 再返回（即
+        // 推迟下一次 arm），给控制器短包后的 FIFO 清理留余量。音频块 ~7.5ms 一个，
+        // 1ms 占空比影响可忽略；判据=实测 resync 频率对比（vc143 听歌 10 秒 5 次）。
+        try {
+            Thread.sleep(READ_SETTLE_MILLIS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        return transferred
     }
 
     private fun readChunkAsync(timeoutMillis: Long): Int? {
@@ -481,6 +515,8 @@ class NcmUsbBridge internal constructor(
         // 1.0.6：usbfs 单次 bulk 请求上限 16384 字节，32KB 缓冲导致 queue/bulkTransfer
         // 直接失败（3e 实测 "NCM read failed"）。上限即取 16384。
         private const val READ_CHUNK_BYTES = 16_384
+        // vc144：同步读成功后重新 arm 前的 settle 延时（机理与实测判据见 readChunkSync 注释）。
+        private const val READ_SETTLE_MILLIS = 1L
         private const val USB_PACKET_SIZE = 512
         private const val STATUS_POLL_TIMEOUT_MILLIS = 20
         private const val STATUS_POLL_INTERVAL_MILLIS = 500L

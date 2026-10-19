@@ -238,7 +238,14 @@ android {
         //   ②NCM 复用 usbmux 会话同一 fd（内核 claim 位图按 fd 记账，双 fd 割裂=KK ENOENT 根因）
         //   ③SETCONFIGURATION(6) 后 GET_CONFIGURATION 回读验证（errno=0≠内核真切过去）。
         versionName = "1.2.0"
-        versionCode = 139
+        // vc143：USBMUX 握手超时 60s→20s（快速进入 full-reset 重试）+ 重试轮次显示
+        // （复位提示此前 8s 被覆盖、静默期观感=卡死）。17:40 会话实证 vc142 自愈链路正常。
+        // vc144：NCM 同步读成功后 settle 1ms 再 arm 下一次传输——vc143-snap-2008 定案
+        // MUSB 在短包结束→重新 arm 交界处吃掉下一 NTB 第一个 512B 包（remnant 1060 实锤）。
+        // vc145：renderState 状态未变即短路（C8815 实测 dalvik 上每 500ms tick 主线程
+        // ~11ms+持续分配，是未连接期按钮延迟的 app 侧放大器；首启快检对话框首次
+        // inflate 触发 GC 风暴 12 连发/Skipped 57 帧为一次性事件，不在本修内）。
+        versionCode = 145
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties

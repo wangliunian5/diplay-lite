@@ -290,7 +290,9 @@ class Iap2UsbMuxHost private constructor(
         private const val TCP_WINDOW_FIELD = 512
         private const val MAX_FRAME_BYTES = 65_536
         private const val FIRST_SOURCE_PORT = 1
-        private const val HANDSHAKE_TIMEOUT_MILLIS = 60_000L
+        // vc143：60s→20s。正常握手 <1s（TS7 实测 0.8s），iPhone 僵尸时 60s 纯属静默
+        // 傻等（用户观感=卡死）；缩短后更快进入 full-reset 自动重试循环。
+        private const val HANDSHAKE_TIMEOUT_MILLIS = 20_000L
         private const val MAX_STALE_HANDSHAKE_FRAMES = 32
         private const val CONNECT_TIMEOUT_MILLIS = 5_000L
         private const val WRITE_TIMEOUT_MILLIS = 2_000
