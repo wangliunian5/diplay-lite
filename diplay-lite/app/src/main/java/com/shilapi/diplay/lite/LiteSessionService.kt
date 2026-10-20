@@ -1,6 +1,8 @@
 package com.shilapi.diplay.lite
 
 import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.Service
 import android.bluetooth.BluetoothA2dp
 import android.bluetooth.BluetoothAdapter
@@ -12,6 +14,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.media.AudioManager
+import android.os.Build
 import android.os.IBinder
 import android.util.Base64
 import android.view.WindowManager
@@ -90,13 +93,18 @@ class LiteSessionService : Service() {
             }
         }
         runCatching {
-            registerReceiver(
-                receiver,
-                IntentFilter().apply {
-                    addAction(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
-                    addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
-                },
-            )
+            val filter = IntentFilter().apply {
+                addAction(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
+                addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
+            }
+            // vc151（targetSdk 34）：动态 receiver 必须带 EXPORTED 旗标；蓝牙状态是
+            // protected broadcast（仅系统可发），NOT_EXPORTED 不影响接收。三参
+            // registerReceiver 是 API 26+ 才有——else 必须走两参重载（API16 崩溃教训）。
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(receiver, filter)
+            }
             btProbeReceiver = receiver
             LiteLog.log("bt", "探针已挂（A2DP/HFP 连接状态广播）")
         }.onFailure {
@@ -169,7 +177,17 @@ class LiteSessionService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         current = this
-        startForeground(NOTIFICATION_ID, buildNotification())
+        // vc151（targetSdk 34）：API 34+ 必须三参 startForeground 传类型（与 Manifest
+        // foregroundServiceType 一致），否则 ForegroundServiceTypeNotAllowedException。
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(
+                NOTIFICATION_ID,
+                buildNotification(),
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification())
+        }
         LiteState.running = true
         LiteState.phase = LiteState.Phase.CONNECTING
         LiteState.statusText = "正在初始化…"
@@ -838,6 +856,22 @@ class LiteSessionService : Service() {
     }
 
     private fun buildNotification(): Notification {
+        // vc151（targetSdk 34）：API 26+ 前台服务通知必须挂渠道，否则通知被系统吞 +
+        // startForeground 告警。低版本渠道 API 不存在，走原路径。
+        if (Build.VERSION.SDK_INT >= 26) {
+            val manager = getSystemService(NotificationManager::class.java)
+            if (manager?.getNotificationChannel(CHANNEL_ID) == null) {
+                manager?.createNotificationChannel(
+                    NotificationChannel(CHANNEL_ID, "CarPlay 会话", NotificationManager.IMPORTANCE_LOW),
+                )
+            }
+            return Notification.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_media_play) // 零图片资源策略：借用系统图标
+                .setContentTitle("DiPlay Lite")
+                .setContentText("CarPlay 会话保持中")
+                .setOngoing(true)
+                .build()
+        }
         return Notification.Builder(this)
             .setSmallIcon(android.R.drawable.ic_media_play) // 零图片资源策略：借用系统图标
             .setContentTitle("DiPlay Lite")
@@ -848,6 +882,8 @@ class LiteSessionService : Service() {
 
     companion object {
         private const val NOTIFICATION_ID = 1
+        /** vc151：API 26+ 前台服务通知渠道。 */
+        private const val CHANNEL_ID = "session"
 
         /**
          * 进程内当前服务实例：MainActivity（触摸/视频）需要拿到同进程的 Session 转触点。

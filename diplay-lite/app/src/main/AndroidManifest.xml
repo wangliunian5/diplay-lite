@@ -11,12 +11,24 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.BLUETOOTH" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <!-- vc151（targetSdk 34）：API 31+ 蓝牙新权限模型——老 BLUETOOTH* 在 API 31+ 被忽略，
+         读已配对设备/状态需 BLUETOOTH_CONNECT 运行时权限（K60 实测 getBondedDevices
+         SecurityException 闪退）。31+ 生效，老设备自动忽略。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- B3 信道读取：4.1 的 WifiManager.getScanResults 需要定位权限 -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <!-- 麦克风上行（CarPlay 语音）；targetSdk 19 下安装即授予 -->
+    <!-- 麦克风上行（CarPlay 语音）；targetSdk 19 下安装即授予。
+         vc151：targetSdk 34 下变运行时权限，MainActivity 启动时批量申请（拒绝则语音上行降级） -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- vc151：targetSdk 34 前台服务约束（API 28 起必须 FOREGROUND_SERVICE；
+         API 34 起必须声明 type 对应的细分权限） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- vc151：API 33+ 通知运行时权限（前台服务常驻通知；拒绝不影响会话只影响通知可见性） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- M6c 通话声音路由：setSpeakerphoneOn / setMode 需要它（4.1 安装即授予） -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- 无 adb 实测：文件日志写 /sdcard/DiPlayLite（普通权限，4.1 安装即授予） -->
@@ -37,7 +49,8 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:allowBackup="false"
         android:hardwareAccelerated="true"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+        android:usesCleartextTraffic="true">
 
         <!-- M4k：/info 的车机屏尺寸、视频编码尺寸、触摸坐标随之确定。
              M4l：configChanges 补齐所有可能触发重建的配置项——重建只会白销毁一次 SurfaceView 的
@@ -84,9 +97,12 @@
             </intent-filter>
         </receiver>
 
+        <!-- vc151：targetSdk 34 要求前台服务声明类型（USB 有线会话=connectedDevice），
+             startForeground 时同步传 type（API 34+ 三参） -->
         <service
             android:name=".LiteSessionService"
-            android:exported="false" />
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
 
         <!-- U4 USB 有线：WiredVpnService（shared 模块）只负责建立 fe80:: TUN 供 NCM 桥使用；
              BIND_VPN_SERVICE + android.net.VpnService action 是系统 VpnService 的清单约定 -->

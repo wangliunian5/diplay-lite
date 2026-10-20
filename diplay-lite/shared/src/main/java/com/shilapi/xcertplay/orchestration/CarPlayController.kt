@@ -224,6 +224,16 @@ class CarPlayController(
     private val wirelessActiveReported = AtomicBoolean(false)
 
     /**
+     * vc151：本代无线会话曾建立过（激活或降级态）。与 [wirelessActiveReported] 分开：
+     * 后者在会话 ended 时复位，而 iPhone 偶发强断（无 goodbye TCP RST，K60 热点实测）
+     * 后短时间内可能自行重投——此时 handoff watchdog（60s 定时）恰好到期，因 reported
+     * 已复位而误判「handoff 超时」把还活着的蓝牙 iAP2 一并拆栈（K60 实测 20:35:53
+     * 二次伤害），重投窗口被毁。本标志=true 表示 handoff 实际完成过，watchdog 放行，
+     * 断流回收交给媒体断供看门狗与既有 auto-retry 链。每代启动时复位（见 737 行）。
+     */
+    private val wirelessEverActive = AtomicBoolean(false)
+
+    /**
      * M6g：已判定为「降级态」——iPhone 已建立 Wi-Fi A/V，但不请求 type-130 iAP2 隧道，
      * 于是蓝牙 RFCOMM 继续承载 iAP2 控制面（见 armWirelessHandoffWatchdog）。
      *
@@ -736,6 +746,7 @@ class CarPlayController(
         wirelessTunnelReady.set(false)
         wirelessActiveReported.set(false)
         wirelessDegradedActive.set(false)
+        wirelessEverActive.set(false) // vc151：新代重置 watchdog 放行依据
         onStatus(CarPlayStatus.StartingHotspot)
         val generation = wirelessGeneration.incrementAndGet()
         executor.execute {
@@ -1460,6 +1471,7 @@ class CarPlayController(
     private fun maybeCompleteWirelessHandoff() {
         if (!wirelessHandoffRequested.get() || !wirelessTunnelReady.get()) return
         if (!wirelessActiveReported.compareAndSet(false, true)) return
+        wirelessEverActive.set(true) // vc151：watchdog 放行依据（本代 handoff 实际完成过）
         val generation = wirelessGeneration.get()
         val attempt = wirelessRetryCount.getAndSet(0)
         // M6k11：会话真建立即退出僵尸模式（后续断链重新按普通族分类）。
@@ -1537,7 +1549,13 @@ class CarPlayController(
                     phase != Phase.WIRELESS ||
                     generation != wirelessGeneration.get() ||
                     !wirelessHandoffRequested.get() ||
-                    wirelessActiveReported.get()
+                    wirelessActiveReported.get() ||
+                    // vc151（K60 热点实测）：本代 handoff 实际完成过（会话曾激活/降级态）时，
+                    // 会话 ended（iPhone 偶发无 goodbye 强断）会把 reported/degraded 复位，
+                    // watchdog 到期会误判「handoff 超时」把活着的蓝牙 iAP2 一并拆栈，
+                    // 毁掉 iPhone 短窗口内的自动重投机会。曾激活即放行，断流回收交给
+                    // 媒体断供看门狗（notifyWirelessMediaStall）与既有 auto-retry 链。
+                    wirelessEverActive.get()
                 ) {
                     return@postDelayed
                 }
@@ -1548,7 +1566,8 @@ class CarPlayController(
                             closed ||
                             phase != Phase.WIRELESS ||
                             generation != wirelessGeneration.get() ||
-                            wirelessActiveReported.get()
+                            wirelessActiveReported.get() ||
+                            wirelessEverActive.get() // vc151：与 postDelayed 判定同款放行
                         ) {
                             return@Thread
                         }
@@ -1559,6 +1578,7 @@ class CarPlayController(
                         if (wirelessConnectionProof.hasRenderedFrame(generation)) {
                             // M6g：先置位再上报，避免与控制环超时分支竞态。
                             wirelessDegradedActive.set(true)
+                            wirelessEverActive.set(true) // vc151：降级态同样证明 handoff 完成过
                             // M6h：会话已经可用（A/V 在跑），自动重试额度重新给满。
                             val attempt = wirelessRetryCount.getAndSet(0)
                             wirelessZombieMode = false // M6k11：degraded 收口同样退出僵尸模式

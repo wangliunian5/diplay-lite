@@ -12,7 +12,10 @@ android {
     defaultConfig {
         applicationId = "com.shilapi.diplay.lite"
         minSdk = 16
-        targetSdk = 19
+        // vc151（K60 安卓14 上向兼容）：19→34。协议/栈零改动，仅壳层适配：
+        // 明文 HTTP 放行、前台服务类型+通知渠道、动态 receiver EXPORTED 旗标、
+        // 运行时权限（RECORD_AUDIO/定位/POST_NOTIFICATIONS）。老车机（KK API19）零回归。
+        targetSdk = 34
         versionCode = 56
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
@@ -252,7 +255,10 @@ android {
         // 等价清理（LiteSessionService.onDestroy 全拆 controller 栈/mediaSink/VPN）；
         // 重插 ATTACHED 经 onNewIntent 触发 maybeAutoConnect 全新建链，根治热重连脏会话
         // （shown=0/触摸延迟 190ms）。此前拔线 app 零感知，旧地基叠会话。
-        versionCode = 149
+        // vc150（T3 来电假死）：静默渲染看门狗——rx 满帧但 shown=0 持续 3s（来电/通话/Siri
+        // 流重建只发 P 帧不补参数集），自动 flush + 请求关键帧自愈，10s 限频。
+        // vc151（K60 安卓14 上向兼容）：targetSdk 19→34 壳层适配（见上方 targetSdk 注释）。
+        versionCode = 151
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties

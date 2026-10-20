@@ -29,8 +29,15 @@ object BondedDevicesResolver {
     /** 标准 + root 兜底合并；每源产出记一行日志便于远端取证。 */
     fun resolve(adapter: BluetoothAdapter?, log: (String) -> Unit = {}): List<Entry> {
         val merged = LinkedHashMap<String, Entry>()
-        val adapterEntries = adapter?.bondedDevices.orEmpty().map {
-            Entry(it.address.uppercase(), it.name, "adapter")
+        // vc151（targetSdk 34）：API 31+ 无 BLUETOOTH_CONNECT 运行时权限时 bondedDevices
+        // 抛 SecurityException（K60 实测闪退）——拒绝授权时降级为空，走源 B root 路径。
+        val adapterEntries = runCatching {
+            adapter?.bondedDevices.orEmpty().map {
+                Entry(it.address.uppercase(), it.name, "adapter")
+            }
+        }.getOrElse {
+            log("bonded resolve: adapter source blocked (${it.javaClass.simpleName})")
+            emptyList()
         }
         adapterEntries.forEach { merged[it.address] = it }
         log("bonded resolve: adapter=${adapterEntries.size} devices")

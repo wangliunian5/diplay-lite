@@ -231,7 +231,41 @@ class MainActivity : Activity() {
         // 的脏会话）。拔线即执行「用户断开等价清理」（LiteSessionService.onDestroy 全拆
         // controller 栈 + mediaSink + VPN），重插 ATTACHED 经 onNewIntent 触发全新建链。
         registerUsbDetachReceiver()
+        // vc151（targetSdk 34）：targetSdk 19→34 后 RECORD_AUDIO（语音上行）/
+        // ACCESS_FINE_LOCATION（无线 B3 信道）/POST_NOTIFICATIONS（33+ 通知）变运行时权限。
+        // 启动即批量申请（系统弹一次窗），拒绝则对应功能降级、不阻塞连接主流程；
+        // API 23- 机型安装即授予，本函数零操作，老车机零回归。
+        requestRequiredRuntimePermissions()
         bootstrapNetworkAdb()
+    }
+
+    /**
+     * vc151（targetSdk 34）：运行时权限批量申请。仅对「未授予且需要运行时申请」的权限
+     * 发起 requestPermissions；重复启动（旋转/重建）时已授予项自动跳过，弹窗只出现一次。
+     * 拒绝的后果：RECORD_AUDIO → CarPlay 语音上行不可用（单向听）；定位 → 无线链路
+     * 信道读取降级；POST_NOTIFICATIONS → 前台服务通知不显示（会话不受影响）。
+     */
+    private fun requestRequiredRuntimePermissions() {
+        if (Build.VERSION.SDK_INT < 23) return
+        val wanted = mutableListOf(
+            android.Manifest.permission.RECORD_AUDIO,
+            android.Manifest.permission.ACCESS_FINE_LOCATION,
+        )
+        // vc151：API 31+ 蓝牙新权限模型（K60 实测 getBondedDevices 无 CONNECT 直接闪退）
+        if (Build.VERSION.SDK_INT >= 31) {
+            wanted.add(android.Manifest.permission.BLUETOOTH_CONNECT)
+            wanted.add(android.Manifest.permission.BLUETOOTH_SCAN)
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            wanted.add(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+        val missing = wanted.filter {
+            checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            LiteLog.log("ui", "运行时权限申请（targetSdk 34）：${missing.joinToString()}")
+            requestPermissions(missing.toTypedArray(), 0x151)
+        }
     }
 
     private var usbDetachReceiver: BroadcastReceiver? = null
@@ -253,7 +287,18 @@ class MainActivity : Activity() {
                 stopService(Intent(this@MainActivity, LiteSessionService::class.java))
             }
         }
-        registerReceiver(usbDetachReceiver, IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED))
+        // vc151（targetSdk 34）：动态 receiver 必须带 EXPORTED 旗标；DETACHED 是 protected
+        // broadcast（仅系统可发），NOT_EXPORTED 不影响接收。注意三参 registerReceiver 是
+        // API 26+ 才有——else 必须走两参重载（C8815 API16 实测传 0 也会 NoSuchMethodError）。
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(
+                usbDetachReceiver,
+                IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED),
+                Context.RECEIVER_NOT_EXPORTED,
+            )
+        } else {
+            registerReceiver(usbDetachReceiver, IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED))
+        }
     }
 
     /**

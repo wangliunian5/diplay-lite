@@ -454,6 +454,13 @@ private class VideoDecoder(
     private var keyframeRequestsWithoutRender = 0
     private var keyframeStallReported = false
     private var lastKeyFrameRequestNs = 0L
+    // vc150（T3 来电假死定案）：iPhone 来电/通话/Siri 会重建视频流但只发 P 帧不补参数集，
+    // 解码器停在旧流状态 → rx 满帧到达但 shown=0 永久定格（19:08 来电实测卡 3 分钟）。
+    // 现有关键帧 flush 只在积压（backlog）时触发，本场景 backlog=0 恰好绕过恢复条件。
+    // 假死判据：曾渲出过帧（排除冷启动首解期）+ 流在来（3s 内有收帧）+ 不在恢复流程
+    // （renderHold=false）+ 持续 3s 零渲染 → 走 recover(flush)+请求关键帧，10s 限频防抖。
+    private var lastRenderNanos = 0L
+    private var lastStallRecoveryNanos = 0L
     // The main screen keeps the historical log format; other screens are labelled.
     private val stats = VideoStats(if (streamType == 110) "" else " stream=$streamType")
     private val thread = Thread(::run, "carplay-video").apply { isDaemon = true; start() }
@@ -514,6 +521,7 @@ private class VideoDecoder(
                     }
                     decoder?.let(::drainOutput)
                     stats.logIfDue()?.let(report)
+                    maybeRecoverRenderStall()
                     if (referenceChain.needsKeyFrame && lastConfig != null && outputSurface != null) requestKeyFrameIfDue()
                 } catch (error: Exception) {
                     if (running) Log.e(TAG, "video decoder job failed: ${job?.javaClass?.simpleName}", error)
@@ -541,6 +549,27 @@ private class VideoDecoder(
         } finally {
             releaseDecoder()
         }
+    }
+
+    /**
+     * vc150（T3 来电假死定案）：静默渲染看门狗——rx 满帧到达但持续零渲染。
+     * iPhone 来电/通话/Siri 重建视频流后只发 P 帧不补参数集，解码器停在旧流状态，
+     * 帧进得来（无积压、解码器不报错）但一帧都解不出 → shown=0 永久定格，
+     * 且积压路径（backlog flush）与断供看门狗（A/V 双静默）均不覆盖本场景。
+     * 判据全部满足才触发：曾渲出过帧（排除冷启动首解期）+ 3s 内有收帧（流活着）
+     * + 不在恢复流程（renderHold=false）+ 距上次渲染超 3s。恢复走既有
+     * recover(flush) → referenceChain.needsKeyFrame → 请求关键帧路径，10s 限频防抖。
+     */
+    private fun maybeRecoverRenderStall() {
+        if (lastRenderNanos == 0L || renderHold || outputSurface == null || lastConfig == null) return
+        val now = System.nanoTime()
+        if (lastStallRecoveryNanos != 0L && now - lastStallRecoveryNanos < RENDER_STALL_RECOVERY_INTERVAL_NS) return
+        if (now - lastRenderNanos < RENDER_STALL_THRESHOLD_NS) return
+        val lastArrival = stats.lastArrivalNanos()
+        if (lastArrival == 0L || now - lastArrival > RENDER_STALL_THRESHOLD_NS) return
+        lastStallRecoveryNanos = now
+        report("render stall: frames arriving but none rendered for ${RENDER_STALL_THRESHOLD_NS / 1_000_000} ms — request keyframe (incoming call/Siri stream reset)")
+        recover("video render stall (frames arriving, none rendered)", rebuildDecoder = false)
     }
 
     private fun configureDecoder(config: VideoJob.Config) {
@@ -900,6 +929,7 @@ private class VideoDecoder(
                 pendingIndex = -1
                 if (render) {
                     stats.onRendered()
+                    lastRenderNanos = nowNs // vc150：静默渲染看门狗的「上次渲染」基准
                     // 1.0.29：恢复看门狗复位——有画面了，通道健康。
                     keyframeRequestsWithoutRender = 0
                     keyframeStallReported = false
@@ -1010,6 +1040,10 @@ private class VideoDecoder(
         // 1.1.3（绿线修复③）：最小渲染间隔 ≈ 一帧显示周期（60Hz→16.7ms）。
         // burst 期间解码速度可到 60~100fps，超频渲染在老显示管线上出 scanout 异常（绿线）。
         const val RENDER_MIN_INTERVAL_NS = 16_000_000L
+        // vc150（T3 来电假死）：静默渲染看门狗阈值/限频——3s 零渲染且流在来即判假死
+        // （来电/通话/Siri 流重建后只发 P 帧不补参数集），恢复后 10s 内不再重复触发。
+        const val RENDER_STALL_THRESHOLD_NS = 3_000_000_000L
+        const val RENDER_STALL_RECOVERY_INTERVAL_NS = 10_000_000_000L
         val START_CODE = byteArrayOf(0x00, 0x00, 0x00, 0x01)
     }
 }

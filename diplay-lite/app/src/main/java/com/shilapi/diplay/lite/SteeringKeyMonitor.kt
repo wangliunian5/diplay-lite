@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.Build
 import android.os.SystemClock
 import android.view.KeyEvent
 import java.util.concurrent.ConcurrentHashMap
@@ -25,7 +26,7 @@ internal data class SteeringObservedKey(
  * - broadcast 源：按绑定/发现到的 action 注册 receiver，从 extras 解析键码；
  * - logcat 源：拉系统日志流，按「tag + 包含子串」规则或正则解析按键行；
  * - 学习模式（discovering）：把日志里出现的广播 action 动态订阅，并上报一切观察到的按键。
- * Lite 裁剪：无 androidx（用原生 registerReceiver，target19 无 EXPORTED 旗标要求）。
+ * Lite 裁剪：无 androidx（原生 registerReceiver；vc151 targetSdk 34 起 33+ 带 EXPORTED 旗标）。
  */
 internal class SteeringKeyMonitor(
     context: Context,
@@ -103,7 +104,13 @@ internal class SteeringKeyMonitor(
             }
         }
         try {
-            app.registerReceiver(receiver, IntentFilter(action))
+            // vc151（targetSdk 34）：厂商按键广播非 protected（车机系统服务自定义 action），
+            // 必须 EXPORTED 才能收到；33- 无旗标要求走原路径。
+            if (Build.VERSION.SDK_INT >= 33) {
+                app.registerReceiver(receiver, IntentFilter(action), Context.RECEIVER_EXPORTED)
+            } else {
+                app.registerReceiver(receiver, IntentFilter(action))
+            }
             receivers[action] = receiver
             if (discovering) onKey(SteeringObservedKey(0, -1, "broadcast", broadcastAction = action))
         } catch (_: Exception) {
