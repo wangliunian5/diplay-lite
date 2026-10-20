@@ -2,7 +2,10 @@ package com.shilapi.diplay.lite
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
@@ -10,6 +13,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.net.VpnService
 import android.os.Build
@@ -32,6 +36,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.shilapi.xcertplay.media.CarPlayTouchMapper
+import com.shilapi.xcertplay.network.WiredVpnService
 import kotlin.math.abs
 
 /**
@@ -218,7 +223,49 @@ class MainActivity : Activity() {
         // （systemUiVisibility 是否被 ROM 改回 + dumpsys window 看顶栏归属），结果写 statusbar 标签。
         StatusBarProbe.probe(this, "onCreate")
         handler.postDelayed({ StatusBarProbe.probe(this, "t+3s") }, 3_000)
+        // vc148（启动阶段 VPN 状态检测）：先清理上次会话可能残留的 TUN fd/服务，
+        // 再进入自动连接——残留的异常 VPN 连接若不清，establish 会在旧 fd 上叠新会话。
+        ensureCleanVpnState()
+        // vc149（USB 拔插彻底清理）：此前拔线 app 零感知——旧 controller/解码器/7000
+        // 监听/VPN 全部残留，重插后 iPhone 对旧地基叠会话（实测 shown=0、触摸延迟 190ms
+        // 的脏会话）。拔线即执行「用户断开等价清理」（LiteSessionService.onDestroy 全拆
+        // controller 栈 + mediaSink + VPN），重插 ATTACHED 经 onNewIntent 触发全新建链。
+        registerUsbDetachReceiver()
         bootstrapNetworkAdb()
+    }
+
+    private var usbDetachReceiver: BroadcastReceiver? = null
+
+    /**
+     * vc149：监听 USB_DEVICE_DETACHED。Apple 设备拔出 → 等价用户断开：
+     * 停 LiteSessionService（onDestroy 按序拆 controller/AirPlay 栈/VPN），
+     * 并重置 autoConnectTried 让重插后自动连接可再次发起。幂等，未连接时无害。
+     */
+    private fun registerUsbDetachReceiver() {
+        usbDetachReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
+                @Suppress("DEPRECATION")
+                val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE) ?: return
+                if (device.vendorId != APPLE_USB_VENDOR_ID) return
+                LiteLog.log("ui", "USB 拔出：按用户断开等价清理会话与 VPN")
+                autoConnectTried = false
+                stopService(Intent(this@MainActivity, LiteSessionService::class.java))
+            }
+        }
+        registerReceiver(usbDetachReceiver, IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED))
+    }
+
+    /**
+     * vc149：重插触发。singleTask Activity 已在前台时 ATTACHED intent 走 onNewIntent
+     * （此前默认空实现，拔插重连只能靠 iPhone 主动连旧残留监听——脏会话根源）。
+     * 延迟 1.5s 等 detach 清理拆栈完成，再走标准自动连接（auto=true 跳确认弹窗）。
+     */
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
+        autoConnectTried = false
+        handler.postDelayed({ maybeAutoConnect() }, 1_500)
     }
 
     /**
@@ -321,6 +368,9 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         LiteLog.log("ui", "onDestroy（Activity 被销毁，下一次进入会重建 Surface 与解码器）")
+        // vc149：注销 USB 拔出监听
+        usbDetachReceiver?.let { runCatching { unregisterReceiver(it) } }
+        usbDetachReceiver = null
         LiteVideoBridge.setVideoSizeListener(null)
         detachCurrentPage()
         // vc108：退出时还原车机栏（写回 false），否则车机桌面栏被永久藏住
@@ -691,6 +741,20 @@ class MainActivity : Activity() {
             attachBallDrag(ball, ballParams)
             ballRoot = ball
             root.addView(ball, ballParams)
+            // vc146（T3 实测）：wm overscan 车机（1024x600 屏、可视仅 500）上
+            // displayMetrics.heightPixels=600 会把球初始位算到可视区外（y≈526>500），
+            // 球被系统黑条吞掉。布局完成后按 root 实际高度校正一次。
+            ball.post {
+                val rh = root.height
+                if (rh > 0 && rh < resources.displayMetrics.heightPixels) {
+                    ballParams.topMargin = if (isLandscapeUi()) {
+                        rh - ballSize - dip(28)
+                    } else {
+                        ((rh - ballSize) / 2).coerceAtLeast(0)
+                    }
+                    ball.layoutParams = ballParams
+                }
+            }
         }
 
         // FAILED 态：居中小卡片（宽度 ≤300dp：标题 + 3 行省略 + 结束按钮）。
@@ -1018,8 +1082,13 @@ class MainActivity : Activity() {
 
     // ---------- 连接动作 ----------
 
-    /** 按通道发起连接。中继/USB 底层未接入前给出明确提示（避免误认为故障）。 */
-    private fun connect(channel: String) {
+    /**
+     * 按通道发起连接。中继/USB 底层未接入前给出明确提示（避免误认为故障）。
+     * auto=true 表示自动连接路径（开机自启/onResume 自动连接）：
+     * USB 通道在 VPN 已授权（prepare 返回 null）时跳过 app 内确认框静默建链，
+     * 避免无人值守场景被确认弹窗阻塞；手动入口（auto 缺省 false）行为不变。
+     */
+    private fun connect(channel: String, auto: Boolean = false) {
         val config = LiteConfig.load(this)
         when (channel) {
             "car" -> {
@@ -1074,6 +1143,21 @@ class MainActivity : Activity() {
                     LiteLog.log("ui", "USB 通道：VpnService.prepare 异常 ${error.message}")
                 }
                 if (!prepareBroken && consent != null) {
+                    // vc148：自动连接优先 root appops 静默授权（仅 auto 路径——手动路径
+                    // 不吃这 4s 超时代价）。授权成功则跳过系统对话框，无人值守全自动；
+                    // 失败（无 root）回落系统对话框，首装首次仍需一次人工授权。
+                    if (auto && grantVpnConsentViaRoot()) {
+                        val after = try {
+                            VpnService.prepare(this)
+                        } catch (error: Exception) {
+                            null
+                        }
+                        if (after == null) {
+                            LiteLog.log("ui", "USB 通道：自动连接 root appops 静默授权成功，跳过系统对话框")
+                            startSession(config, key, "usb")
+                            return
+                        }
+                    }
                     var launched = false
                     try {
                         startActivityForResult(consent, REQUEST_VPN_PERMISSION)
@@ -1106,7 +1190,15 @@ class MainActivity : Activity() {
                     // 授权框被跳过。mPackage 无公开 API 可清（无 root 不可清），用户诉求
                     // 「每次点 USB 连接都要人工确认 VPN」→ prepare 放行时弹自家确认框，
                     // 点确定才开始 establish，语义与系统授权框一致，100% 可控。
-                    showVpnConfirmDialog(config, key)
+                    // vc148（无人值守定案）：自动连接路径（auto=true）不弹确认框直接
+                    // establish——prepare 放行即视为已授权（首装首次的系统授权框仍会
+                    // 正常弹，人工授权过一次后启动阶段全自动）；手动路径保留确认框。
+                    if (auto) {
+                        LiteLog.log("ui", "USB 通道：自动连接 prepare 放行，跳过确认框直接建链")
+                        startSession(config, key, "usb")
+                    } else {
+                        showVpnConfirmDialog(config, key)
+                    }
                     return
                 }
                 // prepare 本身异常 → 也尝试 root 兜底后复检。
@@ -1150,6 +1242,28 @@ class MainActivity : Activity() {
             }
             .create()
         dialog.show()
+    }
+
+    /**
+     * vc148：启动阶段 VPN 状态检测与残留清理（幂等，无 VPN 时为 no-op）。
+     * - 存量 TUN fd（上次会话异常退出未关）→ shutdownTun() 关闭；
+     * - WiredVpnService 实例残留 → stopService 强制停止；
+     * - 系统侧其他 app 的 VPN 不属于本 app 管辖，不触碰（VpnService 无跨 app 清理 API）。
+     * 清理完成后由 maybeAutoConnect 走正常自动连接流程重新 establish。
+     * 全程 try-catch：清理失败仅记录不阻塞启动（establish 自身有失败兜底路径）。
+     */
+    private fun ensureCleanVpnState() {
+        try {
+            WiredVpnService.shutdownTun()
+        } catch (error: Throwable) {
+            LiteLog.log("ui", "VPN 状态检测：TUN 残留清理异常（忽略）${error.message}")
+        }
+        try {
+            stopService(Intent(this, WiredVpnService::class.java))
+            LiteLog.log("ui", "VPN 状态检测：无残留 VPN 连接或已强制清理完成")
+        } catch (error: Throwable) {
+            LiteLog.log("ui", "VPN 状态检测：服务残留清理异常（忽略）${error.message}")
+        }
     }
 
     /** 枚举 USB 设备看是否有 Apple VID（iPhone/iPad），无需任何权限。 */
@@ -1231,46 +1345,30 @@ class MainActivity : Activity() {
     }
 
     /**
-     * M6d：分辨率/帧率变更的二次确认。确认后立刻停止会话并重建界面 ——
-     * 改了视频参数不重启会渲染异常（解码器尺寸与 Surface 对不上）。
+     * M6d：分辨率/帧率变更的二次确认。
+     * vc147（T3 实测定案）：改为「下次连接生效」，不再停止会话/重建界面 ——
+     * 原实现 stopService + finish(NEW_TASK|CLEAR_TASK) 重建后存在渲染端丢失竞态
+     * （新会话解码器正常创建、rx=30fps 正常收流，但 shown=0 —— Surface 与解码器
+     * 在 CLEAR_TASK 重建窗口内脱节，17:25 会话实测复现）。连接时构造
+     * CarPlayController 本就按 config 现值取参，断开重连即按新参数运行，
+     * 无需销毁 Activity；当前会话继续跑旧参数，无渲染异常。
+     * appliedVideoKey 在确认时即落成新值：后续连接入口/自动连接不再二次弹确认
+     * （1054/1068/1318 的 key 比较自然通过）。
      */
     private fun confirmVideoChange() {
         AlertDialog.Builder(this)
             .setTitle("已修改分辨率/帧率")
             .setMessage(
-                "视频参数改动必须断开当前连接并重启软件才能生效，否则画面会渲染异常。\n\n" +
-                    "现在断开并重启吗？",
+                "视频参数将在下次连接时生效。\n\n" +
+                    "当前连接继续使用旧参数，断开后重新连接即按新参数运行。",
             )
             .setNegativeButton("取消", null)
-            .setPositiveButton("断开并重启") { _, _ ->
-                restartAppForVideoChange()
+            .setPositiveButton("知道了") { _, _ ->
+                val config = LiteConfig.load(this)
+                LiteConfig.saveAppliedVideoKey(this, LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps))
+                LiteLog.log("ui", "视频参数已保存，下次连接生效")
             }
             .show()
-    }
-
-    /**
-     * 视频参数（分辨率/帧率/横竖屏）修改后的统一生效路径。
-     *
-     * 原「AlarmManager 预约拉起 + killProcess」在 EMUI9 实测不可靠：set() 是批量闹钟，
-     * 进程死后自启动又受启动管理限制 —— 应用被杀后不再回来（"没有自动重启"）；残留现场里
-     * stopService 的异步拆栈未等待，此时点连接会卡在连接中（残留 7000 监听，见
-     * LiteSessionService 的 EADDRINUSE 记录）。
-     *
-     * M6k25 单 Activity 化后改为进程内重建：appliedVideoKey 落成新值（重启后点主页连接
-     * 直接按新参数发起，不再二次弹确认）→ 停会话服务（拆栈由 closingController await 收口）
-     * → finish + startActivity 重建 MainActivity（全新 SurfaceView 与页面状态），不杀进程、
-     * 不依赖闹钟，行为等价于进程冷启动的"重启软件"。
-     */
-    internal fun restartAppForVideoChange() {
-        val config = LiteConfig.load(this)
-        LiteConfig.saveAppliedVideoKey(this, LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps))
-        stopService(Intent(this, LiteSessionService::class.java))
-        val intent = Intent(this, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-        }
-        LiteLog.log("ui", "视频参数已改：停止会话并重建界面以应用")
-        startActivity(intent)
-        finish()
     }
 
     private fun disconnect() {
@@ -1303,11 +1401,11 @@ class MainActivity : Activity() {
         autoConnectTried = true
         val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps)
         if (config.appliedVideoKey.isNotEmpty() && config.appliedVideoKey != key) {
-            LiteLog.log("ui", "自动连接跳过：视频参数已改，请手动连接并确认重启")
+            LiteLog.log("ui", "自动连接跳过：视频参数已改，请手动连接以应用")
             return
         }
         LiteLog.log("ui", "自动连接：按默认通道（$channel）自动发起")
-        connect(channel)
+        connect(channel, auto = true)
     }
 
     // ---------- 1.0.16（方案四②）开机自启等待弹窗 ----------

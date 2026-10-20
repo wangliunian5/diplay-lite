@@ -233,8 +233,10 @@ class SettingsPage(private val activity: MainActivity) {
                 visibility = View.GONE
                 setOnClickListener {
                     persistFromForm()
-                    toast("分辨率设定已应用，软件即将重启")
-                    activity.restartAppForVideoChange()
+                    // vc147：参数改为「下次连接生效」，不再重建界面（渲染端丢失竞态）。
+                    // appliedVideoKey 由 MainActivity.confirmVideoChange 统一落成，
+                    // 此处已 persistFromForm，无需重复保存。
+                    toast("分辨率设定已保存，下次连接生效")
                 }
             }
             val btnParams = LinearLayout.LayoutParams(
@@ -331,7 +333,8 @@ class SettingsPage(private val activity: MainActivity) {
                 }
                 .setPositiveButton("应用并重启") { _, _ ->
                     persistFromForm()
-                    activity.restartAppForVideoChange()
+                    // vc147：不再重建界面，参数下次连接生效（渲染端丢失竞态定案）。
+                    toast("已应用，下次连接生效")
                 }
                 .show()
         }
@@ -392,7 +395,8 @@ class SettingsPage(private val activity: MainActivity) {
                 }
                 .setPositiveButton("应用并重启") { _, _ ->
                     persistFromForm()
-                    activity.restartAppForVideoChange()
+                    // vc147：不再重建界面，参数下次连接生效（渲染端丢失竞态定案）。
+                    toast("已应用，下次连接生效")
                 }
                 .show()
         }
@@ -994,15 +998,15 @@ class SettingsPage(private val activity: MainActivity) {
                 inputResW.setText(current.manualWidth.toString())
                 inputResH.setText(current.manualHeight.toString())
             }
-            .setPositiveButton("应用并重启") { _, _ ->
+            .setPositiveButton("应用") { _, _ ->
                 persistFromForm()
-                toast("分辨率已应用：${w}×$h，软件即将重启")
-                activity.restartAppForVideoChange()
+                // vc147：不再重建界面，参数下次连接生效（渲染端丢失竞态定案）。
+                toast("分辨率已保存：${w}×$h，下次连接生效")
             }
             .show()
     }
 
-    /** 分辨率显式提交：10-150 钳位；与当前值不同时弹确认（含 >100 超采样警告），确认后重启软件生效。 */
+    /** 分辨率显式提交：10-150 钳位；与当前值不同时弹确认（含 >100 超采样警告），确认后下次连接生效。 */
     private fun applyScale(input: EditText) {
         val raw = input.text.toString().trim().toIntOrNull()
         if (raw == null) {
@@ -1027,10 +1031,10 @@ class SettingsPage(private val activity: MainActivity) {
             .setTitle(if (clamped > 100) "放大超采样确认" else "确认修改分辨率")
             .setMessage(message)
             .setNegativeButton("取消") { _, _ -> input.setText(current.toString()) }
-            .setPositiveButton("应用并重启") { _, _ ->
+            .setPositiveButton("应用") { _, _ ->
                 persistFromForm()
-                toast("分辨率已应用：$clamped%，软件即将重启")
-                activity.restartAppForVideoChange()
+                // vc147：不再重建界面，参数下次连接生效（渲染端丢失竞态定案）。
+                toast("分辨率已保存：$clamped%，下次连接生效")
             }
             .show()
     }

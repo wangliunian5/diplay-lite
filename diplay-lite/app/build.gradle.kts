@@ -245,7 +245,14 @@ android {
         // vc145：renderState 状态未变即短路（C8815 实测 dalvik 上每 500ms tick 主线程
         // ~11ms+持续分配，是未连接期按钮延迟的 app 侧放大器；首启快检对话框首次
         // inflate 触发 GC 风暴 12 连发/Skipped 57 帧为一次性事件，不在本修内）。
-        versionCode = 145
+        // vc146（T3 实测）：悬浮球初始位按 displayMetrics.heightPixels(600) 计算，
+        // wm overscan 车机可视仅 500 → 球落到 y≈526 可视区外被黑条吞掉；布局完成后
+        // 按 root 实际高度 post 校正一次。
+        // vc149（USB 拔插彻底清理）：注册 USB_DEVICE_DETACHED 监听，拔线即按「用户断开」
+        // 等价清理（LiteSessionService.onDestroy 全拆 controller 栈/mediaSink/VPN）；
+        // 重插 ATTACHED 经 onNewIntent 触发 maybeAutoConnect 全新建链，根治热重连脏会话
+        // （shown=0/触摸延迟 190ms）。此前拔线 app 零感知，旧地基叠会话。
+        versionCode = 149
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties

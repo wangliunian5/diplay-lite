@@ -49,8 +49,14 @@ class WiredVpnService : VpnService() {
             null
         }
         if (tun != null) {
-            ensureFe80Route()
-            ensureTunMulticast()
+            // vc148b（T3 实测 shown=0 定案）：修复动作移出主线程——ensureTunMulticast
+            // 的 su 在 root 授权被撤销后会挂起数十秒（waitFor 无超时），onStartCommand
+            // 主线程被卡 → 触摸全丢 + Choreographer 停摆（rx=28fps 正常收流但 shown=0、
+            // 画面定格）。fd 交付不等修复：异步执行，su 另加 4s 超时兜底。
+            Thread {
+                ensureFe80Route()
+                ensureTunMulticast()
+            }.start()
         }
         synchronized(lock) {
             // vc94：快速重连二次 startService 而 request() 未再调用时（或并发竞态），旧 fd 会被
@@ -87,12 +93,9 @@ class WiredVpnService : VpnService() {
             var repaired = false
             for (shell in arrayOf(arrayOf("su", "-c", add), arrayOf("/system/xbin/su", "-c", add))) {
                 try {
-                    val proc = Runtime.getRuntime().exec(shell)
-                    val exit = proc.waitFor()
-                    val out = proc.inputStream.bufferedReader().use { it.readText() }.trim()
-                    proc.destroy()
+                    val exit = execWithTimeout(shell, 4_000)
                     if (hasFe80Route(dev)) {
-                        Log.i(TAG, "wired vpn fe80 route repaired via $shell exit=$exit out=$out")
+                        Log.i(TAG, "wired vpn fe80 route repaired via ${shell[0]} exit=$exit")
                         repaired = true
                         break
                     }
@@ -127,9 +130,7 @@ class WiredVpnService : VpnService() {
                 arrayOf("/system/xbin/su", "-c", "ip link set $dev multicast on"),
             )) {
                 try {
-                    val proc = Runtime.getRuntime().exec(shell)
-                    proc.waitFor()
-                    proc.destroy()
+                    execWithTimeout(shell, 4_000)
                     if (hasMulticastFlag(dev)) {
                         Log.i(TAG, "wired vpn multicast flag repaired on $dev")
                         return
@@ -141,6 +142,27 @@ class WiredVpnService : VpnService() {
         } catch (error: Throwable) {
             Log.w(TAG, "wired vpn multicast check failed: ${error.message}")
         }
+    }
+
+    /**
+     * vc148b：带超时的 su 执行（对齐 MainActivity vc94 轮询模式）——Process.waitFor()
+     * 无超时在「root 授权被撤销后 su 挂起等待」场景会永久阻塞调用线程；4s 无果即
+     * destroy 走失败。返回 exit code（超时/异常返回 null）。
+     */
+    private fun execWithTimeout(shell: Array<String>, timeoutMillis: Long): Int? {
+        val proc = Runtime.getRuntime().exec(shell)
+        var exit: Int? = null
+        var waited = 0L
+        while (exit == null && waited < timeoutMillis) {
+            Thread.sleep(100)
+            waited += 100
+            try {
+                exit = proc.exitValue()
+            } catch (_: IllegalThreadStateException) {
+            }
+        }
+        if (exit == null) proc.destroy()
+        return exit
     }
 
     private fun hasMulticastFlag(dev: String): Boolean {
