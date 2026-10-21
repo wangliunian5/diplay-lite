@@ -258,7 +258,14 @@ android {
         // vc150（T3 来电假死）：静默渲染看门狗——rx 满帧但 shown=0 持续 3s（来电/通话/Siri
         // 流重建只发 P 帧不补参数集），自动 flush + 请求关键帧自愈，10s 限频。
         // vc151（K60 安卓14 上向兼容）：targetSdk 19→34 壳层适配（见上方 targetSdk 注释）。
-        versionCode = 151
+        // vc152（K60 微信语音挂断后会话不自愈）：对端优雅结束会话后自动 0x4301 邀请重投。
+        // vc153（K60 有线连接 0x4301 后 iPhone 静默假死）：有线启动看门狗 60s→15s 判死 +
+        // 自动重试 2 次封顶 + 第 2 轮前 0x52 mode request/重枚举升级；MainActivity 有线
+        // 连接前无线互斥（拆无线栈延迟 2.5s 再走有线）。
+        // vc154（待办收口三件套）：④有线切换改拆栈完成回调驱动（替代固定 2.5s，8s 兜底）；
+        // ⑤VPN 授权失败引导页（原两处失败终点只弹 toast，升级为重试授权/改无线引导弹窗）；
+        // ⑦CI 化构建 task（签名固化缺省 debug keystore + ciRelease 一键构建归档）。
+        versionCode = 154
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties
@@ -286,18 +293,23 @@ android {
         jvmTarget = "1.8"
     }
 
-    // 外发测试签名：沿用 docs/BUILD.md 的环境变量约定。
-    // 只在显式提供 ANDROID_KEYSTORE_PATH 时才创建签名配置；未提供时 release 保持未签名
-    // （与主工程「源码/CI 构建无签名」语义一致，避免把密钥路径/口令写死进仓库）。
+    // 外发测试签名：vc154（⑦ CI 化构建 task·签名固化）。
+    // 环境变量优先（CI/正式发布密钥可覆盖）；缺省回落 Android SDK 标准 debug keystore
+    // （~/.android/debug.keystore，alias=androiddebugkey，口令均为 android）——即
+    // docs/BUILD.md 手动打包约定的固化：任何环境 ./gradlew ciRelease 无需记环境变量
+    // 直接产出已签名 APK。debug 凭据为 SDK 通用值，无个人路径/机密入仓，开源分支同步
+    // 安全；keystore 文件不存在且未配环境变量时保持未签名（纯源码环境语义不变）。
     val releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
+        ?: "${System.getProperty("user.home")}${File.separator}.android${File.separator}debug.keystore"
+    val releaseKeystoreUsable = releaseKeystorePath.isNotBlank() && File(releaseKeystorePath).exists()
 
     signingConfigs {
-        if (!releaseKeystorePath.isNullOrBlank()) {
+        if (releaseKeystoreUsable) {
             create("release") {
                 storeFile = file(releaseKeystorePath)
-                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
-                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD") ?: "android"
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS") ?: "androiddebugkey"
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD") ?: "android"
             }
         }
     }
@@ -312,7 +324,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
-            if (!releaseKeystorePath.isNullOrBlank()) {
+            if (releaseKeystoreUsable) {
                 signingConfig = signingConfigs.getByName("release")
             }
         }
@@ -331,4 +343,28 @@ android {
 dependencies {
     // 零 AndroidX / 零 Compose —— 轻量化红线（设计文档 §2.2）
     implementation(project(":shared"))
+}
+
+// vc154（⑦ CI 化构建 task）：一键「签名 release 构建 + APK 归档」。
+// 用法：./gradlew ciRelease（无需任何环境变量，签名走上方固化缺省）。
+// 产物复制到仓库 apks/DiPlay-<versionName>-cluster1-vc<versionCode>.apk（与既有
+// 归档命名一致）；归档目录可用 DIPLAY_APK_ARCHIVE_DIR 覆盖（独立 clone 无上级 apks 时）。
+tasks.register("ciRelease") {
+    group = "build"
+    description = "Signed release build + archive APK to repo apks/ (vc154 signing-solidified CI task)"
+    dependsOn("assembleRelease")
+    doLast {
+        val versionName = android.defaultConfig.versionName as String
+        val versionCode = android.defaultConfig.versionCode
+        val output = file("build/outputs/apk/release/app-release.apk")
+        if (!output.exists()) {
+            throw GradleException("ciRelease：未找到 ${output.absolutePath}（assembleRelease 产物缺失）")
+        }
+        val archiveDir = System.getenv("DIPLAY_APK_ARCHIVE_DIR")
+            ?: rootProject.file("../apks").absolutePath
+        val target = File(archiveDir, "DiPlay-$versionName-cluster1-vc$versionCode.apk")
+        target.parentFile.mkdirs()
+        output.copyTo(target, overwrite = true)
+        println("ciRelease：APK 已归档 ${target.absolutePath}")
+    }
 }

@@ -252,6 +252,12 @@ class CarPlayController(
     private val wirelessGeneration = AtomicInteger(0)
     private val wirelessConnectionProof = WirelessConnectionProof<AirPlaySession>()
 
+    // vc152（微信语音挂断后会话不自愈）：无线控制环 client 引用——run 存活期间可被
+    // 会话结束后自动重投逻辑调用 sendCarPlayInvitation()（外部线程直发 0x4301）。
+    @Volatile private var wirelessControlClient: Iap2WirelessControlClient? = null
+    private val peerEndInvitationArmed = AtomicBoolean(false)
+    private val peerEndInvitationsSent = AtomicInteger(0)
+
     // M6k10 重连可观测：iAP2 隧道就绪即 authenticated；采样器每秒输出 tcpAccepted 等判据，
     // 定位「连上但 iPhone 不进来」卡在 Wi-Fi 段（tcpAccepted=0）还是 RTSP 段（tcpAccepted≥1）。
     private val wirelessAuthenticated = AtomicBoolean(false)
@@ -294,6 +300,11 @@ class CarPlayController(
     // 对新 0x4301 视而不见（46s 死窗）。楔死/watchdog/usbmux-reset 重试前置位，
     // onIphonePermission 消费后清除；常规 peer-closed 重试不置位，保留快速重连。
     @Volatile private var wiredFullResetPending = false
+    // vc153（K60 实锤 0x4301 后 iPhone 完全静默）：有线启动看门狗重试记账——判死自动重试
+    // 额度 2 次封顶（耗尽落 ControlEnded，不再无限循环重建占住「有线链路建立中」）；代际
+    // 令牌使 teardown/重 arm 后的待触发计时器失活。会话真建立即归零（对齐 wiredRetryCount 语义）。
+    private val wiredStartWatchdogRetries = AtomicInteger(0)
+    @Volatile private var wiredStartWatchdogGeneration = 0
     // vc97③：wedge 判别器数据源——控制环最近收帧时刻（usbmux 控制口心跳在此浮现）。
     // Ipv6NcmBridge fatal 判定时探查：控制口活=端点级楔死快拆 / 控制口同停=iPhone 停发宽限。
     @Volatile private var wiredControlLastRxAtNanos = 0L
@@ -398,6 +409,8 @@ class CarPlayController(
             ensureBtAudioHandoff(session)
             // 1.0.10：会话真建立 = wired 自动重试额度重置（对齐无线链「成功即归零」语义）。
             wiredRetryCount.set(0)
+            // vc153：启动看门狗重试额度同步归零（会话已建立，静默判死族清账）。
+            wiredStartWatchdogRetries.set(0)
             debugLog(
                 "AirPlay session active controller=${session.controllerId ?: "unknown"} " +
                     "peer=${session.host}",
@@ -483,6 +496,14 @@ class CarPlayController(
 
     fun hasActiveAirPlayAttachment(): Boolean = airPlayServer?.isAttached() == true
 
+    /**
+     * vc153：无线会话活跃查询（MainActivity 有线连接互斥判定用）——当前活跃（真交接
+     * [wirelessActiveReported] / 降级态 [wirelessDegradedActive]）或本代曾建立过
+     * [wirelessEverActive]（覆盖 iPhone 强断后无线栈仍在重试的窗口）任一即算活跃。
+     */
+    fun isWirelessSessionAlive(): Boolean =
+        wirelessActiveReported.get() || wirelessDegradedActive.get() || wirelessEverActive.get()
+
     fun start() {
         synchronized(this) {
             if (closed) return
@@ -490,6 +511,8 @@ class CarPlayController(
         wirelessRetryCount.set(0)
         // 1.0.10：用户手动重连 = 重新给满 wired 自动重试额度（对齐无线链 M6h 语义）。
         wiredRetryCount.set(0)
+        // vc153：启动看门狗重试额度同步给满。
+        wiredStartWatchdogRetries.set(0)
         if (config.transport == CarPlayTransport.WIRED) {
             startWiredReceivers()
         }
@@ -510,6 +533,8 @@ class CarPlayController(
         wirelessRetryCount.set(0)
         // 1.0.10：wired 额度同步重置。
         wiredRetryCount.set(0)
+        // vc153：启动看门狗重试额度同步重置。
+        wiredStartWatchdogRetries.set(0)
         if (mfiSession == null) {
             startMfi()
         } else if (config.transport == CarPlayTransport.WIRED) {
@@ -637,6 +662,12 @@ class CarPlayController(
         debugLog(line)
     }
 
+    /** vc154：拆栈完成一次性回调（teardown 线程触发，调用方自行 post 主线程）。
+     *  供 MainActivity 有线切换等待「无线栈拆干净」替代固定 2.5s 延迟；
+     *  与 teardownComplete 闭锁同点触发，close() 重入被 closed 位防抖。 */
+    @Volatile
+    var onTeardownComplete: Runnable? = null
+
     override fun close() {
         synchronized(this) {
             if (closed) return
@@ -683,6 +714,13 @@ class CarPlayController(
                         Thread.currentThread().interrupt()
                     }
                     teardownComplete.countDown()
+                    // vc154：闭锁放行后同点触发一次性回调（拆栈已彻底完成）。
+                    onTeardownComplete?.let { callback ->
+                        try {
+                            callback.run()
+                        } catch (_: Throwable) {
+                        }
+                    }
                 }
             },
             "xcertplay-controller-teardown",
@@ -1063,10 +1101,14 @@ class CarPlayController(
 
             onStatus(CarPlayStatus.RunningWireless)
             debugLog("wireless Bluetooth iAP2 control starting")
-            val result = Iap2WirelessControlClient(
+            // vc152：持有 client 引用——会话结束后自动重投逻辑经 sendCarPlayInvitation()
+            // 外部线程直发 0x4301；控制环退出即清引用（RFCOMM 已断邀请通道无效）。
+            val controlClient = Iap2WirelessControlClient(
                 session = channel,
                 mfi = Iap2MfiAuthenticationClient(mfi),
-            ).run(
+            )
+            wirelessControlClient = controlClient
+            val result = controlClient.run(
                 identification = identification,
                 endpoint = endpoint,
                 timeoutMillis = controlLoopTimeoutMillis(),
@@ -1080,6 +1122,8 @@ class CarPlayController(
                 // 踢出后 1.5s 恢复真凭证并持续重发（详见 Iap2WirelessControlClient 注释）。
                 relayKickAfterResends = if (relayTestFakeCredential != null) 2 else -1,
             )
+            // vc152：控制环退出（RFCOMM 断/terminal 返回）后邀请通道失效，清引用。
+            wirelessControlClient = null
             if (isStaleWirelessRun(generation)) {
                 closeWirelessStack()
                 return
@@ -1359,6 +1403,8 @@ class CarPlayController(
         object : AirPlaySessionListener by sessionListener {
             override fun onSessionActive(session: AirPlaySession) {
                 if (isStaleWirelessRun(generation)) return
+                // vc152：重投成功（自动邀请或 iPhone 自发 0x4300）即撤销邀请定时器。
+                peerEndInvitationArmed.set(false)
                 wirelessConnectionProof.activate(generation, session)
                 sessionListener.onSessionActive(session)
             }
@@ -1367,6 +1413,11 @@ class CarPlayController(
                 if (isStaleWirelessRun(generation)) return
                 wirelessConnectionProof.end(generation, session)
                 handlePreStreamEof(generation, session)
+                // vc152：本代会话曾激活 + 对端正常结束（微信语音挂断等）→ 自动邀请重投。
+                // 用户断开（disconnect）走整代拆栈 → generation 失配/isStale 已拦。
+                if (wirelessActiveReported.get() || wirelessDegradedActive.get()) {
+                    armPeerEndInvitation(generation)
+                }
                 sessionListener.onSessionEnded(session)
             }
 
@@ -1375,6 +1426,55 @@ class CarPlayController(
                 wirelessConnectionProof.rendered(generation, session)
             }
         }
+
+    /**
+     * vc152（K60 21:03:49 实锤）：无线会话被 iPhone 主动优雅结束后自动邀请重投。
+     * 背景：微信语音挂断后 iPhone 走有秩序 teardown 结束整会话，但不发 0x4300，而车机
+     * 的 0x4301 是应答式（CARPLAY_AVAILABILITY 分支）→ 干等永不重投。此处经存活的蓝牙
+     * RFCOMM 控制环直发 0x4301 邀请。节奏：3s 后第一轮，距上轮 30s 补一轮，共 2 次封顶；
+     * 重投成功（onSessionActive 复位 armed）、代更替（isStale/generation 判定）或
+     * RFCOMM 断（client 引用清空）即终止。用户断开路径不受影响。
+     */
+    private fun armPeerEndInvitation(generation: Int) {
+        if (!peerEndInvitationArmed.compareAndSet(false, true)) return
+        peerEndInvitationsSent.set(0)
+        Thread(
+            {
+                val client = wirelessControlClient ?: run {
+                    peerEndInvitationArmed.set(false)
+                    return@Thread
+                }
+                var delayMillis = 3_000L
+                while (true) {
+                    try {
+                        Thread.sleep(delayMillis)
+                    } catch (interrupted: InterruptedException) {
+                        return@Thread
+                    }
+                    if (closed || phase != Phase.WIRELESS) return@Thread
+                    if (generation != wirelessGeneration.get()) return@Thread
+                    if (activeSession != null) return@Thread // 已重投成功
+                    if (peerEndInvitationsSent.get() >= PEER_END_INVITATION_MAX_SENDS) {
+                        debugLog("wireless peer-end invitations exhausted; giving up")
+                        return@Thread
+                    }
+                    if (!client.sendCarPlayInvitation()) {
+                        debugLog("wireless peer-end invitation failed (RFCOMM gone); giving up")
+                        return@Thread
+                    }
+                    val sent = peerEndInvitationsSent.incrementAndGet()
+                    debugLog(
+                        "wireless peer-end invitation #$sent sent (0x4301 after session ended)",
+                    )
+                    delayMillis = PEER_END_INVITATION_RETRY_DELAY_MILLIS
+                }
+            },
+            "xcertplay-peer-end-invite",
+        ).apply {
+            isDaemon = true
+            start()
+        }
+    }
 
     /** 1.0.29（EU5 修复）：wired 建立期看门狗的解除信号——RTSP 激活或首帧渲染即撤销看门狗。 */
     private fun wiredSessionListener(): AirPlaySessionListener =
@@ -2771,18 +2871,33 @@ class CarPlayController(
         }
     }
 
-    /** 1.0.29：wired 建立期看门狗——0x4301 后 [WIRED_ESTABLISH_WATCHDOG_MILLIS] 无流帧即关桥重建。 */
+    /**
+     * 1.0.29：wired 建立期看门狗——0x4301 后 [WIRED_ESTABLISH_WATCHDOG_MILLIS] 无流帧即关桥重建。
+     * vc153（K60 实锤 0x4301 后 iPhone 完全静默、界面恒「有线链路建立中」）：判死后结束本次
+     * 有线尝试并自动重试，额度 [WIRED_START_WATCHDOG_MAX_RETRIES] 次封顶；第 2 轮重试前置
+     * [wiredFullResetPending] 升级为「0x52 CarPlay mode request + 重新枚举」恢复路径（对齐
+     * 上游 WiredConfigurationAction.REQUEST_TRANSITION，经既有 onIphonePermission 消费）。
+     * 计时器以代际令牌失活：会话激活（wiredStreamSeen 短路）与 teardown（closeWiredStack
+     * 令牌递增）均使待触发计时器取消，重 arm 亦使旧计时器作废。
+     */
     private fun armWiredEstablishWatchdog() {
         wiredControlReturned = false
         wiredEstablishWatchdogFired = false
         wiredStreamSeen = false
+        val generation = ++wiredStartWatchdogGeneration
         mainHandler.postDelayed({
+            if (generation != wiredStartWatchdogGeneration) return@postDelayed
             if (closed || wiredControlReturned || wiredStreamSeen) return@postDelayed
             wiredEstablishWatchdogFired = true
+            val retries = wiredStartWatchdogRetries.incrementAndGet()
             debugLog(
-                "wired establish watchdog: no stream frame within " +
-                    "${WIRED_ESTABLISH_WATCHDOG_MILLIS}ms after 0x4301; closing CSM to rebuild",
+                "wired start watchdog: no session within " +
+                    "${WIRED_ESTABLISH_WATCHDOG_MILLIS}ms after 0x4301; " +
+                    "ending attempt (watchdog retry #$retries/$WIRED_START_WATCHDOG_MAX_RETRIES)",
             )
+            // vc153：第 2 轮重试前升级恢复路径——重试代强制 0x52 + setConfiguration 全量
+            // 复位（streamFrames>0 时 wedgeSuspect 不置位，此处兜底补上 mode request）。
+            if (retries >= 2) wiredFullResetPending = true
             runCatching { wiredCsm?.close() }
         }, WIRED_ESTABLISH_WATCHDOG_MILLIS)
     }
@@ -2891,6 +3006,12 @@ class CarPlayController(
                 onStatus(CarPlayStatus.ControlEnded)
                 return
             }
+            // vc153：启动看门狗重试额度耗尽——不再自动重试，落终态避免「建立中」假死循环。
+            if (wiredStartWatchdogRetries.get() > WIRED_START_WATCHDOG_MAX_RETRIES) {
+                debugLog("wired start watchdog retries exhausted; giving up")
+                onStatus(CarPlayStatus.ControlEnded)
+                return
+            }
             val attempt = wiredRetryCount.incrementAndGet()
             if (attempt > MAX_WIRED_RETRIES) {
                 debugLog("wired auto-retry exhausted after $MAX_WIRED_RETRIES attempts")
@@ -2959,6 +3080,12 @@ class CarPlayController(
             // 正常路径同节奏：清栈 + 30s 长退避后 startIphone 重建。
             if (wiredEstablishWatchdogFired && !closed) {
                 wiredEstablishWatchdogFired = false
+                // vc153：启动看门狗重试额度耗尽 → 终态，不再循环重建。
+                if (wiredStartWatchdogRetries.get() > WIRED_START_WATCHDOG_MAX_RETRIES) {
+                    closeWiredStack(reason = "establish-watchdog-retries-exhausted")
+                    onStatus(CarPlayStatus.ControlEnded)
+                    return
+                }
                 closeWiredStack(reason = "establish-watchdog-wedge")
                 onStatus(
                     CarPlayStatus.RecoveryHint("USB 连接停滞，正在重建（约 30 秒后自动重试）"),
@@ -3308,6 +3435,8 @@ class CarPlayController(
      * vc87（fe6t5）掉线取证：fe6t3 日志两次「掉线不自动重连」无法定位 close 发起者
      * （实测一次为用户断开按钮、一次根因=对端关 event 连接），reason 全量落盘。 */
     private fun closeWiredStack(restoreNetwork: Boolean = true, reason: String = "unspecified") {
+        // vc153：teardown 取消待触发的启动看门狗计时器（代际令牌失活）。
+        wiredStartWatchdogGeneration += 1
         debugLog("wired teardown starting reason=$reason")
         val activeServer = airPlayServer
         airPlayServer = null
@@ -3705,6 +3834,9 @@ class CarPlayController(
         private const val REENUMERATION_POLL_INTERVAL_MILLIS = 500L
         // M6k23：未建流阶段控制流 peer EOF 触发整代重启的阈值（连续次数）。
         private const val PRE_STREAM_EOF_RESTART_THRESHOLD = 2
+        // vc152：对端优雅结束会话后的 0x4301 邀请节奏——3s 首轮，30s 补轮，2 次封顶。
+        private const val PEER_END_INVITATION_MAX_SENDS = 2
+        private const val PEER_END_INVITATION_RETRY_DELAY_MILLIS = 30_000L
         // M6h：链路掉线后的自动重连（次数 + 间隔）。
         // M6k9：额度 3 → 5，间隔由固定 5s 改为指数退避（4s×attempt，封顶 15s）；
         // 重建会话成功（WirelessActive / degraded）即 attempt 归零，避免陈旧计数放大退避。
@@ -3727,7 +3859,13 @@ class CarPlayController(
         // 但连接发生在 0x4301+30s 整——iPhone 在此平台的 mDNS 问答循环要 ~30s 才收敛，
         // 30s 看门狗在数据到达前 57ms 拆桥误杀。30s→60s：查询收敛 ~30s + 流建立 20s 富余；
         // wiredStreamSeen 置位后看门狗即失效，健康路径不变。
-        private const val WIRED_ESTABLISH_WATCHDOG_MILLIS = 60_000L
+        // vc153（K60 定案）：60s→15s——K60 实锤 0x4301 后 iPhone 完全静默（无会话无流帧），
+        // 60s 判死 × 多轮重试 = 数分钟「有线链路建立中」假死。15s 判死 + 重试 2 次封顶 +
+        // 第 2 轮前 0x52 重枚举升级；健康平台会话 2~13s 内激活即令计时器失活（对齐上游
+        // WiredStartWatchdog：工作车机 0x4301 后 2~13s 会话即激活）。
+        private const val WIRED_ESTABLISH_WATCHDOG_MILLIS = 15_000L
+        // vc153：有线启动看门狗判死后的自动重试轮数封顶（超出落 ControlEnded 终态）。
+        private const val WIRED_START_WATCHDOG_MAX_RETRIES = 2
         private const val WIRED_WEDGE_RETRY_DELAY_MILLIS = 30_000L
         // vc97③：usbmux 控制面活性窗口——iAP2 心跳间隔通常 ≤5s，8s 收不到帧判控制面停。
         private const val USBMUX_ALIVE_WINDOW_MILLIS = 8_000L

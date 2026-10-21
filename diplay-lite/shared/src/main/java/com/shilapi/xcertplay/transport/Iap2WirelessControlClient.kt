@@ -21,6 +21,29 @@ class Iap2WirelessControlClient(
     private val session: Iap2Session,
     private val mfi: Iap2MfiAuthenticationClient,
 ) {
+    // vc152：会话结束后外部线程发 0x4301 邀请需要 endpoint 与构帧参数；run() 进入即写入，
+    // 控制环退出后仍可读（邀请通道随 RFCOMM 存活而有效）。
+    @Volatile
+    private var invitationEndpoint: Iap2WirelessCarPlayEndpoint? = null
+
+    /**
+     * vc152（微信语音挂断后会话不自愈，K60 21:03:49 实锤）：iPhone 挂断语音后主动优雅
+     * 结束 AirPlay 会话（type=102 ended → session ended，有秩序 teardown 非 TCP RST）但
+     * 不会发 0x4300——而车机的 0x4301 是应答式的（CARPLAY_AVAILABILITY 分支），干等永不
+     * 重投。此方法支持控制环存活期间由外部线程直接发一轮 0x4301 邀请：session.send 走
+     * CsmChannel sendLock 线程安全，与控制环 recv 并发无冲突。控制环已退出（RFCOMM 断/
+     * endpoint 未就绪）时返回 false，调用方按重试预算处理。
+     */
+    fun sendCarPlayInvitation(): Boolean {
+        val endpoint = invitationEndpoint ?: return false
+        return try {
+            session.send(carPlayStartSession(endpoint), INVITATION_SEND_TIMEOUT_MILLIS)
+            true
+        } catch (error: Throwable) {
+            false
+        }
+    }
+
     fun run(
         identification: Iap2IdentificationConfig,
         endpoint: Iap2WirelessCarPlayEndpoint,
@@ -47,6 +70,8 @@ class Iap2WirelessControlClient(
         require(timeoutMillis == NO_TIMEOUT_MILLIS || timeoutMillis in 1..MAX_TIMEOUT_MILLIS) {
             "timeoutMillis must be in 1..$MAX_TIMEOUT_MILLIS or NO_TIMEOUT_MILLIS"
         }
+        // vc152：记录 endpoint 供 sendCarPlayInvitation()（外部线程会话结束后发邀请）构帧。
+        invitationEndpoint = endpoint
 
         // 这个截止时间只约束「建链窗口」：识别/鉴权/订阅必须在此窗口内完成，卡住就 TIMED_OUT。
         // 一旦 onReady()（订阅已发出，iAP2 进入稳态）就放开为无超时 —— 见下方 onReady() 之后。
@@ -460,6 +485,8 @@ class Iap2WirelessControlClient(
         private const val MAX_PRE_TRANSPORT_WIFI_CONFIGURATION_SENDS = 5
         private const val MAX_POST_TRANSPORT_WIFI_CONFIGURATION_SENDS = 2
         private const val NANOS_PER_MILLISECOND = 1_000_000L
+        /** vc152：外部线程会话结束后发 0x4301 邀请的发送超时。 */
+        private const val INVITATION_SEND_TIMEOUT_MILLIS = 2_000L
 
         /** Reference-compatible 0x5703 body. BSSID is omitted when the platform does not expose it. */
         fun accessoryWiFiConfiguration(endpoint: Iap2WirelessCarPlayEndpoint): Iap2Frame =

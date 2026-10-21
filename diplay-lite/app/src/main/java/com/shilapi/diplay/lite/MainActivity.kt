@@ -1163,6 +1163,35 @@ class MainActivity : Activity() {
                 startSession(config, key, "relay")
             }
             "usb" -> {
+                // vc153（K60）：有线连接前的无线互斥——无线会话活跃（真交接/降级态/本代
+                // 曾建立过）时先 stopService 拆无线栈（onDestroy 全拆 controller/AirPlay
+                // 栈/VPN）。vc154：不再用固定 2.5s 延迟——拆栈完成回调驱动（teardown
+                // 线程在闭锁放行后触发，即无线栈已彻底拆干净、iPhone 已收到断开信号），
+                // 回调即重入本流程走有线 bring-up；8s 兜底防回调丢失（服务销毁竞态等）。
+                // 无线未连接（无服务/未建立过会话）时零影响直走原路径。
+                if (LiteSessionService.current?.isWirelessSessionAlive() == true) {
+                    LiteLog.log("ui", "USB 通道：无线会话活跃，先拆无线栈，拆栈完成回调驱动有线连接（8s 兜底）")
+                    val entered = java.util.concurrent.atomic.AtomicBoolean(false)
+                    val handler = Handler(mainLooper)
+                    // vc154 回调：onDestroy 转挂到 closingController，拆栈线程触发；
+                    // post 回主线程后重入 connect（AtomicBoolean 防与兜底双触发）。
+                    LiteSessionService.armTeardownCallback {
+                        handler.post {
+                            if (entered.compareAndSet(false, true)) {
+                                LiteLog.log("ui", "USB 通道：无线栈拆除完成（回调驱动），进入有线连接")
+                                connect(channel, auto)
+                            }
+                        }
+                    }
+                    stopService(Intent(this, LiteSessionService::class.java))
+                    handler.postDelayed({
+                        if (entered.compareAndSet(false, true)) {
+                            LiteLog.log("ui", "USB 通道：拆栈完成回调 8s 未到（兜底触发），直接进入有线连接")
+                            connect(channel, auto)
+                        }
+                    }, WIRED_SWITCH_FALLBACK_MS)
+                    return
+                }
                 // U4 USB 有线：数据面 TUN 需要 VPN 授权（一次性系统对话框）；
                 // 已授权（prepare 返回 null）则直接进入连接流程。
                 val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps)
@@ -1225,8 +1254,9 @@ class MainActivity : Activity() {
                             return
                         }
                     }
-                    toast("车机 ROM 缺失 VPN 授权组件（vpndialogs），USB 有线模式不可用")
-                    LiteLog.log("ui", "USB 通道：VPN 授权链路全失败（无 root 或 appops 未生效）")
+                    // vc154：授权链路全失败不再只弹 toast（无行动路径），升级引导页。
+                    LiteLog.log("ui", "USB 通道：VPN 授权链路全失败（无 root 或 appops 未生效），弹引导页")
+                    showVpnConsentGuideDialog(prepareBroken = false)
                     return
                 }
                 if (!prepareBroken && consent == null) {
@@ -1259,8 +1289,9 @@ class MainActivity : Activity() {
                         return
                     }
                 }
-                toast("车机 VPN 授权组件异常，USB 有线模式不可用")
-                LiteLog.log("ui", "USB 通道：VpnService.prepare 异常且 root 兜底未生效")
+                // vc154：prepare 异常且 root 兜底未生效 → 引导页（原只弹 toast）。
+                LiteLog.log("ui", "USB 通道：VpnService.prepare 异常且 root 兜底未生效，弹引导页")
+                showVpnConsentGuideDialog(prepareBroken = true)
             }
             else -> {
                 toast("未知连接通道")
@@ -1287,6 +1318,64 @@ class MainActivity : Activity() {
             }
             .create()
         dialog.show()
+    }
+
+    /**
+     * vc154：VPN 授权失败引导页（场景：无 root + 车机 ROM 缺失/裁剪授权组件）。
+     * 原两个失败终点只弹 toast 无行动路径，升级为弹窗引导：
+     * ① 已 root → 授权后点「重试授权」自动写 appops + 复检建链；
+     * ② 无 root → 提示改用无线连接（车机热点/中继），此类车机有线结构性不可用。
+     * 重试的 su 写入放后台线程（grantVpnConsentViaRoot 内部 4s 轮询），结果 post 回
+     * 主线程；API16 兼容：仅用 AlertDialog 既有 API，无新依赖。
+     */
+    private fun showVpnConsentGuideDialog(prepareBroken: Boolean) {
+        val reason = if (prepareBroken) {
+            "车机 VPN 授权组件异常（VpnService.prepare 抛异常）"
+        } else {
+            "车机系统缺失 VPN 授权组件（vpndialogs 被裁剪）"
+        }
+        LiteLog.log("ui", "USB 通道：VPN 授权失败引导页展示（$reason）")
+        android.app.AlertDialog.Builder(this)
+            .setTitle("USB 有线模式需要 VPN 授权")
+            .setMessage(
+                "$reason，且当前未获取 root，无法完成一次性授权。\n\n" +
+                    "USB 有线模式需建立 VPN 网络通道（数据面必需），此类车机可选：\n\n" +
+                    "① 若车机已 root：请先给本 app 授权 root，再点「重试授权」自动放行并连接；\n" +
+                    "② 改用无线连接（车机热点/中继模式），不依赖 VPN 授权组件。",
+            )
+            .setPositiveButton("重试授权（已 root）") { _, _ ->
+                LiteLog.log("ui", "VPN 授权引导页：点重试授权")
+                Thread {
+                    val granted = grantVpnConsentViaRoot() && runCatching {
+                        VpnService.prepare(this) == null
+                    }.getOrDefault(false)
+                    runOnUiThread {
+                        if (granted) {
+                            LiteLog.log("ui", "VPN 授权引导页：重试成功，进入有线连接")
+                            val config = LiteConfig.load(this)
+                            startSession(
+                                config,
+                                LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps),
+                                "usb",
+                            )
+                        } else {
+                            toast("授权仍未生效：root 未授予或未生效，请改用无线连接")
+                            LiteLog.log("ui", "VPN 授权引导页：重试仍失败")
+                        }
+                    }
+                }.start()
+            }
+            .setNegativeButton("改用无线连接") { _, _ -> switchToWirelessFromGuide() }
+            .setNeutralButton("取消", null)
+            .show()
+    }
+
+    /** vc154：引导页「改用无线连接」动作——沿用最近一次用过的无线通道（无记录走车机热点）。 */
+    private fun switchToWirelessFromGuide() {
+        val saved = getSharedPreferences(SESSION_PREFS, MODE_PRIVATE).getString(SESSION_CHANNEL_KEY, null)
+        val channel = if (saved == "relay") "relay" else "car"
+        LiteLog.log("ui", "VPN 授权引导页：用户选择改用无线连接（channel=$channel）")
+        connect(channel)
     }
 
     /**
@@ -1578,6 +1667,8 @@ class MainActivity : Activity() {
         // M6k25：CarIconPage 图库选择回调码（原 CarIconActivity.REQ_PICK_IMAGE=4301）。
         private const val REQUEST_GALLERY_PICK = 1001
         private const val APPLE_USB_VENDOR_ID = 0x05ac
+        // vc154：有线切换拆栈完成回调的超时兜底（正常远小于此值，8s 覆盖慢速拆栈+竞态）。
+        private const val WIRED_SWITCH_FALLBACK_MS = 8_000L
         private val DOT_CONNECTING = Color.rgb(240, 200, 60)
         private val DOT_FAILED = Color.rgb(240, 80, 80)
 

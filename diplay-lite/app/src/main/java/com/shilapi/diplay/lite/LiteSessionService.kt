@@ -175,6 +175,12 @@ class LiteSessionService : Service() {
     fun sendTouch(contacts: List<AirPlayContact>, sticky: Boolean): Boolean =
         controller?.sendTouch(contacts, sticky) == true
 
+    /**
+     * vc153：无线会话是否活跃（MainActivity 有线连接互斥判定用）；
+     * controller 未建/已关（含服务销毁中）视为不活跃。
+     */
+    fun isWirelessSessionAlive(): Boolean = controller?.isWirelessSessionAlive() == true
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         current = this
         // vc151（targetSdk 34）：API 34+ 必须三参 startForeground 传类型（与 Manifest
@@ -219,7 +225,16 @@ class LiteSessionService : Service() {
         // vc96：停 root USB 取证探针（幂等，未启动时 no-op）。
         WiredUsbForensics.stop()
         unregisterBtProbe()
-        controller?.let { closingController = it; it.close() }
+        // vc154：MainActivity 有线切换前挂载的拆栈完成回调在此转挂到 closingController
+        // ——拆栈线程闭锁放行后触发（回调内部自行 post 主线程）。controller 为 null 时
+        // 也消费掉（丢弃），防止残留到下一代 teardown 误触发——此时 MainActivity 的
+        // 8s 兜底会接管。未挂载时 consume 为 null，保持 controller 原值不动。
+        val teardownCallback = consumeTeardownCallback()
+        controller?.let {
+            closingController = it
+            teardownCallback?.let { callback -> it.onTeardownComplete = callback }
+            it.close()
+        }
         controller = null
         mediaSink?.close()
         mediaSink = null
@@ -899,6 +914,26 @@ class LiteSessionService : Service() {
          */
         @Volatile
         private var closingController: CarPlayController? = null
+
+        /**
+         * vc154：有线切换等待拆栈完成的一次性回调（teardown 完成回调驱动，替代固定 2.5s）。
+         * MainActivity stopService 前经 armTeardownCallback 挂载；onDestroy 把它转挂到
+         * closingController，teardown 线程拆栈结束时触发。消费后即清空；无人消费时由
+         * 调用方的超时兜底触发（MainActivity 侧 8s）。
+         */
+        @Volatile
+        private var pendingTeardownCallback: Runnable? = null
+
+        /** 挂载拆栈完成回调（幂等覆盖：仅保留最后一次）。 */
+        fun armTeardownCallback(callback: Runnable) {
+            pendingTeardownCallback = callback
+        }
+
+        private fun consumeTeardownCallback(): Runnable? {
+            val callback = pendingTeardownCallback
+            pendingTeardownCallback = null
+            return callback
+        }
 
         private const val IDENTITY_PREFS = "diplay_lite_identity"
         private const val PAIRING_PREFS = "diplay_lite_pairings"
