@@ -898,8 +898,12 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.6f),
             )
             topRow.addView(space(16), LinearLayout.LayoutParams(dip(16), 1))
-            // 右列高度撑满行高（= 左卡高度），实现与状态大卡顶底对齐。
-            topRow.addView(right, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+            // vc155：右列 WRAP_CONTENT 而非 MATCH_PARENT——右列自身内容总高（USB 键+说明+
+            // 快捷行+设置键）在断开连接按钮 GONE、左卡变矮后可能超过左卡高度，MATCH_PARENT
+            // 会把右列压到左卡同高导致设置键底部溢出被裁（K60 实测：断开后设置键圆角被切）。
+            // WRAP_CONTENT 让右列反撑 topRow 行高（行高=左右较大者），任何状态都不裁切；
+            // 连接中右列内容从顶排、位置与之前一致，视觉零变化。
+            topRow.addView(right, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             content.addView(topRow)
         } else {
             content.addView(statusCard)

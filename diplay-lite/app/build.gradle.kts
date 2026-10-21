@@ -265,7 +265,9 @@ android {
         // vc154（待办收口三件套）：④有线切换改拆栈完成回调驱动（替代固定 2.5s，8s 兜底）；
         // ⑤VPN 授权失败引导页（原两处失败终点只弹 toast，升级为重试授权/改无线引导弹窗）；
         // ⑦CI 化构建 task（签名固化缺省 debug keystore + ciRelease 一键构建归档）。
-        versionCode = 154
+        // vc155（K60 实测 UI 修复）：主面板横屏右列 MATCH_PARENT→WRAP_CONTENT——断开连接
+        // 按钮 GONE 左卡变矮后右列被压至同高，设置键底部溢出圆角被裁；改右列反撑行高根治。
+        versionCode = 155
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties
