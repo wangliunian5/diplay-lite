@@ -1,39 +1,96 @@
-# Building DiPlay
+# Building DiPlay Lite
 
-Requirements: JDK 25, Android SDK 37, NDK 28.2.13676358 and the included Gradle wrapper.
+Pinned toolchain below. Read the notes before changing any version — most of these pins exist
+because upgrading breaks the API 16 baseline or the R8 pass.
 
-## Source and CI builds
+## Requirements
 
-```sh
-./gradlew :shared:testDebugUnitTest :common:testDebugUnitTest :mobile:lintDebug :mobile:assembleDebug
+| Component | Version | Note |
+|---|---|---|
+| JDK | **17** | Kotlin 1.8.22's `JavaVersion.parse` fails on JDK 25's four-segment version string |
+| Gradle | 7.6.4 | Provided by the included wrapper |
+| AGP | 7.4.2 | Cannot consume platform `android-37` |
+| Kotlin | 1.8.22 | |
+| Android SDK | compileSdk / targetSdk **34** | minSdk is 16 (Android 4.1) |
+| NDK | Only for the local Opus native build | CI does not depend on it |
+
+If your `JAVA_HOME` points elsewhere, pin it explicitly in `diplay-lite/gradle.properties`:
+
+```properties
+org.gradle.java.home=C:/Android/jdk-17/jdk-17.0.2
 ```
 
-The resulting source-only APK contains no accessory identity. Standalone CarPlay requires runtime authentication provisioning. Tests generate synthetic identities at runtime; no test private-key files are tracked.
+## Source-only build
 
-## Local release packaging
-
-Provide an external asset directory using `DIPLAY_AUTH_ASSETS_DIR`. The directory must contain exactly the intended runtime files under `offline-mfi/identity.pk8` and `offline-mfi/certificate.p7b`. Neither file belongs in Git. The build permits those two files only when this explicit input is set and rejects unexpected credential containers elsewhere in APK assets.
-
-Set `ANDROID_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD` locally for your Android signing key. Never commit these values or the keystore. Different signing keys cannot update an existing project-signed installation.
+The project has three modules: `:app`, `:shared` and `:blackbar`.
 
 ```sh
-./gradlew :shared:testDebugUnitTest :common:testDebugUnitTest :mobile:lintRelease :mobile:assembleRelease
+./gradlew :app:assembleDebug :shared:assembleDebug
 ```
 
-Output: `mobile/build/outputs/apk/release/mobile-release.apk`. The release APK deliberately contains the experimental identity described in the notices; it is extractable by recipients. The separate Android signing key is not included. The retired build-beta.py helper is not used; this Gradle workflow uses explicit environment inputs.
+Without the identity input described below, the resulting APK contains **no accessory identity**.
+It compiles and installs, but cannot authenticate with CarPlay — this is intentional for
+source-only and CI builds. Tests generate synthetic identities at runtime; no test private-key
+files are tracked.
 
-The public release source archive corresponds to the tagged source and excludes runtime identities, signing keys, local configuration and build output.
+## Identity assets are external — never in the repository
 
-## Standalone car-test APK
+The receiver needs an experimental CarPlay accessory identity at runtime. **`identity.pk8` and
+`certificate.p7b` are not part of the source tree**; they are injected at build time.
 
-Use `:mobile:assembleStandaloneDebug` for a test APK that must connect to an iPhone:
+| Priority | Source | Use case |
+|---|---|---|
+| 1 | `DIPLAY_IDENTITY_DIR` environment variable | CI, or your own directory |
+| 2 | `auth/offline-mfi/` alongside the repository root | Default on a local machine |
+| 3 | Neither present | Build continues without identity (see above) |
+
+Only those two filenames are accepted; if only one is present the build fails.
 
 ```sh
-DIPLAY_AUTH_ASSETS_DIR=/absolute/path/to/runtime-assets ./gradlew :mobile:assembleStandaloneDebug
+DIPLAY_IDENTITY_DIR=/absolute/path/to/assets ./gradlew :app:ciRelease
 ```
 
-This task refuses missing or empty runtime inputs. `assembleDebug` remains an identity-free
-source/CI build when the explicit asset input is absent; do not install that output as a
-standalone car-test package. Before delivery, verify both `assets/offline-mfi/identity.pk8`
-and `assets/offline-mfi/certificate.p7b` in the APK against the selected local inputs.
-Update the existing test app without uninstalling it to preserve its settings.
+`ciRelease` runs `injectRuntimeIdentity` (hooked into `preBuild`), then assembles, signs and
+archives to `apks/DiPlay-<version>-<flavor>-vc<code>.apk`. Override the archive location with
+`DIPLAY_APK_ARCHIVE_DIR`.
+
+**Always verify the identity actually landed in the APK.** A missing identity produces an APK
+that installs fine but silently fails to authenticate, which is easily misdiagnosed as a
+protocol or handshake problem:
+
+```sh
+python -c "import zipfile;z=zipfile.ZipFile('apks/<apk>');print([n for n in z.namelist() if 'offline-mfi' in n])"
+# expect: assets/offline-mfi/identity.pk8, assets/offline-mfi/certificate.p7b
+```
+
+**Never commit identity assets to any repository**, public or private. CI runs
+`scripts/check_public_tree.py` as its first step and fails the build if key material or
+credentials enter the index. Run it locally before committing:
+
+```sh
+python3 scripts/check_public_tree.py
+```
+
+## Android signing key
+
+Set `ANDROID_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` and
+`ANDROID_KEY_PASSWORD` for your own key. Otherwise `ciRelease` falls back to
+`~/.android/debug.keystore`, whose alias is **`androiddebugkey`** (not `android`) with every
+password `android`. If that keystore is absent too, the APK stays unsigned. Different signing
+keys cannot update an existing installation.
+
+Never commit these values or the keystore itself.
+
+## Third-party dependencies
+
+Limited to `org.jmdns:jmdns:3.5.1` and `org.bouncycastle:bcprov-jdk15on:1.70`.
+
+Do **not** upgrade jmdns: 3.5.4+ calls `Map.getOrDefault`, a Java 8 API, which throws
+`NoSuchMethodError` on API 16.
+
+## Notes
+
+- This document previously described an upstream layout (`:common` / `:mobile` modules, JDK 25,
+  SDK 37, `DIPLAY_AUTH_ASSETS_DIR`). Those no longer exist here; the current text reflects
+  the actual project as of 2026-10-21.
+- See `INSTALL.md` for setting up a device, and `TESTING.md` for the verification checklist.

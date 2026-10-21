@@ -17,19 +17,17 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '25'
+          # Must stay on 17: Kotlin 1.8.22 crashes inside JavaVersion.parse on JDK 25
+          # (see diplay-lite/gradle.properties). Do not bump casually.
+          java-version: '17'
       - uses: android-actions/setup-android@v3
         with:
-          packages: platform-tools platforms;android-37.0 build-tools;36.0.0 ndk;28.2.13676358
+          # compileSdk is 34 across the three modules and AGP 7.4.2 cannot target
+          # newer platforms. No NDK here - the Opus JNI is built locally only.
+          packages: platform-tools platforms;android-34 build-tools;34.0.0
       - uses: gradle/actions/setup-gradle@v4
-      - name: Unit tests, lint and source-only debug build
-        run: ./gradlew :shared:testDebugUnitTest :common:testDebugUnitTest :mobile:lintDebug :mobile:assembleDebug --stacktrace
-      - name: Test reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-reports
-          path: |
-            shared/build/reports/tests/
-            common/build/reports/tests/
-            mobile/build/reports/lint-results-debug.html
+      - name: Source-only debug build
+        # The modules that actually exist: :app :shared :blackbar. The old :common
+        # and :mobile were removed when the tree collapsed into a single diplay-lite
+        # project, and the repo has no unit tests, so compilation is the gate.
+        run: ./gradlew :shared:assembleDebug :app:assembleDebug :blackbar:assembleDebug --stacktrace

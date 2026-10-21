@@ -8,7 +8,7 @@ Upstream credits [LIVI](https://github.com/f-io/LIVI) and [Showcase](https://git
 
 ## Home and settings UI
 
-`common/src/main/java/com/shilapi/xcertplay/DiPlayActivity.kt` adapts the palette, visual arrangement and interface copy of the [DiAuto project](https://github.com/shihabal3amri/DiAuto). DiAuto's source is licensed under AGPL version 3. The UI file is marked AGPL-3.0-only; its license text is included in `docs/licenses/DiAuto-AGPL-3.0.txt`.
+`diplay-lite/app/src/main/java/com/shilapi/diplay/lite/MainActivity.kt` adapts the palette, visual arrangement and interface copy of the [DiAuto project](https://github.com/shihabal3amri/DiAuto). DiAuto's source is licensed under AGPL version 3. The UI file is marked AGPL-3.0-only; its license text is included in `docs/licenses/DiAuto-AGPL-3.0.txt`.
 
 ## CarPlay icon
 
@@ -20,13 +20,14 @@ CarPlay and the CarPlay icon are Apple Inc. marks/assets. This asset is not cove
 
 ## Runtime dependencies
 
-- AndroidX and Jetpack Compose — Android Open Source Project; Apache License 2.0.
+- JmDNS **3.5.1** — JmDNS contributors; Apache License 2.0. Deliberately pinned: 3.5.4+ calls
+  `Map.getOrDefault`, a Java 8 API, which throws `NoSuchMethodError` on API 16.
+- Bouncy Castle **bcprov-jdk15on 1.70** — The Legion of the Bouncy Castle Inc.;
+  Bouncy Castle license (MIT-style).
 - Kotlin standard library — JetBrains; Apache License 2.0.
-- Bouncy Castle 1.79 — The Legion of the Bouncy Castle Inc.; Bouncy Castle license (MIT-style).
-- JmDNS 3.6.3 — JmDNS contributors; Apache License 2.0.
-- SLF4J — QOS.ch; MIT license.
 
-Gradle dependency declarations and version catalog accompany the source. License files available in the resolved artifacts are included under `docs/licenses/dependencies/`.
+**No AndroidX, no Jetpack Compose, and no other third-party libraries are used.** Maintaining
+that zero-dependency baseline is a deliberate constraint of this fork; see `docs/BUILD.md`.
 
 ## Experimental authentication data
 

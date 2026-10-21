@@ -2,7 +2,7 @@ name: Publish download site
 on:
   push:
     branches: [main]
-    paths: ['site/**', 'scripts/build_site.py', '.github/workflows/pages.yml']
+    paths: ['site/**', '.github/workflows/pages.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -19,7 +19,8 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-      - run: python3 scripts/build_site.py
+      # site/ ships pre-built. The previous step invoked scripts/build_site.py,
+      # which does not exist in this repository and made every run fail.
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
