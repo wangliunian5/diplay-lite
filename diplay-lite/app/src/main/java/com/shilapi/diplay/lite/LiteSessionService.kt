@@ -348,6 +348,8 @@ class LiteSessionService : Service() {
             // M6k19：音乐缓存（设置页 10-4000ms 可调）。
             // M6k21：媒体/导航各自的音频流编号覆盖（0=自动路由，1~20=传统音频流编号）。
             mediaBufferMillis = config.mediaBufferMillis,
+            // vc156（上游 0.2.21 预缓冲移植）：媒体预缓冲开关（默认开，重新连接后生效）。
+            audioPrebufferEnabled = config.audioPrebuffer,
             mediaStreamOverride = config.mediaAudioStream,
             navStreamOverride = config.navAudioStream,
             // 1.0.16（P0-1）：通话走扬声器时 telephony 下行按 MEDIA（STREAM_MUSIC）路由。
@@ -434,6 +436,9 @@ class LiteSessionService : Service() {
                     // 设置页「即时生效」提示名不副实）。车机热点模式接上手填信道
                     // （0=自动）；relay 复用凭据字段不吃信道、usb 无热点，均保持 0。
                     manualHotspotChannel = if (usb || relay) 0 else config.carIpv4Channel,
+                    // vc156（B 级补充路径）：热点失败 Wi-Fi Direct P2P 兜底开关——仅车机热点
+                    // 模式生效（RELAY 接外部网络无替代 AP 语义；USB 有线无热点），其余场景恒 false。
+                    wifiP2pFallbackEnabled = !usb && !relay && config.wifiP2pFallback,
                     wirelessBluetoothDeviceAddress = config.bluetoothAddress.takeIf { it.isNotBlank() },
                     // 1.1.6(vc76)：TS7 无 root 裁决实验——本包关闭有线 cdc_ncm 解绑守护。
                     wiredNcmGuardEnabled = BuildConfig.WIRED_NCM_GUARD_ENABLED,

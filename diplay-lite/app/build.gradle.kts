@@ -16,7 +16,9 @@ android {
         // 明文 HTTP 放行、前台服务类型+通知渠道、动态 receiver EXPORTED 旗标、
         // 运行时权限（RECORD_AUDIO/定位/POST_NOTIFICATIONS）。老车机（KK API19）零回归。
         targetSdk = 34
-        versionCode = 56
+        // versionCode 唯一生效处在下方 vc 迭代注释区（随版本递增，出包时改那里）。
+        // 2026-10-21 整顿：此处原有 `versionCode = 56` 为失效的重复赋值，被后者静默
+        // 覆盖；出包时改错一处即打错版本，已移除。
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
         // 版本迭代规则：1.0.x 系列止于 1.0.29，自 1.1.x 重新起排（每次出包 patch +1）。
@@ -267,7 +269,10 @@ android {
         // ⑦CI 化构建 task（签名固化缺省 debug keystore + ciRelease 一键构建归档）。
         // vc155（K60 实测 UI 修复）：主面板横屏右列 MATCH_PARENT→WRAP_CONTENT——断开连接
         // 按钮 GONE 左卡变矮后右列被压至同高，设置键底部溢出圆角被裁；改右列反撑行高根治。
-        versionCode = 155
+        // vc156（上游 0.2.21 待移植双项）：①音频抗抖动=Opus 编码选择层（native→平台回退→
+        // 失败容错）+ MediaPacketLagGuard 积压丢帧 + AudioTrack 预缓冲水位（audioPrebuffer 开关）；
+        // ②Wi-Fi Direct fallback=热点建链失败时 P2P GO 兜底（wifiP2pFallback 开关，默认关）。
+        versionCode = 156
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties
@@ -345,6 +350,49 @@ android {
 dependencies {
     // 零 AndroidX / 零 Compose —— 轻量化红线（设计文档 §2.2）
     implementation(project(":shared"))
+}
+
+// CarPlay 身份资产「构建期外部注入」（2026-10-21 整顿）。
+// 背景：identity.pk8 / certificate.p7b 曾被直接跟踪入 Git 并随源码同步到公开仓，导致
+// MFi 身份私钥进入历史（谁 clone 到旧提交都能取出，且与现役密钥为同一把）。现改为：
+//   · 源码树内的 app/src/main/assets/offline-mfi/ 由 .gitignore 排除，永不入仓；
+//   · 构建时从外部目录注入：优先环境变量 DIPLAY_IDENTITY_DIR，缺省回落 ../auth/offline-mfi
+//     （工程本级私有目录，同样不入库）；
+//   · 白名单仅两个文件，缺失即报错、多余不予理会，避免误塞其它资产；
+//   · 外部目录不存在时按「纯源码环境」继续构建（产出 APK 不带身份，代码仍可正常编译），
+//     与 release 签名「keystore 缺省即未签名」的处理保持一致。
+val runtimeIdentityDir = System.getenv("DIPLAY_IDENTITY_DIR")?.takeIf { it.isNotBlank() }
+    ?: rootProject.file("../auth/offline-mfi").absolutePath
+val runtimeIdentityTarget = file("src/main/assets/offline-mfi")
+val runtimeIdentityFiles = listOf("identity.pk8", "certificate.p7b")
+
+tasks.register("injectRuntimeIdentity") {
+    group = "build"
+    description = "Copy allowed CarPlay identity assets from an external dir into app assets (never committed)"
+    val srcDir = File(runtimeIdentityDir)
+    val dstDir = runtimeIdentityTarget
+    doLast {
+        if (!srcDir.isDirectory) {
+            logger.warn(
+                "未找到 CarPlay 身份资产目录 $srcDir —— 将产出不带身份的 APK（纯源码构建语义）。" +
+                    "需打包请把 identity.pk8 与 certificate.p7b 放入该目录，或设置环境变量 DIPLAY_IDENTITY_DIR。"
+            )
+            return@doLast
+        }
+        val present = runtimeIdentityFiles.filter { File(srcDir, it).isFile }
+        if (present.size != runtimeIdentityFiles.size) {
+            throw GradleException(
+                "身份资产不完整：$srcDir 中应有 $runtimeIdentityFiles，实得 $present"
+            )
+        }
+        dstDir.mkdirs()
+        present.forEach { name -> File(srcDir, name).copyTo(File(dstDir, name), overwrite = true) }
+        logger.lifecycle("已注入 CarPlay 身份资产 $present（来源：$srcDir）")
+    }
+}
+
+tasks.named("preBuild").configure {
+    dependsOn("injectRuntimeIdentity")
 }
 
 // vc154（⑦ CI 化构建 task）：一键「签名 release 构建 + APK 归档」。

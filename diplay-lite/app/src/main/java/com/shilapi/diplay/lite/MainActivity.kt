@@ -258,6 +258,9 @@ class MainActivity : Activity() {
         }
         if (Build.VERSION.SDK_INT >= 33) {
             wanted.add(android.Manifest.permission.POST_NOTIFICATIONS)
+            // vc156（热点失败 Wi-Fi Direct 兜底）：API 33+ P2P 建组前置权限；拒绝只影响
+            // P2P 兜底路径（提示去系统设置授予），不影响热点/中继主路径。
+            wanted.add(android.Manifest.permission.NEARBY_WIFI_DEVICES)
         }
         val missing = wanted.filter {
             checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED

@@ -39,6 +39,7 @@ import com.shilapi.xcertplay.network.ConfirmedChannelMemory
 import com.shilapi.xcertplay.network.Ipv6NcmBridge
 import com.shilapi.xcertplay.network.ManualHotspotManager
 import com.shilapi.xcertplay.network.RelayClientManager
+import com.shilapi.xcertplay.network.WifiP2pGroupManager
 import com.shilapi.xcertplay.network.WiredBonjourAdvertiser
 import com.shilapi.xcertplay.network.WiredMdnsResponder
 import com.shilapi.xcertplay.network.WiredNcmGuard
@@ -1870,6 +1871,16 @@ class CarPlayController(
             // vc93：OEM 状态语义失灵兜底（235233 实锤 ECARX state=11 但 ap0 存活带地址）——
             // 状态判死前查 AP 专用接口，接口活着就不阻塞连接。
             if (!CarHotspotStatus.hasDedicatedApInterface()) {
+                // vc156（B 级补充路径）：SoftAP 判死（热点关/OEM 语义失灵且无 ap 接口）→
+                // 开关允许时改用 Wi-Fi P2P GO 当替代 AP；P2P 也失败才抛原始错误（主诊断不丢）。
+                if (p2pFallbackEligible(generation)) {
+                    try {
+                        return startP2pFallbackHotspot(generation, "car hotspot off")
+                    } catch (p2pFailure: Exception) {
+                        debugLog("wifi-p2p fallback failed: " +
+                            "${p2pFailure.message ?: p2pFailure.javaClass.simpleName}; keeping the hotspot-off error")
+                    }
+                }
                 throw IOException("The car hotspot is off. Turn it on in the car settings and connect again.")
             }
             debugLog("car hotspot state check overridden by live AP interface (OEM state semantics)")
@@ -1927,9 +1938,71 @@ class CarPlayController(
             if (hotspot === manager) hotspot = null
             closeBestEffort(hotspotMode.name) { manager.close() }
             if (isStaleWirelessRun(generation)) throw failure
+            // vc156（B 级补充路径）：热点附着失败（权限受限/超时/OEM 裁剪）→ P2P GO 替代。
+            // P2P 建组成功 → 返回的 WirelessHotspotInfo 直接喂既有 0x5703 凭证/监听/Bonjour 链路；
+            // P2P 也失败 → 保留主路径错误原文重抛，绝不掩盖主诊断、绝不阻塞主建链。
+            if (hotspotMode.isManualHotspot && p2pFallbackEligible(generation)) {
+                debugLog("manual hotspot attach failed " +
+                    "(${failure.message ?: failure.javaClass.simpleName}); trying Wi-Fi P2P GO fallback")
+                try {
+                    return startP2pFallbackHotspot(generation, "hotspot attach failure")
+                } catch (p2pFailure: Exception) {
+                    debugLog("wifi-p2p fallback failed: " +
+                        "${p2pFailure.message ?: p2pFailure.javaClass.simpleName}; keeping the primary error")
+                }
+            }
             throw IOException(
                 "Could not establish ${hotspotMode.name} hotspot: " +
                     (failure.message ?: failure.javaClass.simpleName),
+                failure,
+            )
+        }
+    }
+
+    /**
+     * vc156（B 级补充路径）：P2P fallback 触发资格。
+     * 开关开 + 本代仍有效 + WifiP2pManager 服务存在（ROM 裁剪/不可用时静默返回 false，
+     * 全程 runCatching，绝不抛出、绝不阻塞主建链）。
+     */
+    private fun p2pFallbackEligible(generation: Int): Boolean {
+        if (!config.wifiP2pFallbackEnabled) return false
+        if (isStaleWirelessRun(generation)) return false
+        return runCatching {
+            appContext.getSystemService(Context.WIFI_P2P_SERVICE) as? android.net.wifi.p2p.WifiP2pManager != null
+        }.getOrDefault(false)
+    }
+
+    /**
+     * vc156（B 级补充路径）：Wi-Fi P2P GO fallback 建组（移植上游 0.2.21 WifiP2pGroupManager）。
+     * 成功后返回的 WirelessHotspotInfo（P2P 接口 IPv4/组网信息）走既有凭证下发链路
+     * （0x5703 / AirPlay 监听 / Bonjour），下游对 backend 无感知；失败一律包装为 IOException
+     * 由调用方决定保留主路径错误。close/保留复用语义与 ManualHotspotManager 相同
+     * （closeWirelessStack(keepHotspotForReuse=true) 时 P2P 组同样跨代保留不掉网）。
+     */
+    private fun startP2pFallbackHotspot(generation: Int, cause: String): WirelessHotspotInfo {
+        val manager = try {
+            WifiP2pGroupManager(appContext, ::debugLog)
+        } catch (unavailable: Exception) {
+            // P2P 不可用（服务缺失/ROM 裁剪）：包装后由调用方静默降级回主路径错误。
+            throw IOException("Wi-Fi P2P is unavailable on this ROM: " +
+                (unavailable.message ?: unavailable.javaClass.simpleName), unavailable)
+        }
+        hotspot = manager
+        return try {
+            val info = manager.start(P2P_FALLBACK_START_TIMEOUT_MILLIS)
+            debugLog(
+                "wifi-p2p fallback ready ($cause) ssid=${info.ssid} channel=${info.channel} " +
+                    "host=${info.hostAddress?.let(::hostAddressText) ?: "unknown"} " +
+                    "iface=${info.interfaceName ?: "unknown"}",
+            )
+            lastHotspotInfo = info
+            info
+        } catch (failure: Exception) {
+            if (hotspot === manager) hotspot = null
+            closeBestEffort("wifi-p2p-fallback") { manager.close() }
+            if (isStaleWirelessRun(generation)) throw failure
+            throw IOException(
+                "Wi-Fi P2P fallback failed: ${failure.message ?: failure.javaClass.simpleName}",
                 failure,
             )
         }
@@ -3809,6 +3882,9 @@ class CarPlayController(
         private const val MAXIMUM_REENUMERATION_ATTEMPTS = 2
         private const val WIRED_VPN_TUN_TIMEOUT_MILLIS = 10_000L
         private const val HOTSPOT_START_TIMEOUT_MILLIS = 60_000L
+        // vc156（B 级补充路径）：P2P fallback 建组超时（对齐上游 0.2.21 WIFI_P2P_START_TIMEOUT_MILLIS；
+        // 信道计划逐项尝试 + 组建 + 接口地址等待，20s 为上游实测值）。
+        private const val P2P_FALLBACK_START_TIMEOUT_MILLIS = 20_000L
         private const val CONTROL_LOOP_TIMEOUT_MILLIS = 5 * 60_000L
         private const val LOCATION_CONTROL_LOOP_TIMEOUT_MILLIS = 24 * 60 * 60 * 1_000L
         private const val WIRELESS_HANDOFF_TIMEOUT_MILLIS = 45_000L

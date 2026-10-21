@@ -42,6 +42,13 @@ class AndroidMediaSink(
     private val advancedAudioChannelMapping: Boolean = false,
     onScreenStreamActiveChanged: ((Int, Boolean) -> Unit)? = null,
     private val mediaBufferMillis: Int = MediaAudioBuffer.DEFAULT_MILLIS,
+    /**
+     * vc156（移植自上游 0.2.21 BufferedAudioStream 预缓冲语义）：媒体流预缓冲开关。
+     * true 时媒体（音乐）流的起播/复播水位抬到约 1s（PREBUFFER_LEAD_MILLIS，上游
+     * LEAD_MILLIS），让 AudioTrack 队列天然吸收 ≤1s 的 Wi-Fi 断流；关闭则维持
+     * [mediaBufferMillis] 原阈值（起播更快）。仅 media 生效，通话/Siri 等低延迟流不受影响。
+     */
+    private val audioPrebufferEnabled: Boolean = true,
     private val onAudioDiagnostic: (String) -> Unit = {},
     /**
      * M6c：CarPlay 电话流（[AudioChannel.PHONE]）出现/消失时回调 true/false。
@@ -357,6 +364,8 @@ class AndroidMediaSink(
             format,
             advancedAudioChannelMapping,
             mediaBufferMillis,
+            // vc156：预缓冲开关随流建轨时快照（与 mediaBufferMillis 同节奏，重连生效）。
+            audioPrebufferEnabled,
             onAudioDiagnostic,
             ::onRendererChannelState,
             mediaStreamOverride,
@@ -1064,6 +1073,8 @@ private class AudioRenderer(
     val format: AudioFormat,
     private val advancedAudioChannelMapping: Boolean,
     private val mediaBufferMillis: Int,
+    /** vc156：媒体预缓冲开关（构造时快照，见外层同名参数注释）。 */
+    private val prebufferEnabled: Boolean,
     private val report: (String) -> Unit,
     /** M6c/M6d：通道活跃状态变化（PHONE=听筒/扬声器、NAVIGATION/MEDIA=duck）。 */
     private val onChannelState: ((AudioChannel?, Boolean) -> Unit)? = null,
@@ -1084,6 +1095,14 @@ private class AudioRenderer(
     private data class AudioPacket(val rtp: ByteArray, val sample: Int)
 
     private val queue = LinkedBlockingQueue<AudioPacket>(MAX_QUEUED_PACKETS)
+    // vc156（#814，移植自上游 0.2.21 MediaPacketLagGuard + AndroidMediaSink 接线）：
+    // 仅媒体流启用。短 Wi-Fi 追包突发不动；压缩包积压（RTP 时间戳跨度）>1.5s 且持续
+    // >1.5s 才丢过期未解码包追平到 0.5s。上游配套的 MediaClockTrim「积压不学时钟」守卫
+    // 在本分支无对应物（lite 没有时钟学习/倍速微调），故只需移植丢帧半边。
+    // lite AudioFormat 无 rtpClockRate 字段：CarPlay 音频流 RTP 时钟率==采样率，直接用之。
+    private val mediaLagGuard = if (format.audioType == "media") MediaPacketLagGuard(format.sampleRate) else null
+    @Volatile private var newestRtpSample = 0
+    private var lagRecoveryReports = 0
     @Volatile private var running = true
     @Volatile private var started = false
     private var codec: MediaCodec? = null
@@ -1183,6 +1202,20 @@ private class AudioRenderer(
             val previous = lastArrivalNs.getAndSet(now)
             // API16 适配：AtomicLong.accumulateAndGet 是 API 24+，改 CAS 循环。
             if (previous != 0L) updateMaxArrivalGap((now - previous) / 1_000_000L)
+            newestRtpSample = sample
+            // vc156（#814）：入队前先做积压检查。短突发原样保全；确认真积压（>1.5s 持续
+            // >1.5s）才丢弃队首过期未解码包，让音乐追平到正在播放的位置而不是拿旧包续播。
+            val removed = mediaLagGuard?.recover(queue, sample, AudioPacket::sample, now) ?: 0
+            if (removed > 0) {
+                packetsDropped.addAndGet(removed)
+                if (lagRecoveryReports < MAX_LAG_RECOVERY_REPORTS) {
+                    lagRecoveryReports++
+                    report(
+                        "Audio: stale media packet backlog recovered audioType=${format.audioType} " +
+                            "packetsDiscarded=$removed remaining=${queue.size}",
+                    )
+                }
+            }
         }
         if (!started || !queue.offer(AudioPacket(rtp, sample))) {
             if (started) packetsDropped.incrementAndGet()
@@ -1376,6 +1409,27 @@ private class AudioRenderer(
             plan.trackBufferBytes
         }
         startThresholdBytes = MediaAudioBuffer.startBytesFor(plan.startBytes, capacityBytes, PREBUFFER_WRITE_CHUNK_BYTES)
+        // vc156（移植自上游 0.2.21 BufferedAudioStream 预缓冲语义，LEAD_MILLIS=1000ms）：
+        // 仅媒体流且开关开启时，把起播/复播水位抬到 max(配置阈值, ~1s)。**不新增第二层缓冲**：
+        // 预缓冲的就是 AudioTrack 这一条 MODE_STREAM 队列本身，容量仍由 MediaAudioBuffer.plan
+        // 规划（媒体池 ≥ MEDIA_MIN_CAPACITY_MILLIS=1500ms，1s 水位放得下）；水位抬高后
+        // 低水位 rebuffer（lowWatermarkMs）按同一条 startThresholdBytes 派生，语义自动对齐。
+        // 再过一次 startBytesFor 钳制：保证 start ≤ capacity-写块，暂停态 blocking write 不卡死。
+        if (prebufferEnabled && format.audioType == "media") {
+            val leadBytes = (bytesPerSecond.toLong() * PREBUFFER_LEAD_MILLIS / 1000L).toInt()
+            if (leadBytes > startThresholdBytes) {
+                startThresholdBytes = MediaAudioBuffer.startBytesFor(
+                    leadBytes,
+                    capacityBytes,
+                    PREBUFFER_WRITE_CHUNK_BYTES,
+                )
+                report(
+                    "Audio: media prebuffer lead audioType=${format.audioType} " +
+                        "startMs=${startThresholdBytes * 1000L / bytesPerSecond} " +
+                        "(planned ${plan.startBytes * 1000L / bytesPerSecond}ms, lead=${PREBUFFER_LEAD_MILLIS}ms)",
+                )
+            }
+        }
         // M6v：低水位 = min(容量 25%, 起播阈值一半, 容量-起播阈值)。第三项防死锁：暂停态补缓冲时
         // 「残量(<水位) + 起播阈值」必须小于容量，否则 blocking write 会卡死在写满的 paused track 上。
         lowWatermarkMs = minOf(
@@ -2035,6 +2089,11 @@ private class AudioRenderer(
         // Holds a burst after a Wi-Fi gap (~4 s of AAC) instead of dropping it.
         const val MAX_QUEUED_PACKETS = 192
         const val PREBUFFER_WRITE_CHUNK_BYTES = 2 * 1024
+        // vc156：媒体预缓冲水位（移植自上游 0.2.21 BufferedAudioStream.LEAD_MILLIS）——
+        // 播放时保持约 1s 音频领先于实时，盖住无线链路常见数百 ms~1s 的断流。
+        const val PREBUFFER_LEAD_MILLIS = 1000L
+        // vc156（#814）：积压恢复诊断限报次数（防持续积压刷爆日志）。
+        const val MAX_LAG_RECOVERY_REPORTS = 5
         const val STATS_TAG = "DiPlay-AudioStats"
         const val STATS_WINDOW_NS = 5_000_000_000L
         const val DECODED_BUFFER_LOG_INTERVAL = 50

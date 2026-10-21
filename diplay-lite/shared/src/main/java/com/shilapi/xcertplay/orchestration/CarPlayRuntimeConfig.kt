@@ -62,6 +62,11 @@ class CarPlayRuntimeConfig(
     // 1.1.6(vc76)：有线 cdc_ncm 解绑守护开关（TS7 无 root 裁决实验）。默认 true=正式路径；
     // false 时不启动 WiredNcmGuard，验证「仅 NTB16 重同步、无 root 无守护」能否稳住会话。
     val wiredNcmGuardEnabled: Boolean = true,
+    // vc156（B 级补充路径，默认关）：车机热点建链失败（SoftAP 判死/附着超时/权限受限机型）时，
+    // 改用 Wi-Fi Direct P2P GO 作为替代 AP（WifiP2pGroupManager，移植自上游 0.2.21）。
+    // 默认关闭理由：P2P 建组会切换无线电角色、可能扰动正常的主路径，补充路径必须显式 opt-in；
+    // 仅 MANUAL/MANUAL_IPV4 车机热点模式生效（RELAY 加入的是外部网络，无「替代 AP」语义）。
+    val wifiP2pFallbackEnabled: Boolean = false,
     // vc102 USB bootstrap 无线升级（实验）：有线 CSM 建好后不走 NCM/有线控制环，改走
     // 「开热点 + AirPlay 监听 + mDNS + 识别帧 group16+24 + 无线控制环（0x5703 经 USB 隧道）」。
     // Apple 官方「插 USB 弹提醒可无线」流程的配件侧实现；热点参数复用 wirelessHotspotMode 组。

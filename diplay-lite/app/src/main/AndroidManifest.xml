@@ -20,6 +20,12 @@
     <!-- B3 信道读取：4.1 的 WifiManager.getScanResults 需要定位权限 -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- vc156（热点失败 Wi-Fi Direct 兜底）：API 33+ 的 Wi-Fi P2P 前置权限；
+         neverForLocation=声明不用周边设备推断位置（沿用 ACCESS_FINE_LOCATION 语义）。
+         声明本身无副作用，运行时由 MainActivity 批量申请；API 32- 被系统自动忽略。 -->
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
     <!-- 麦克风上行（CarPlay 语音）；targetSdk 19 下安装即授予。
          vc151：targetSdk 34 下变运行时权限，MainActivity 启动时批量申请（拒绝则语音上行降级） -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />

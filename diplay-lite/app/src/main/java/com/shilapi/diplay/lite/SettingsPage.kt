@@ -122,6 +122,10 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var cbFps30: CheckBox
     private lateinit var cbSpeaker: CheckBox
     private lateinit var cbVoiceMedia: CheckBox
+    // vc156：热点失败 Wi-Fi Direct P2P 兜底开关（B 级补充路径，默认关）。
+    private lateinit var cbP2pFallback: CheckBox
+    // vc156（上游 0.2.21 预缓冲移植）：媒体预缓冲开关。
+    private lateinit var cbPrebuffer: CheckBox
     private lateinit var tvVersion: TextView
 
     // loadIntoForm 期间静默：setChecked 会触发监听，避免半加载状态写盘
@@ -354,6 +358,10 @@ class SettingsPage(private val activity: MainActivity) {
             },
             block(top = dip(2), bottom = dip(4)),
         )
+        // vc156（移植自上游 0.2.21 BufferedAudioStream 预缓冲）：媒体预缓冲开关，默认开。
+        // 开 = 音乐起播/复播水位抬到约 1s，Wi-Fi 短断流不再卡顿；代价是切歌起播稍慢。
+        cbPrebuffer = checkbox("音乐预缓冲（抗Wi-Fi卡顿，起播稍慢）")
+        column.addView(cbPrebuffer, block(bottom = dip(4)))
         // 音视频传输方式（1.1.3：加回小标题；二选一选定后弹窗确认、应用并重启）
         column.addView(subSectionLabel("音视频传输方式"), block(top = dip(8), bottom = dip(2)))
         val avGroup = RadioGroup(activity).apply { orientation = LinearLayout.HORIZONTAL }
@@ -438,6 +446,9 @@ class SettingsPage(private val activity: MainActivity) {
         // 1.1.2（EU5 双向无声）：Siri/助手语音走媒体通道——ASSISTANT/NAVIGATION usage 在
         // PATEO 等老 HAL 上静音，勾选后改走媒体音量（媒体通道已实测出声）。
         cbVoiceMedia = checkbox("Siri/语音提示走媒体音量")
+        // vc156（B 级补充路径）：车机热点建链失败（热点判死/附着超时/权限受限）时改用
+        // Wi-Fi Direct P2P GO 当替代 AP。仅车机热点（car）通道生效，中继/USB 不适用。
+        cbP2pFallback = checkbox("热点失败时用Wi-Fi Direct兜底")
         column.addView(cbBoot, block(bottom = dip(2)))
         column.addView(cbBootBluetooth, block(bottom = dip(2)))
         column.addView(cbBootHotspot, block(bottom = dip(2)))
@@ -446,7 +457,8 @@ class SettingsPage(private val activity: MainActivity) {
         column.addView(cbSoftDecode, block(bottom = dip(2)))
         column.addView(cbFps30, block(bottom = dip(2)))
         column.addView(cbSpeaker, block(bottom = dip(2)))
-        column.addView(cbVoiceMedia, block())
+        column.addView(cbVoiceMedia, block(bottom = dip(2)))
+        column.addView(cbP2pFallback, block())
 
         // M6k23：自定义返回图标页（选图→裁剪→确认保存）。1.1.3：入口行 -3dp（按钮随行号缩小）。
         column.addView(entryRow("自定义返回图标") { activity.setPage("caricon") }, block(top = dip(14)))
@@ -903,6 +915,8 @@ class SettingsPage(private val activity: MainActivity) {
         cbFps30.isChecked = config.limit30Fps
         cbSpeaker.isChecked = config.speakerForCalls
         cbVoiceMedia.isChecked = config.voiceRoutedToMedia
+        cbP2pFallback.isChecked = config.wifiP2pFallback
+        cbPrebuffer.isChecked = config.audioPrebuffer
         isLoading = false
     }
 
@@ -942,6 +956,8 @@ class SettingsPage(private val activity: MainActivity) {
                 limit30Fps = cbFps30.isChecked,
                 speakerForCalls = cbSpeaker.isChecked,
                 voiceRoutedToMedia = cbVoiceMedia.isChecked,
+                wifiP2pFallback = cbP2pFallback.isChecked,
+                audioPrebuffer = cbPrebuffer.isChecked,
                 softwareVideoDecoder = cbSoftDecode.isChecked,
                 orientationMode = currentOrientationMode(),
                 avPathMode = if (rbAvBt.isChecked) "bt_audio" else "full",

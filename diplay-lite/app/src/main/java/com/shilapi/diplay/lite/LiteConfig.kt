@@ -35,6 +35,10 @@ data class LiteConfig(
     val btAudioInfoVariant: String = "no_audio",
     // M6k19：音乐缓存毫秒数（10-4000，默认 300 = MediaAudioBuffer.DEFAULT_MILLIS）。
     val mediaBufferMillis: Int = 300,
+    // vc156（移植自上游 0.2.21 BufferedAudioStream 预缓冲）：媒体流预缓冲开关（默认开）。
+    // 开 = 音乐起播/复播水位抬到约 1s，抗 Wi-Fi 断流；关 = 维持 mediaBufferMillis 原阈值
+    // （起播更快）。仅媒体流生效，通话/Siri 低延迟流不受影响；重新连接后生效。
+    val audioPrebuffer: Boolean = true,
 
     /** vc109：底部触摸失灵区占比‰（0=关闭）。仅影响视频视图高度与触摸映射。 */
     val touchTrimBottomPermille: Int = 0,
@@ -78,6 +82,9 @@ data class LiteConfig(
     // 1.0.17：CarPlay 显示名称（/info name + Bonjour 服务名）。自定义返回图标页可改，
     // 选厂家预置图标时自动替换为厂家名；空串回落 "DiPlay"。
     val carIconName: String = "DiPlay",
+    // vc156（B 级补充路径，默认关）：车机热点建链失败时改用 Wi-Fi Direct P2P GO 兜底
+    // （SoftAP 判死/附着超时/权限受限机型）。仅车机热点模式（car 通道）生效，中继/USB 不适用。
+    val wifiP2pFallback: Boolean = false,
 ) {
     companion object {
         private const val PREFS = "diplay_lite"
@@ -148,6 +155,8 @@ data class LiteConfig(
                 avPathMode = prefs.getString("av_path_mode", "full") ?: "full",
                 btAudioInfoVariant = prefs.getString("bt_audio_info_variant", "no_audio") ?: "no_audio",
                 mediaBufferMillis = prefs.getInt("media_buffer_millis", 300),
+                // vc156：媒体预缓冲开关（默认开）。
+                audioPrebuffer = prefs.getBoolean("audio_prebuffer", true),
                 // vc109（T3 触摸屏下沿物理失灵）：0=关闭；>0=底部失灵区占比‰（154≈1/6.5）。
                 // 视频视图缩进顶部有效区，触摸映射基于视图尺寸自动重映射，死区天然丢弃。
                 touchTrimBottomPermille = prefs.getInt("touch_trim_bottom_permille", 0),
@@ -172,6 +181,7 @@ data class LiteConfig(
                 relayIpv6Channel = prefs.getInt("relay_ipv6_channel", 0),
                 relayIpv4Channel = prefs.getInt("relay_ipv4_channel", 0),
                 carIconName = prefs.getString("car_icon_name", "DiPlay").orEmpty().ifBlank { "DiPlay" },
+                wifiP2pFallback = prefs.getBoolean("wifi_p2p_fallback", false),
             )
         }
 
@@ -192,6 +202,7 @@ data class LiteConfig(
                 .putString("av_path_mode", config.avPathMode)
                 .putString("bt_audio_info_variant", config.btAudioInfoVariant)
                 .putInt("media_buffer_millis", config.mediaBufferMillis)
+                .putBoolean("audio_prebuffer", config.audioPrebuffer)
                 .putInt("touch_trim_bottom_permille", config.touchTrimBottomPermille)
                 // vc59 修复（8815 实测）：分辨率设定三键漏写——load 读 video_resolution_mode/
                 // manual_resolution_w/h，但 save 从未写入，导致「手动设定分辨率」确认重启后
@@ -215,6 +226,8 @@ data class LiteConfig(
                 .putInt("relay_ipv6_channel", config.relayIpv6Channel)
                 .putInt("relay_ipv4_channel", config.relayIpv4Channel)
                 .putString("car_icon_name", config.carIconName)
+                // vc156：热点失败 P2P 兜底开关。
+                .putBoolean("wifi_p2p_fallback", config.wifiP2pFallback)
                 // 注意：applied_video_key 故意不在这里写 —— 它只由 saveAppliedVideoKey() 维护，
                 // 否则表单保存（每次勾选都会触发）会用默认值把它冲掉。
                 //

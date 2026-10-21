@@ -63,6 +63,8 @@ internal class MicrophoneUplink(
     // 可报的静音只能出在该层，App 层无罪）。
     private val triedSources = LinkedHashSet<Int>()
     @Volatile private var healExhausted = false
+    // vc156（#866 容错）：编码失败限报计数。只在采集线程读写，无需同步。
+    private var encodeFailureReports = 0
 
     /** Reports a start failure into the diagnostic log so field reports show why calls went silent. */
     private fun fail(message: String): Boolean {
@@ -75,23 +77,19 @@ internal class MicrophoneUplink(
     fun start(): Boolean {
         if (!running.compareAndSet(false, true)) return true
 
-        // 上行编码器选择：**MediaCodec 优先、libopus 兜底**（API 29+ 行为零变化）。
-        // 本分支（API16）没有 MediaCodec OPUS 编码器，改由内置 libopus 软件编码 ——
+        // 上行编码器选择：统一走 OpusEncoderSupport 选择层（移植自上游 0.2.21
+        // MicrophoneOpusEncoders，vc156）。本分支（API16）没有 MediaCodec OPUS 编码器，
+        // 顺序为 **libopus 优先、MediaCodec 兜底**，创建/初始化失败逐级容错回落 ——
         // 否则带无线输入的流协商了 OPUS 上行却编不出来，通话/微信语音对方就听不到。
         var encoderBackend = "pcm"
         val nextEncoder = if (config.codec == AudioCodecKind.OPUS) {
-            val mediaCodec = OpusEncoder(config.bitrate ?: 48_000).takeIf { it.available }
-            val native = if (mediaCodec != null) {
-                null
-            } else {
-                NativeOpusEncoder.create(config.bitrate ?: 48_000)
+            OpusEncoderSupport.createEncoder(config.bitrate ?: 48_000, diagnostics).also { encoder ->
+                encoderBackend = when (encoder) {
+                    is NativeOpusEncoder -> "libopus"
+                    is OpusEncoder -> "MediaCodec"
+                    else -> "none"
+                }
             }
-            encoderBackend = when {
-                mediaCodec != null -> "MediaCodec"
-                native != null -> "libopus"
-                else -> "none"
-            }
-            mediaCodec ?: native
         } else {
             null
         }
@@ -623,7 +621,23 @@ internal class MicrophoneUplink(
 
     private fun sendFrame(socket: DatagramSocket, counters: MicrophoneCounters, frame: ByteArray) {
         val bodies = if (config.codec == AudioCodecKind.OPUS) {
-            opusEncoder?.encode(frame).orEmpty()
+            // #866 容错（移植自上游 0.2.21 SoftwareOpusEncoder 的 failed() 语义，vc156）：
+            // 编码失败（含 JNI/MediaCodec 抛出的 Error）只损当前一帧 20ms，绝不让异常
+            // 炸穿采集循环把整个上行会话拆掉 —— 一帧丢音远好过通话整段静音。
+            // 与上游一致限报 3 次，防持续故障刷爆诊断日志。
+            try {
+                opusEncoder?.encode(frame).orEmpty()
+            } catch (error: Throwable) {
+                if (encodeFailureReports < MAX_ENCODE_FAILURE_REPORTS) {
+                    encodeFailureReports++
+                    Log.w(TAG, "microphone opus encode failed (frame dropped, uplink kept)", error)
+                    diagnostics?.invoke(
+                        "Microphone opus encode failed: ${error.javaClass.simpleName}: " +
+                            "${error.message}（本帧丢弃，会话保持）",
+                    )
+                }
+                emptyList()
+            }
         } else {
             listOf(MicrophonePacketizer.toWirePcm(frame))
         }
@@ -761,6 +775,8 @@ internal class MicrophoneUplink(
         // （fe6t3 日志 uplink started 后无任何 level window/tx 心跳即此形态），凑不满
         // 整帧连 e5t1 的 peak==0 静默自愈都触发不了。约 1s 内 50 次零读即按采集失效轮换源。
         const val ZERO_READ_HEAL_THRESHOLD = 50
+        // vc156（#866 容错）：编码失败最多落 3 条诊断（对齐上游 MAX_REPORTED_FAILURES）。
+        const val MAX_ENCODE_FAILURE_REPORTS = 3
         val EMPTY_BYTES = ByteArray(0)
     }
 }
