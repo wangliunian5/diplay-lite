@@ -272,7 +272,11 @@ android {
         // vc156（上游 0.2.21 待移植双项）：①音频抗抖动=Opus 编码选择层（native→平台回退→
         // 失败容错）+ MediaPacketLagGuard 积压丢帧 + AudioTrack 预缓冲水位（audioPrebuffer 开关）；
         // ②Wi-Fi Direct fallback=热点建链失败时 P2P GO 兜底（wifiP2pFallback 开关，默认关）。
-        versionCode = 156
+        // vc157（Wi-Fi Direct 升格为一级模式）：承载方式改为「车机热点 / Wi-Fi Direct」二选一，
+        // 选 P2P 时直接建 GO，不再依赖车机热点开关状态（绕过 SoftAP 判死逻辑）；
+        // 同时帧率由 limit30Fps 布尔升级为四档（25/30/40/60，默认 60），
+        // 修复页面重建后指示灯变灰/断开按钮消失（render 末尾清空渲染哨兵）。
+        versionCode = 157
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties

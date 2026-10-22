@@ -305,10 +305,12 @@ class LiteSessionService : Service() {
         val deviceId = deviceIdOf(identity)
         val btMac = localBluetoothAddress() ?: deviceId
         // M6b：/info 的 maxFPS 与分辨率都由 LiteConfig 控制（弱机省算力）。
-        // fps 30/60 二选一；分辨率 = 车机屏 × 百分比（长宽等比、各自取偶）。
+        // vc157：fps 四档 25/30/40/60；分辨率 = 车机屏 × 百分比（长宽等比、各自取偶）。
         // 1.0.29：分辨率设定=手动指定时，基准值改用用户填的宽×高（强制竖屏时交换横纵）。
         val full = if (config.resolutionMode == "manual") manualMetrics(config) else screenMetrics()
-        val fps = if (config.limit30Fps) AirPlayDisplaySettings.MIN_FPS else AirPlayDisplaySettings.DEFAULT_FPS
+        // vc157：帧率四档（25/30/40/60，LiteConfig.videoFps）——load 已过网格校验，
+        // 此处显式 sanitizeFps 兜底（防代码路径旁路直接构造 config）。
+        val fps = AirPlayDisplaySettings.sanitizeFps(config.videoFps)
         val size = scaleDisplay(full, config.videoScalePercent)
         // fe6t1（FE-6 黑边/拉伸规避试验）：/info 声明官方支持比例。真实屏 1920x620（96:31）
         // 在 MFi 官方列表外——iOS 首连接受声明（全屏无黑边但图标拉伸）、重连回退 16:9
@@ -420,11 +422,19 @@ class LiteSessionService : Service() {
                     // 会话永远建不起来）。C8815 之所以"碰巧"正常，是因为 API16 的
                     // NetworkInterface.getIndex 取不到（回退 0），IPv6 分支被跳过而落到 IPv4。
                     // RELAY：双 client 接随身WiFi，manualHotspotSsid/Passphrase 字段复用为中继凭据。
-                    wirelessHotspotMode = if (relay && !usb) WirelessHotspotMode.RELAY else WirelessHotspotMode.MANUAL_IPV4,
-                    manualHotspotSsid = if (usb) null else ssid,
+                    // vc157：wifiP2pMode 开（仅 car 通道）→ WIFI_P2P 一级模式，直接建 P2P GO
+                    // 不再依赖车机热点开关；SSID/密码传 null（P2P 凭据系统随机，必填校验不适用）。
+                    wirelessHotspotMode = when {
+                        usb -> WirelessHotspotMode.MANUAL_IPV4
+                        relay -> WirelessHotspotMode.RELAY
+                        config.wifiP2pMode -> WirelessHotspotMode.WIFI_P2P
+                        else -> WirelessHotspotMode.MANUAL_IPV4
+                    },
+                    manualHotspotSsid = if (usb || (!relay && config.wifiP2pMode)) null else ssid,
                     manualHotspotPassphrase = when {
                         usb -> null
                         relay -> passphrase.takeIf { it.isNotEmpty() }
+                        !relay && config.wifiP2pMode -> null
                         security == ManualHotspotSecurity.OPEN -> null
                         else -> config.password
                     },
@@ -436,9 +446,6 @@ class LiteSessionService : Service() {
                     // 设置页「即时生效」提示名不副实）。车机热点模式接上手填信道
                     // （0=自动）；relay 复用凭据字段不吃信道、usb 无热点，均保持 0。
                     manualHotspotChannel = if (usb || relay) 0 else config.carIpv4Channel,
-                    // vc156（B 级补充路径）：热点失败 Wi-Fi Direct P2P 兜底开关——仅车机热点
-                    // 模式生效（RELAY 接外部网络无替代 AP 语义；USB 有线无热点），其余场景恒 false。
-                    wifiP2pFallbackEnabled = !usb && !relay && config.wifiP2pFallback,
                     wirelessBluetoothDeviceAddress = config.bluetoothAddress.takeIf { it.isNotBlank() },
                     // 1.1.6(vc76)：TS7 无 root 裁决实验——本包关闭有线 cdc_ncm 解绑守护。
                     wiredNcmGuardEnabled = BuildConfig.WIRED_NCM_GUARD_ENABLED,

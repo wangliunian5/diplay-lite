@@ -1,6 +1,7 @@
 package com.shilapi.diplay.lite
 
 import android.content.Context
+import com.shilapi.xcertplay.airplay.AirPlayDisplaySettings
 
 /**
  * MANUAL（车机自带热点）配置的持久化。
@@ -12,8 +13,9 @@ data class LiteConfig(
     val channel: Int,          // 0 = 未知/自动（0x5703 下发前应尽量实测填充，难点 B3）
     val security: String,      // WPA2 / WPA2-WPA3 / WPA3 / OPEN
     val bluetoothAddress: String, // 空 = 自动选择已配对 iPhone
-    // M6b：弱机性能开关。limit30Fps = true 时 /info 的 maxFPS 声明 30（默认 60）。
-    val limit30Fps: Boolean = false,
+    // M6b：弱机性能开关。vc157：limit30Fps 布尔升级为四档帧率（25/30/40/60，默认 60），
+    // load 经 AirPlayDisplaySettings.sanitizeFps 网格校验；旧 limit_30fps=true 迁移为 30。
+    val videoFps: Int = 60,
     // M6b：/info 声明分辨率 = 车机屏 × 该百分比（50~100，整数）；100 = 原生、不改。
     val videoScalePercent: Int = 100,
     // M6c：CarPlay 通话声音走扬声器（false = 听筒，本机默认）。
@@ -82,9 +84,9 @@ data class LiteConfig(
     // 1.0.17：CarPlay 显示名称（/info name + Bonjour 服务名）。自定义返回图标页可改，
     // 选厂家预置图标时自动替换为厂家名；空串回落 "DiPlay"。
     val carIconName: String = "DiPlay",
-    // vc156（B 级补充路径，默认关）：车机热点建链失败时改用 Wi-Fi Direct P2P GO 兜底
-    // （SoftAP 判死/附着超时/权限受限机型）。仅车机热点模式（car 通道）生效，中继/USB 不适用。
-    val wifiP2pFallback: Boolean = false,
+    // vc157：Wi-Fi Direct 一级模式（默认关）。开 = car 通道无线承载直接用 P2P GO
+    // （不再依赖车机热点开关状态，绕过 SoftAP 判死）；关 = 车机热点 MANUAL。仅 car 通道生效。
+    val wifiP2pMode: Boolean = false,
 ) {
     companion object {
         private const val PREFS = "diplay_lite"
@@ -111,7 +113,7 @@ data class LiteConfig(
         const val MAX_MANUAL_RESOLUTION = 4096
 
         /** M6d：视频参数是否与"上次连接时生效的值"一致（不一致 = 必须先断开重连）。 */
-        fun videoKeyOf(scalePercent: Int, limit30Fps: Boolean): String = "$scalePercent/$limit30Fps"
+        fun videoKeyOf(scalePercent: Int, videoFps: Int): String = "$scalePercent/$videoFps"
 
         fun saveAppliedVideoKey(context: Context, key: String) {
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -143,7 +145,12 @@ data class LiteConfig(
                 channel = prefs.getInt("channel", 0),
                 security = prefs.getString("security", "WPA2") ?: "WPA2",
                 bluetoothAddress = prefs.getString("bt_address", "").orEmpty(),
-                limit30Fps = prefs.getBoolean("limit_30fps", false),
+                // vc157：帧率四档（25/30/40/60）。旧 limit_30fps=true 迁移为 30，此后
+                // video_fps 为唯一真源；sanitizeFps 负责网格 snap（脏值自动回落合法档）。
+                videoFps = AirPlayDisplaySettings.sanitizeFps(
+                    if (prefs.contains("video_fps")) prefs.getInt("video_fps", 60)
+                    else if (prefs.getBoolean("limit_30fps", false)) 30 else 60,
+                ),
                 videoScalePercent = prefs.getInt("video_scale_percent", MAX_SCALE_PERCENT)
                     .coerceIn(MIN_SCALE_PERCENT, MAX_SCALE_PERCENT),
                 speakerForCalls = prefs.getBoolean("speaker_for_calls", false),
@@ -181,7 +188,7 @@ data class LiteConfig(
                 relayIpv6Channel = prefs.getInt("relay_ipv6_channel", 0),
                 relayIpv4Channel = prefs.getInt("relay_ipv4_channel", 0),
                 carIconName = prefs.getString("car_icon_name", "DiPlay").orEmpty().ifBlank { "DiPlay" },
-                wifiP2pFallback = prefs.getBoolean("wifi_p2p_fallback", false),
+                wifiP2pMode = prefs.getBoolean("wifi_p2p_mode", false),
             )
         }
 
@@ -193,7 +200,9 @@ data class LiteConfig(
                 .putInt("channel", config.channel)
                 .putString("security", config.security)
                 .putString("bt_address", config.bluetoothAddress)
-                .putBoolean("limit_30fps", config.limit30Fps)
+                // vc157：帧率四档落盘（video_fps 为唯一真源；旧 limit_30fps 不再维护，
+                // 升级后回滚旧包按默认 60 跑）。
+                .putInt("video_fps", config.videoFps)
                 .putInt("video_scale_percent", config.videoScalePercent)
                 .putBoolean("speaker_for_calls", config.speakerForCalls)
                 .putInt("nav_duck_percent", config.navDuckPercent)
@@ -226,8 +235,8 @@ data class LiteConfig(
                 .putInt("relay_ipv6_channel", config.relayIpv6Channel)
                 .putInt("relay_ipv4_channel", config.relayIpv4Channel)
                 .putString("car_icon_name", config.carIconName)
-                // vc156：热点失败 P2P 兜底开关。
-                .putBoolean("wifi_p2p_fallback", config.wifiP2pFallback)
+                // vc157：Wi-Fi Direct 一级模式开关。
+                .putBoolean("wifi_p2p_mode", config.wifiP2pMode)
                 // 注意：applied_video_key 故意不在这里写 —— 它只由 saveAppliedVideoKey() 维护，
                 // 否则表单保存（每次勾选都会触发）会用默认值把它冲掉。
                 //

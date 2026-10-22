@@ -1,7 +1,5 @@
 package com.shilapi.xcertplay.airplay
 
-import android.os.Build
-
 enum class AirPlayPhysicalSizeBasis {
     WIDTH,
     HEIGHT,
@@ -14,7 +12,10 @@ data class AirPlayPhysicalSizeMm(
 
 /** User-adjustable display values with the same stepped ranges used by the settings UI. */
 object AirPlayDisplaySettings {
-    const val MIN_FPS = 30
+    // vc157：下限 30→25（弱机自救档——降负载降码率，8815 老硬解的绿线噪点可借此进一步减轻）。
+    // STEP=5 不变，网格 25/30/35/40/45/50/55/60；UI 只露出 25/30/40/60 四档，中间值
+    // 仅作为 snap 边界存在（prefs 唯一写入口是设置页四档，不会产生中间值）。
+    const val MIN_FPS = 25
     const val MAX_FPS = 60
     const val FPS_STEP = 5
     const val DEFAULT_FPS = MAX_FPS
@@ -28,11 +29,11 @@ object AirPlayDisplaySettings {
     const val MAX_REPORTED_PHYSICAL_MM = 2_000
 
     fun sanitizeFps(value: Int): Int {
-        val snapped = snapToStep(value, MIN_FPS, MAX_FPS, FPS_STEP)
-        // 1.1.3（8815 运动噪块修复②）：API<21 的老硬解（Adreno 203 档）在峰值 60fps+高码率
-        // 运动画面下会静默输出纠错噪块（不报错）。/info 协商层压到 30fps，iPhone 编码端直接
-        // 减半峰值负载——比在解码端补救有效得多。
-        return if (Build.VERSION.SDK_INT < 21) minOf(snapped, 30) else snapped
+        // vc157：删除原 API<21 压 30 分支（8815 运动噪块修复②）——按 API 一刀切把
+        // 同 API 下性能更好的老车机也锁死在 30。档位选择本身就是「用户自调负载」机制：
+        // 弱机（8815 Adreno 203 档，60fps+高码率会静默输出纠错噪块）建议选 25/30；
+        // 40/60 档在任何机型上真实生效，噪块风险由用户知情选择、自行降档兜底。
+        return snapToStep(value, MIN_FPS, MAX_FPS, FPS_STEP)
     }
 
     fun sanitizeWidthPhysicalMm(value: Int): Int =

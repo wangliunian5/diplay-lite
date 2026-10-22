@@ -258,8 +258,8 @@ class MainActivity : Activity() {
         }
         if (Build.VERSION.SDK_INT >= 33) {
             wanted.add(android.Manifest.permission.POST_NOTIFICATIONS)
-            // vc156（热点失败 Wi-Fi Direct 兜底）：API 33+ P2P 建组前置权限；拒绝只影响
-            // P2P 兜底路径（提示去系统设置授予），不影响热点/中继主路径。
+            // vc157（Wi-Fi Direct 一级模式）：API 33+ P2P 建组前置权限；拒绝只影响
+            // 选了 Wi-Fi Direct 承载方式的场景（提示去系统设置授予），不影响车机热点/中继主路径。
             wanted.add(android.Manifest.permission.NEARBY_WIFI_DEVICES)
         }
         val missing = wanted.filter {
@@ -847,6 +847,15 @@ class MainActivity : Activity() {
         setPanelVisible(panelVisible)
         // M6k24k 方向诊断：每个 page 构建完成后记录一次（tag=当前 page）。
         logOrientation(this, page)
+        // vc157：页面重建会创建一批新视图（statusDot 未着色、disconnectButton 默认 GONE、
+        // 主按钮可用态未设）。若当前状态与上次相同，renderState() 的变化检测会整块短路，
+        // 新视图停在灰色/隐藏态且不自愈（500ms tick 一直判定"状态未变"）——实测症状即
+        // 「切回主页指示灯变灰、断开按钮消失，直到状态再次变化才恢复」。置空哨兵强制
+        // 本 tick 走完整渲染（与"哨兵 null 保证首 tick 必跑"的既有约定一致）。
+        shownPhase = null
+        shownRunning = null
+        shownStatus = null
+        shownActiveChannel = null
         renderState()
     }
 
@@ -1148,7 +1157,7 @@ class MainActivity : Activity() {
                     toast("请先在「设置 → 车机热点网络配置」里填写热点名称")
                     return
                 }
-                val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps)
+                val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.videoFps)
                 // M6d：实测改分辨率后不重启+重连会出现渲染异常，这里拦一道二次确认。
                 if (config.appliedVideoKey.isNotEmpty() && config.appliedVideoKey != key) {
                     confirmVideoChange()
@@ -1161,7 +1170,7 @@ class MainActivity : Activity() {
                     toast("请先在「设置 → 中继热点网络配置」里填写随身WIFI信息")
                     return
                 }
-                val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps)
+                val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.videoFps)
                 // M6d：实测改分辨率后不重启+重连会出现渲染异常，这里拦一道二次确认。
                 if (config.appliedVideoKey.isNotEmpty() && config.appliedVideoKey != key) {
                     confirmVideoChange()
@@ -1201,7 +1210,7 @@ class MainActivity : Activity() {
                 }
                 // U4 USB 有线：数据面 TUN 需要 VPN 授权（一次性系统对话框）；
                 // 已授权（prepare 返回 null）则直接进入连接流程。
-                val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps)
+                val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.videoFps)
                 if (config.appliedVideoKey.isNotEmpty() && config.appliedVideoKey != key) {
                     confirmVideoChange()
                     return
@@ -1362,7 +1371,7 @@ class MainActivity : Activity() {
                             val config = LiteConfig.load(this)
                             startSession(
                                 config,
-                                LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps),
+                                LiteConfig.videoKeyOf(config.videoScalePercent, config.videoFps),
                                 "usb",
                             )
                         } else {
@@ -1453,7 +1462,7 @@ class MainActivity : Activity() {
         }
         if (requestCode != REQUEST_VPN_PERMISSION) return
         if (resultCode == RESULT_OK) {
-            startSession(LiteConfig.load(this), LiteConfig.videoKeyOf(LiteConfig.load(this).videoScalePercent, LiteConfig.load(this).limit30Fps), "usb")
+            startSession(LiteConfig.load(this), LiteConfig.videoKeyOf(LiteConfig.load(this).videoScalePercent, LiteConfig.load(this).videoFps), "usb")
         } else {
             toast("未授予 VPN 权限，USB 连接无法建立")
             LiteLog.log("ui", "USB 通道：VPN 授权被拒绝")
@@ -1506,7 +1515,7 @@ class MainActivity : Activity() {
             .setNegativeButton("取消", null)
             .setPositiveButton("知道了") { _, _ ->
                 val config = LiteConfig.load(this)
-                LiteConfig.saveAppliedVideoKey(this, LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps))
+                LiteConfig.saveAppliedVideoKey(this, LiteConfig.videoKeyOf(config.videoScalePercent, config.videoFps))
                 LiteLog.log("ui", "视频参数已保存，下次连接生效")
             }
             .show()
@@ -1540,7 +1549,7 @@ class MainActivity : Activity() {
         }
         if (ssidBlank) return
         autoConnectTried = true
-        val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.limit30Fps)
+        val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.videoFps)
         if (config.appliedVideoKey.isNotEmpty() && config.appliedVideoKey != key) {
             LiteLog.log("ui", "自动连接跳过：视频参数已改，请手动连接以应用")
             return

@@ -1862,6 +1862,12 @@ class CarPlayController(
             return info
         }
         val hotspotMode = config.wirelessHotspotMode
+        // vc157：Wi-Fi Direct 升为一级模式——选此模式直接建 P2P GO，绕过 SoftAP 判死逻辑
+        //（不再依赖「热点恰好没开」触发兜底的副作用）。retained 复用已在上方统一处理
+        //（P2P 组支持 keepHotspotForReuse，跨代保留同样走复用快路径）。
+        if (hotspotMode == WirelessHotspotMode.WIFI_P2P) {
+            return startP2pHotspot(generation, "mode selected")
+        }
         if (
             hotspotMode.isManualHotspot &&
             CarHotspotStatus.isEnabled(appContext) == false
@@ -1871,16 +1877,8 @@ class CarPlayController(
             // vc93：OEM 状态语义失灵兜底（235233 实锤 ECARX state=11 但 ap0 存活带地址）——
             // 状态判死前查 AP 专用接口，接口活着就不阻塞连接。
             if (!CarHotspotStatus.hasDedicatedApInterface()) {
-                // vc156（B 级补充路径）：SoftAP 判死（热点关/OEM 语义失灵且无 ap 接口）→
-                // 开关允许时改用 Wi-Fi P2P GO 当替代 AP；P2P 也失败才抛原始错误（主诊断不丢）。
-                if (p2pFallbackEligible(generation)) {
-                    try {
-                        return startP2pFallbackHotspot(generation, "car hotspot off")
-                    } catch (p2pFailure: Exception) {
-                        debugLog("wifi-p2p fallback failed: " +
-                            "${p2pFailure.message ?: p2pFailure.javaClass.simpleName}; keeping the hotspot-off error")
-                    }
-                }
+                // vc157：SoftAP 判死时不再自动切 P2P GO——Wi-Fi Direct 已是一级模式，
+                // 需要即用设置页显式选择（保留原始错误，避免自动切换无线电角色扰动主路径）。
                 throw IOException("The car hotspot is off. Turn it on in the car settings and connect again.")
             }
             debugLog("car hotspot state check overridden by live AP interface (OEM state semantics)")
@@ -1938,19 +1936,6 @@ class CarPlayController(
             if (hotspot === manager) hotspot = null
             closeBestEffort(hotspotMode.name) { manager.close() }
             if (isStaleWirelessRun(generation)) throw failure
-            // vc156（B 级补充路径）：热点附着失败（权限受限/超时/OEM 裁剪）→ P2P GO 替代。
-            // P2P 建组成功 → 返回的 WirelessHotspotInfo 直接喂既有 0x5703 凭证/监听/Bonjour 链路；
-            // P2P 也失败 → 保留主路径错误原文重抛，绝不掩盖主诊断、绝不阻塞主建链。
-            if (hotspotMode.isManualHotspot && p2pFallbackEligible(generation)) {
-                debugLog("manual hotspot attach failed " +
-                    "(${failure.message ?: failure.javaClass.simpleName}); trying Wi-Fi P2P GO fallback")
-                try {
-                    return startP2pFallbackHotspot(generation, "hotspot attach failure")
-                } catch (p2pFailure: Exception) {
-                    debugLog("wifi-p2p fallback failed: " +
-                        "${p2pFailure.message ?: p2pFailure.javaClass.simpleName}; keeping the primary error")
-                }
-            }
             throw IOException(
                 "Could not establish ${hotspotMode.name} hotspot: " +
                     (failure.message ?: failure.javaClass.simpleName),
@@ -1960,26 +1945,15 @@ class CarPlayController(
     }
 
     /**
-     * vc156（B 级补充路径）：P2P fallback 触发资格。
-     * 开关开 + 本代仍有效 + WifiP2pManager 服务存在（ROM 裁剪/不可用时静默返回 false，
-     * 全程 runCatching，绝不抛出、绝不阻塞主建链）。
-     */
-    private fun p2pFallbackEligible(generation: Int): Boolean {
-        if (!config.wifiP2pFallbackEnabled) return false
-        if (isStaleWirelessRun(generation)) return false
-        return runCatching {
-            appContext.getSystemService(Context.WIFI_P2P_SERVICE) as? android.net.wifi.p2p.WifiP2pManager != null
-        }.getOrDefault(false)
-    }
-
-    /**
-     * vc156（B 级补充路径）：Wi-Fi P2P GO fallback 建组（移植上游 0.2.21 WifiP2pGroupManager）。
+     * vc157：P2P GO 建组（一级模式，移植自上游 0.2.21 WifiP2pGroupManager）。
+     * 触发路径：仅 wirelessHotspotMode=WIFI_P2P（"mode selected"）。
+     * MANUAL 热点失败不再自动兜底——需要 Wi-Fi Direct 请显式选该模式。
      * 成功后返回的 WirelessHotspotInfo（P2P 接口 IPv4/组网信息）走既有凭证下发链路
-     * （0x5703 / AirPlay 监听 / Bonjour），下游对 backend 无感知；失败一律包装为 IOException
-     * 由调用方决定保留主路径错误。close/保留复用语义与 ManualHotspotManager 相同
+     * （0x5703 / AirPlay 监听 / Bonjour），下游对 backend 无感知；失败一律包装为 IOException。
+     * close/保留复用语义与 ManualHotspotManager 相同
      * （closeWirelessStack(keepHotspotForReuse=true) 时 P2P 组同样跨代保留不掉网）。
      */
-    private fun startP2pFallbackHotspot(generation: Int, cause: String): WirelessHotspotInfo {
+    private fun startP2pHotspot(generation: Int, cause: String): WirelessHotspotInfo {
         val manager = try {
             WifiP2pGroupManager(appContext, ::debugLog)
         } catch (unavailable: Exception) {

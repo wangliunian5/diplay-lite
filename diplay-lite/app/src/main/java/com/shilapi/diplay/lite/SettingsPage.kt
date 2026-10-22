@@ -119,11 +119,19 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var cbBootWifi: CheckBox
     private lateinit var cbAutoConnect: CheckBox
     private lateinit var cbSoftDecode: CheckBox
-    private lateinit var cbFps30: CheckBox
+    // vc157：帧率四档单选（25/30/40/60），替代原「限制 30 帧」复选框。
+    private lateinit var rgFps: RadioGroup
+    private lateinit var rbFps25: RadioButton
+    private lateinit var rbFps30: RadioButton
+    private lateinit var rbFps40: RadioButton
+    private lateinit var rbFps60: RadioButton
     private lateinit var cbSpeaker: CheckBox
     private lateinit var cbVoiceMedia: CheckBox
-    // vc156：热点失败 Wi-Fi Direct P2P 兜底开关（B 级补充路径，默认关）。
-    private lateinit var cbP2pFallback: CheckBox
+    // vc157：无线承载方式二选一（车机热点 / Wi-Fi Direct）。P2P 一级模式下凭据由系统
+    // 随机生成，热点 SSID/密码不适用。
+    private lateinit var rgCarrier: RadioGroup
+    private lateinit var rbCarrierHotspot: RadioButton
+    private lateinit var rbCarrierP2p: RadioButton
     // vc156（上游 0.2.21 预缓冲移植）：媒体预缓冲开关。
     private lateinit var cbPrebuffer: CheckBox
     private lateinit var tvVersion: TextView
@@ -441,24 +449,51 @@ class SettingsPage(private val activity: MainActivity) {
         cbBootWifi = checkbox("开机自启WIFI")
         cbAutoConnect = checkbox("启动后自动连接")
         cbSoftDecode = checkbox("强制软解")
-        cbFps30 = checkbox("限制 30 帧")
+        // vc157：帧率四档单选（替代「限制 30 帧」复选框）。25=弱网省流/弱机自救档（降负载
+        // 减轻老硬解噪点）；40/60=流畅优先（弱硬解机型高帧率高码率可能出噪块，自行降档）。
+        // 直接落盘不弹确认——帧率已纳入 appliedVideoKey 机制，连接时检测到变化会二次确认。
+        rgFps = RadioGroup(activity).apply { orientation = LinearLayout.HORIZONTAL }
+        rbFps25 = radio("25帧")
+        rbFps30 = radio("30帧")
+        rbFps40 = radio("40帧")
+        rbFps60 = radio("60帧")
+        rgFps.addView(rbFps25)
+        rgFps.addView(rbFps30)
+        rgFps.addView(rbFps40)
+        rgFps.addView(rbFps60)
+        rgFps.setOnCheckedChangeListener { _, _ ->
+            if (isLoading) return@setOnCheckedChangeListener
+            refreshRadioDrawables(rgFps)
+            runCatching { persistFromForm() }
+            toast("已应用，下次连接生效")
+        }
         cbSpeaker = checkbox("通话声音走媒体音量")
         // 1.1.2（EU5 双向无声）：Siri/助手语音走媒体通道——ASSISTANT/NAVIGATION usage 在
         // PATEO 等老 HAL 上静音，勾选后改走媒体音量（媒体通道已实测出声）。
         cbVoiceMedia = checkbox("Siri/语音提示走媒体音量")
-        // vc156（B 级补充路径）：车机热点建链失败（热点判死/附着超时/权限受限）时改用
-        // Wi-Fi Direct P2P GO 当替代 AP。仅车机热点（car）通道生效，中继/USB 不适用。
-        cbP2pFallback = checkbox("热点失败时用Wi-Fi Direct兜底")
+        // vc157：无线承载方式二选一（车机热点 / Wi-Fi Direct）。Wi-Fi Direct = 直接建 P2P GO，
+        // 不依赖车机热点开关（P2P 凭据系统随机生成，热点 SSID/密码不适用）。
+        rgCarrier = RadioGroup(activity).apply { orientation = LinearLayout.HORIZONTAL }
+        rbCarrierHotspot = radio("车机热点")
+        rbCarrierP2p = radio("Wi-Fi Direct")
+        rgCarrier.addView(rbCarrierHotspot)
+        rgCarrier.addView(rbCarrierP2p)
+        rgCarrier.setOnCheckedChangeListener { _, _ ->
+            if (isLoading) return@setOnCheckedChangeListener
+            refreshRadioDrawables(rgCarrier)
+            runCatching { persistFromForm() }
+            toast("已应用，下次连接生效")
+        }
         column.addView(cbBoot, block(bottom = dip(2)))
         column.addView(cbBootBluetooth, block(bottom = dip(2)))
         column.addView(cbBootHotspot, block(bottom = dip(2)))
         column.addView(cbBootWifi, block(bottom = dip(2)))
         column.addView(cbAutoConnect, block(bottom = dip(2)))
         column.addView(cbSoftDecode, block(bottom = dip(2)))
-        column.addView(cbFps30, block(bottom = dip(2)))
+        column.addView(rgFps, block(bottom = dip(2)))
         column.addView(cbSpeaker, block(bottom = dip(2)))
         column.addView(cbVoiceMedia, block(bottom = dip(2)))
-        column.addView(cbP2pFallback, block())
+        column.addView(rgCarrier, block(bottom = dip(2)))
 
         // M6k23：自定义返回图标页（选图→裁剪→确认保存）。1.1.3：入口行 -3dp（按钮随行号缩小）。
         column.addView(entryRow("自定义返回图标") { activity.setPage("caricon") }, block(top = dip(14)))
@@ -858,13 +893,17 @@ class SettingsPage(private val activity: MainActivity) {
         }
     }
 
-    /** 三组单选全部刷新选中态染色（自绘 drawable 不感知 checked 状态变化，必须手动重设）。 */
+    /** 四组单选全部刷新选中态染色（自绘 drawable 不感知 checked 状态变化，必须手动重设）。 */
     private fun refreshAllDrawables() {
         (rbOrientLand.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
         (rbAutoCar.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
         (rbAvFull.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
         // 1.0.29：分辨率设定组。
         (rbResFit.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
+        // vc157：帧率四档组。
+        (rbFps25.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
+        // vc157：无线承载方式组。
+        (rbCarrierHotspot.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
     }
 
     // ---------- 表单读写 ----------
@@ -912,10 +951,17 @@ class SettingsPage(private val activity: MainActivity) {
         cbBootWifi.isChecked = config.bootAutoWifi
         cbAutoConnect.isChecked = config.autoConnect
         cbSoftDecode.isChecked = config.softwareVideoDecoder
-        cbFps30.isChecked = config.limit30Fps
+        // vc157：帧率四档回显（load 已过网格校验，else 兜底 30）。
+        when (config.videoFps) {
+            25 -> rbFps25.isChecked = true
+            40 -> rbFps40.isChecked = true
+            60 -> rbFps60.isChecked = true
+            else -> rbFps30.isChecked = true
+        }
         cbSpeaker.isChecked = config.speakerForCalls
         cbVoiceMedia.isChecked = config.voiceRoutedToMedia
-        cbP2pFallback.isChecked = config.wifiP2pFallback
+        // vc157：无线承载方式回显（默认车机热点）。
+        if (config.wifiP2pMode) rbCarrierP2p.isChecked = true else rbCarrierHotspot.isChecked = true
         cbPrebuffer.isChecked = config.audioPrebuffer
         isLoading = false
     }
@@ -953,10 +999,17 @@ class SettingsPage(private val activity: MainActivity) {
                     rbAutoUsb.isChecked -> "usb"
                     else -> "car"
                 },
-                limit30Fps = cbFps30.isChecked,
+                // vc157：帧率四档落盘（脏值防线在 LiteConfig.load 的 sanitizeFps）。
+                videoFps = when {
+                    rbFps25.isChecked -> 25
+                    rbFps40.isChecked -> 40
+                    rbFps60.isChecked -> 60
+                    else -> 30
+                },
                 speakerForCalls = cbSpeaker.isChecked,
                 voiceRoutedToMedia = cbVoiceMedia.isChecked,
-                wifiP2pFallback = cbP2pFallback.isChecked,
+                // vc157：无线承载方式落盘（Wi-Fi Direct 优先于热点，仅 car 通道生效）。
+                wifiP2pMode = rbCarrierP2p.isChecked,
                 audioPrebuffer = cbPrebuffer.isChecked,
                 softwareVideoDecoder = cbSoftDecode.isChecked,
                 orientationMode = currentOrientationMode(),

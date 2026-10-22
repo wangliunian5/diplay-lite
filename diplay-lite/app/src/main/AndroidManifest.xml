@@ -20,7 +20,8 @@
     <!-- B3 信道读取：4.1 的 WifiManager.getScanResults 需要定位权限 -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <!-- vc156（热点失败 Wi-Fi Direct 兜底）：API 33+ 的 Wi-Fi P2P 前置权限；
+    <!-- vc157（Wi-Fi Direct 一级模式）：API 33+ 的 Wi-Fi P2P 建组前置权限；
+         选了「Wi-Fi Direct」承载方式时必须具备（vc156 的自动兜底已移除，不再隐式建组）。
          neverForLocation=声明不用周边设备推断位置（沿用 ACCESS_FINE_LOCATION 语义）。
          声明本身无副作用，运行时由 MainActivity 批量申请；API 32- 被系统自动忽略。 -->
     <uses-permission
