@@ -8,6 +8,8 @@ import android.os.Build
 import java.io.IOException
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 
 /**
  * 中继热点（双 client 模式）：不建热点，而是把本机接入外部网络（随身WiFi），
@@ -71,6 +73,8 @@ class RelayClientManager(
         // 「没关联上 AP」还是「关联了但没拿到 IP」；加一次性中间态日志区分两态，
         // joined 日志补网关字段，便于和 iPhone 侧网段对账。
         var loggedAssociated = false
+        var loggedStuck = false
+        var associatedAtMillis = 0L
         while (System.currentTimeMillis() < deadline) {
             if (closed) throw IOException("Relay client closed while connecting")
             val info = wifi.connectionInfo
@@ -79,7 +83,22 @@ class RelayClientManager(
                     // 已关联到 AP 但 DHCP 还没出地址：只报一次，避免刷屏。
                     if (!loggedAssociated) {
                         loggedAssociated = true
+                        associatedAtMillis = System.currentTimeMillis()
                         onDiagnostic("relay: associated ssid='$ssid', waiting for IP address (DHCP)")
+                    } else if (!loggedStuck) {
+                        // vc174（C8815 00:26 k602026 实证）：密码错时 Android 4.x 的 WifiInfo
+                        // 照样报目标 SSID（4-way handshake 未完成也算 associated），于是界面
+                        // 一直转圈、没有任何提示，用户只能干等超时。超时前主动提示一次：
+                        // 长时间停在「已关联、无 IP」= 认证没过（密码/加密方式）或热点 DHCP 慢。
+                        val stuckMs = System.currentTimeMillis() - associatedAtMillis
+                        if (stuckMs >= ASSOCIATED_STALL_HINT_MILLIS) {
+                            loggedStuck = true
+                            onDiagnostic(
+                                "relay: still no IP ${stuckMs}ms after association — most likely the " +
+                                    "passphrase/encryption was rejected (4-way handshake incomplete) " +
+                                    "or the hotspot DHCP is slow",
+                            )
+                        }
                     }
                 } else {
                     val dhcp = wifi.dhcpInfo
@@ -141,34 +160,42 @@ class RelayClientManager(
         val netId = if (existing != null) {
             // vc94：命中同名网络时校验 PSK 一致性——用户改中继热点密码后，存量配置仍指向
             // 旧密码，无条件复用会让 join 恒超时（无法自愈）。不一致即就地 updateNetwork 覆盖。
-            val pskChanged = if (passphrase.isNotEmpty()) {
+            // vc174（C8815 00:28 日志实证）：Android 4.x 的 getConfiguredNetworks() 不返回
+            // 明文 PSK，而是掩码 "*"（日志里 `PSK mismatch (stored=1 chars)` 就是它），
+            // 于是这条比对**恒为真**——每次点连接都走一次 updateNetwork + disconnect +
+            // reconnect，把已经连着的 Wi-Fi 先拆掉重连，DHCP 因此每次要 20s（Windows
+            // 承载网络 192.168.137.x）。改为：掩码值视为「不可比对」，且本机已在该网并
+            // 拿到 IP 时一律不动配置（自断重连没有任何收益）。
+            val pskMasked = existing.preSharedKey == null || existing.preSharedKey == PSK_MASKED
+            val pskChanged = if (pskMasked) {
+                false
+            } else if (passphrase.isNotEmpty()) {
                 existing.preSharedKey != quoted(passphrase)
             } else {
                 // 本次配置为开放网络，但存量带 PSK → 需清空才能转开放。
-                !existing.preSharedKey.isNullOrEmpty()
+                existing.preSharedKey!!.isNotEmpty()
             }
             if (!pskChanged) {
-                onDiagnostic("relay: reusing configured network id=${existing.networkId}")
+                onDiagnostic(
+                    "relay: reusing configured network id=${existing.networkId}" +
+                        if (pskMasked) " (platform masks PSK as '$PSK_MASKED'; no update)" else "",
+                )
+            } else if (isJoinedWithIp(wifi)) {
+                onDiagnostic(
+                    "relay: PSK differs but already joined '$ssid' with an IP; " +
+                        "keeping the live connection (no update/reconnect)",
+                )
             } else {
                 onDiagnostic(
                     "relay: configured network id=${existing.networkId} PSK mismatch " +
                         "(stored=${existing.preSharedKey?.length ?: 0} chars) — updating",
                 )
-                val config = WifiConfiguration().apply {
-                    SSID = quoted(ssid)
-                    networkId = existing.networkId
-                    if (passphrase.isNotEmpty()) preSharedKey = quoted(passphrase) else preSharedKey = ""
-                }
+                val config = relayConfiguration(existing.networkId)
                 val updated = wifi.updateNetwork(config)
                 if (updated < 0) {
                     onDiagnostic("relay: updateNetwork failed (code=$updated); falling back to add")
                     wifi.removeNetwork(existing.networkId)
-                    val added = wifi.addNetwork(
-                        WifiConfiguration().apply {
-                            SSID = quoted(ssid)
-                            if (passphrase.isNotEmpty()) preSharedKey = quoted(passphrase)
-                        },
-                    )
+                    val added = wifi.addNetwork(relayConfiguration(-1))
                     if (added < 0) {
                         throw IOException(
                             "Updating relay network '$ssid' password failed (code=$added)",
@@ -180,10 +207,7 @@ class RelayClientManager(
             }
             existing.networkId
         } else {
-            val config = WifiConfiguration().apply {
-                SSID = quoted(ssid)
-                if (passphrase.isNotEmpty()) preSharedKey = quoted(passphrase)
-            }
+            val config = relayConfiguration(-1)
             val added = wifi.addNetwork(config)
             if (added < 0) {
                 throw IOException(
@@ -194,6 +218,29 @@ class RelayClientManager(
             added
         }
         return finishJoin(wifi, netId)
+    }
+
+    /**
+     * 本会话的中继网络配置。vc174：显式写 key management——只给 preSharedKey 而不给
+     * key_mgmt 时，老 wpa_supplicant 会落到开放网络语义（key_mgmt=NONE），去连 WPA2 热点
+     * 必然 4-way handshake 失败，表象正是「密码明明是对的却报密码/认证错误」。
+     */
+    private fun relayConfiguration(networkId: Int): WifiConfiguration = WifiConfiguration().apply {
+        SSID = quoted(ssid)
+        if (networkId >= 0) this.networkId = networkId
+        if (passphrase.isNotEmpty()) {
+            preSharedKey = quoted(passphrase)
+            allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_PSK)
+        } else {
+            preSharedKey = ""
+            allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE)
+        }
+    }
+
+    /** 本机已经连在该 SSID 上并且拿到了 IP（用于避免无意义的 update/disconnect）。 */
+    private fun isJoinedWithIp(wifi: WifiManager): Boolean {
+        val info = wifi.connectionInfo ?: return false
+        return info.ipAddress != 0 && isConnectedTo(info, ssid)
     }
 
     /** enableNetwork + reconnect + DHCP 轮询共用尾段（vc94 从 attachNetwork 拆出）。 */
@@ -208,7 +255,7 @@ class RelayClientManager(
         return netId
     }
 
-    /** AP 隔离/连错网自检：网关 3s×4 次 ping 不通 → 显性报错（归类确定性失败，不烧重试额度）。 */
+    /** AP 隔离/连错网自检：网关 3s×4 次 ping 不通 → 先做 TCP 探测，仍不活才报错（确定性失败，不烧重试额度）。 */
     private fun verifyGatewayReachable(gateway: Int) {
         val gatewayAddress = intToInetAddress(gateway)
             ?: throw IOException("RELAY_UNREACHABLE: relay network returned no gateway")
@@ -228,12 +275,49 @@ class RelayClientManager(
                 Thread.currentThread().interrupt()
             }
         }
+        // vc174（C8815 00:27~00:28 三轮实证）：ICMP 不通 ≠ 网络不通。Windows 承载网络
+        // （192.168.137.x，本次中继热点就是它）与多数手机热点默认**不回 ping**（防火墙
+        // 公用网络禁 ICMP 回显），此时旧代码直接抛 RELAY_UNREACHABLE，弹「网关无响应/
+        // AP隔离」——纯误杀，车机其实已经拿到 192.168.137.35 且链路正常。
+        // 改为：ICMP 全灭后补一次 TCP 探测（53/80/443），任一端口有应答即判网关存活、
+        // 只记告警继续（真正的判据是 iPhone 能否建 AirPlay TCP，交给 first TCP watchdog）。
+        onDiagnostic(
+            "relay: gateway $gatewayAddress did not answer ICMP ($REACHABLE_ATTEMPTS probes); " +
+                "probing TCP ports to tell 'ICMP blocked' from 'real AP isolation'",
+        )
+        val tcpPort = probeTcpPort(gatewayAddress)
+        if (tcpPort > 0) {
+            onDiagnostic(
+                "relay: gateway answered TCP on port $tcpPort — ICMP is blocked by the hotspot " +
+                    "firewall (common on Windows hosted network / phone tethering); continuing",
+            )
+            return
+        }
         // 1.0.29（at8317 排查）：InetAddress.toString() 带 '/' 前缀（弹窗显示成 /192.168.200.1），
         // 会污染 localizeFailure 的 gateway 正则提取；改用 hostAddress 纯地址格式，英文原文照旧进日志。
         throw IOException(
-            "RELAY_UNREACHABLE: gateway ${gatewayAddress.hostAddress} did not answer; " +
+            "RELAY_UNREACHABLE: gateway ${gatewayAddress.hostAddress} did not answer ICMP or TCP; " +
                 "the relay router may block this device (AP isolation) or the iPhone is on another network",
         )
+    }
+
+    /**
+     * vc174：ICMP 之外的存活判据——连一次网关的常见 TCP 端口（DNS/HTTP/HTTPS）。
+     * 返回应答的端口号，全不通返回 0。只用于区分「禁 ping」与「真隔离」，不承载业务。
+     */
+    private fun probeTcpPort(gateway: InetAddress): Int {
+        for (port in GATEWAY_TCP_PROBE_PORTS) {
+            if (closed) return 0
+            try {
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress(gateway, port), TCP_PROBE_TIMEOUT_MILLIS)
+                }
+                return port
+            } catch (_: Exception) {
+                // 连接被拒/超时都按不可达计，继续下一个端口
+            }
+        }
+        return 0
     }
 
     private fun buildInfo(wifi: WifiManager, info: WifiInfo, hostAddress: InetAddress): WirelessHotspotInfo {
@@ -298,6 +382,16 @@ class RelayClientManager(
         private const val REACHABLE_TIMEOUT_MILLIS = 3_000
         private const val REACHABLE_RETRY_DELAY_MILLIS = 1_000L
         private const val REACHABLE_ATTEMPTS = 4
+        // vc174：ICMP 不通后的 TCP 补刀探测（DNS / HTTP / HTTPS），单端口超时。
+        private val GATEWAY_TCP_PROBE_PORTS = intArrayOf(53, 80, 443)
+        private const val TCP_PROBE_TIMEOUT_MILLIS = 1_200
+        /** vc174：停在「已关联但没 IP」多久后提示一次「多半是密码/加密被拒或 DHCP 慢」。 */
+        private const val ASSOCIATED_STALL_HINT_MILLIS = 12_000L
+        /**
+         * vc174：Android 4.x（以及多数版本）的 getConfiguredNetworks() 不返回明文 PSK，
+         * 一律掩码成 "*"；拿它做一致性比对会恒不相等（见 [attachNetwork]）。
+         */
+        private const val PSK_MASKED = "*"
         // vc83：自动开 WiFi 的等待上限与轮询步长。
         private const val WIFI_ENABLE_WAIT_MILLIS = 8_000L
         private const val WIFI_ENABLE_POLL_MILLIS = 200L

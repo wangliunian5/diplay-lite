@@ -249,8 +249,7 @@ android {
         // vc167（第二步）：落 A+B 批——usbbt 开关接入 CarPlayController 建链缝 +
         // USB 传输层探活（枚举→openDevice→HCI Reset→读 BD_ADDR）；UsbDongleProbe
         // 枚举能力收进 shared/.../usbbt/UsbBtSession 并删除。
-        val versionPatch = 5
-        versionName = "1.2.$versionPatch.dongle"
+        // versionPatch/versionName 迁至 versionCode 附近统一维护（vc171 起，见下方 vc171 注释块）。
         // vc143：USBMUX 握手超时 60s→20s（快速进入 full-reset 重试）+ 重试轮次显示
         // （复位提示此前 8s 被覆盖、静默期观感=卡死）。17:40 会话实证 vc142 自愈链路正常。
         // vc144：NCM 同步读成功后 settle 1ms 再 arm 下一次传输——vc143-snap-2008 定案
@@ -313,7 +312,35 @@ android {
         // 改为 MainActivity.render() 里挂一颗全局球，所有页面共用、可拖拽、
         // 位置跨页面保留；点击语义集中一处（home=收起/唤出面板，子页=逐级返回）；
         // 删除 UiKit.attachPageBall 与三个子页的调用点。
-        versionCode = 170
+        // vc171（CatPlay 0.68.4 K60 补丁实测迁移）：first TCP watchdog RecoveryHint 文案
+        // 补充两大实证因素——iPhone 保持亮屏解锁（iOS 熄屏暂停热点自动加入，实测 44s vs
+        // 8.6s）+ 关闭该网络「私有无线局域网地址」（用户实测体感相关）；行为层不动：
+        // 既有 60s 窗口+宽限复查已覆盖竞品 40s 慢入网上限，实测数据见
+        // 工程文档/09-逆向-车机与取证/竞品分析-CatPlay-0.68.4-K60实测与补丁.md。
+        // vc174（C8815 中继 00:26~00:28 三轮日志取证，含两个误判修复 + 一条文案）：
+        // ①网关自检误杀——Windows 承载网络（192.168.137.x）/多数手机热点默认不回 ICMP，
+        //   车机已拿到 192.168.137.35 却被判 RELAY_UNREACHABLE 弹「AP隔离」。改为 ICMP 全灭后
+        //   补一次 TCP(53/80/443) 探测：有应答即判「只是禁 ping」记告警继续，真隔离才报错。
+        // ②PSK 比对失效——Android 4.x 的 getConfiguredNetworks() 把 PSK 掩码成 "*"（日志
+        //   `PSK mismatch (stored=1 chars)`），导致每次点连接都 update+disconnect+reconnect，
+        //   DHCP 每次重来 ~20s。改为掩码视为不可比对；已在该网且拿到 IP 时一概不动配置。
+        // ③attachNetwork 显式写 allowedKeyManagement=WPA_PSK——只给 preSharedKey 不给 key_mgmt
+        //   时老 supplicant 落到开放网络语义，去连 WPA2 热点必然握手失败，表象正是
+        //   「密码明明对却报密码错误」。
+        // ④first TCP watchdog 两条无效提示（亮屏解锁/私有地址，复测不成立）改为
+        //   「无互联网连接 → 仍要加入」（C8815 入网 76.5s 的真因）。
+        // vc175（K60 有线拔线实测，20261023）：LiteSessionService.onSessionEnded 区分
+        // 主动断开/中断——拔线瞬间不再弹误导性的「会话已结束」（用户多点一次按钮的根因），
+        // 改可行动文案；重插→attach→授权→重枚举本就全自动，无需其他行为改动。
+        // vc176（K60 复测实锤，20261023）：vc175 只改了文案没治本——首次授权后 0x52=0x0
+        // 重枚举的旧实例 DETACHED 被 MainActivity vc149 拔线监听误判为用户拔线 →
+        // stopService 杀掉重枚举兜底 → 弹「控制通道已结束」。改为重枚举等待期
+        // （WaitingForReenumeration）忽略 DETACHED：授权①→重枚举→授权②→出画面全自动，
+        // 不再弹结束提示、无需二次点按钮。改动：LiteState.reenumerating 标志 +
+        // Service 状态机维护 + MainActivity detach receiver 忽略判断。
+        versionCode = 176
+        val versionPatch = 11
+        versionName = "1.2.$versionPatch.dongle"
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties

@@ -123,12 +123,16 @@ class LiteSessionService : Service() {
 
     /** M3 媒体面：每轮 startController 新建一套（AndroidMediaSink.close() 后不可复用）。 */
     private var mediaSink: AndroidMediaSink? = null
+    /** K60 实测（20261023，vc171）：用户主动断开（服务销毁）置位——onSessionEnded 据此区分
+     *  主动断开与拔线/断链中断，中断场景给可行动文案而非误导性的「会话已结束」。 */
+    @Volatile private var userStopped = false
     private var mediaEngine: CarPlayMediaEngine? = null
     /** 1.1.4：ECARX 媒体中心冒充桥（非 ECARX 车机内部静默禁用，零开销）。 */
     private var ecarxBridge: EcarxMediaCenterBridge? = null
 
     private val sessionListener = object : AirPlaySessionListener {
         override fun onSessionActive(session: AirPlaySession) {
+            userStopped = false // 新会话激活，清除上一轮主动断开标记
             LiteState.phase = LiteState.Phase.ACTIVE
             LiteState.statusText = "CarPlay 会话已激活"
             LiteLog.log("airplay", "会话已激活 peer=${session.host}")
@@ -136,8 +140,12 @@ class LiteSessionService : Service() {
 
         override fun onSessionEnded(session: AirPlaySession) {
             LiteState.phase = LiteState.Phase.IDLE
-            LiteState.statusText = "会话已结束"
-            LiteLog.log("airplay", "会话已结束")
+            // K60 实测（20261023）：拔线瞬间的「会话已结束」观感像故障，误导用户在重插后
+            // 多点一次按钮；实际重插→attach→授权→重枚举已全自动续连。中断场景给可行动文案。
+            LiteState.statusText =
+                if (userStopped) "会话已结束"
+                else "连接已断开：重新插入 USB 线（或点连接）即可自动恢复"
+            LiteLog.log("airplay", "会话已结束 userStopped=$userStopped")
         }
 
         override fun onTransportError(message: String) {
@@ -215,6 +223,8 @@ class LiteSessionService : Service() {
     }
 
     override fun onDestroy() {
+        // K60 实测（20261023）：标记主动断开，onSessionEnded 据此区分文案。
+        userStopped = true
         // close() 在后台线程按序拆除：无线栈（AirPlay → 隧道 → 蓝牙）→ MFi → 定位。
         // 拆栈可能等待 socket 关闭，onDestroy 在主线程，故不 awaitClosed()；
         // 拆栈线程随进程存续（MainActivity 在前台时进程不会先死）。
@@ -517,6 +527,9 @@ class LiteSessionService : Service() {
     /** CarPlayStatus -> LiteState 映射；controller 已投递到主线程回调。 */
     private fun onStatus(status: CarPlayStatus) {
         LiteLog.log("carplay", "状态：$status")
+        // vc176：重枚举标志随状态机自动维护——仅 WaitingForReenumeration 期间为真，
+        // 其余任何状态（含 Failed/ControlEnded/新授权请求）一律清除。
+        LiteState.reenumerating = status is CarPlayStatus.WaitingForReenumeration
         when (status) {
             is CarPlayStatus.DiscoveringMfi -> connecting("正在加载 MFi 证书")
             is CarPlayStatus.MfiReady -> connecting("MFi 证书就绪")
@@ -569,10 +582,15 @@ class LiteSessionService : Service() {
         return when {
             "relay_unreachable" in m -> {
                 val gateway = Regex("gateway (\\S+)").find(message)?.groupValues?.get(1) ?: "网关"
-                "中继网络不通：网关 $gateway 无响应。通常是路由器开了AP隔离（设备间禁止互访），或iPhone没连同一个随身WiFi；请到路由器设置关闭AP隔离后重试"
+                // vc174：ICMP 不通现在会先用 TCP 复测（禁 ping 的热点不再走到这里），
+                // 能到这里说明网关 ping/TCP 全无应答，AP 隔离或 iPhone 不在同一网的嫌疑最大。
+                "中继网络不通：网关 $gateway 对 ping 与 TCP 均无应答（已排除「只是禁ping」）。通常是路由器开了AP隔离（设备间禁止互访），或iPhone没连同一个随身WiFi；请关闭AP隔离或换一个热点后重试"
             }
+            // vc174（C8815 00:26 k602026 实证）：卡在这一步有两种常见原因——密码/加密方式
+            // 被拒（老车机不支持 WPA3/SAE，或密码真错）与热点 DHCP 慢。原文案只提密码，
+            // 用户核对无误后仍然无解；补上加密方式与 DHCP 两条可排查项。
             "could not join relay network" in m ->
-                "加入中继网络超时：请核对随身WiFi名称/密码，确认车机Wi-Fi已开启"
+                "加入中继网络超时：请核对随身WiFi名称/密码；若确认无误，多半是热点开了WPA3（老车机不支持，请改WPA2/AES）或DHCP较慢，可再试一次"
             "relay ssid is not configured" in m -> "当前是中继热点模式，未配置SSID，无法连接"
             "adding relay network" in m -> "添加中继网络失败：请核对随身WiFi密码"
             "enabling relay network" in m -> "启用中继网络失败，请重试"

@@ -336,6 +336,13 @@ class AndroidMediaSink(
         microphoneUplinks.clear()
         microphoneRetryFutures.clear()
         microphoneRetryExecutor.shutdownNow()
+        // vc173：mediaStallMonitor 是 `while(true)` 线程，**仅靠 InterruptedException 退出**，
+        // 而 close() 此前从未 interrupt 它 ⇒ 每次重连新建一个 sink 就泄漏一个常驻线程，
+        // 且该线程通过闭包持有 audioRenderers/videoDecoders 等 ⇒ **整个 sink 对象图都释放不掉**，
+        // 泄漏实例还会继续 5s 周期自杀轮询（判据引用的 renderer 已 close，行为不可预期）。
+        // 修法：close() 中 interrupt（线程在 sleep 处立即响应；不在 sleep 时中断标志也保证
+        // 下一轮 sleep 立刻抛出并退出）。对已结束的线程 interrupt 是空操作，可重复调用。
+        runCatching { mediaStallMonitor.interrupt() }
     }
 
     private fun videoDecoder(type: Int): VideoDecoder {

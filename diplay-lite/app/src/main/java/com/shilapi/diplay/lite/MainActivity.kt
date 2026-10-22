@@ -288,6 +288,13 @@ class MainActivity : Activity() {
                 @Suppress("DEPRECATION")
                 val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE) ?: return
                 if (device.vendorId != APPLE_USB_VENDOR_ID) return
+                // vc176（K60 实测）：0x52 重枚举等待期内旧实例的 detach 是必经步骤、
+                // 不是用户拔线——此时停服务会杀掉重枚举兜底、误弹「控制通道已结束」，
+                // 表象是「首次授权后弹结束提示，必须再点一次连接」。忽略并继续等待。
+                if (LiteState.reenumerating) {
+                    LiteLog.log("ui", "USB 拔出：重枚举等待期，忽略（等待新实例出现）")
+                    return
+                }
                 LiteLog.log("ui", "USB 拔出：按用户断开等价清理会话与 VPN")
                 autoConnectTried = false
                 stopService(Intent(this@MainActivity, LiteSessionService::class.java))

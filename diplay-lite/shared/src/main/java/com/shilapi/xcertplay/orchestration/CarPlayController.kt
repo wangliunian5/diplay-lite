@@ -1761,12 +1761,22 @@ class CarPlayController(
                 // 1.0.29（011741 三样本结论）：0x5703 已发 + 0 TCP 的首要嫌疑 = iPhone WLAN
                 // 开关关闭（iOS 保护性放弃后表现为 Wi-Fi 图标变白）或 join 未发生，AP 隔离降为
                 // 次要嫌疑——主动给用户可操作的一步提示，替代盲等。
+                // 1.1.29（CatPlay 0.68.4 K60 实测迁移，20261022）：iPhone 入网耗时 1.3~40s
+                // 波动的两大实证因素——①iOS 熄屏时暂停 Wi-Fi 扫描/热点自动加入（亮屏后秒连，
+                // 竞品两轮实测 44s vs 8.6s）；②「私有无线局域网地址」开启时 iOS 对热点做
+                // 完整信任评估（用户实测体感相关，与竞品静态分析互证）。写进提示文案。
+                // vc174（C8815 中继/车机热点实测纠正）：上述两条经复测**不成立**——
+                // 亮屏=单样本推断，私有地址两轮复测与入网耗时无强关联（关 37s / 开 1.3s），
+                // 且两条都无法在 iPhone 上换来一步动作。入网慢的真因定案是
+                // **热点无互联网出口 → iOS 需用户确认**（提示「无互联网连接」，须点
+                // 「仍要加入」才继续；C8815 首次入网 76.5s 几乎全耗在这里）。
+                // 提示改为可直接照做的一步：点进热点 → 选「仍要加入」。
                 onStatus(
                     CarPlayStatus.RecoveryHint(
                         if (relaySuspect) {
-                            "连接停滞：请打开 iPhone 的 WLAN 开关（若已开请关闭再打开），正在自动重试"
+                            "连接停滞：请打开 iPhone 的 WLAN 开关（若已开请关闭再打开）；中继热点无互联网，iPhone 入网会等确认——请在「无线局域网」页点进该热点并选「仍要加入」，正在自动重试"
                         } else {
-                            "连接停滞：请确认 iPhone 的 WLAN 已连接车机热点，或忽略此网络后重新连接"
+                            "连接停滞：车机热点无互联网，iPhone 入网较慢——请在 iPhone「无线局域网」页点进车机热点，看到「无互联网连接」时选「仍要加入」，正在自动重试"
                         },
                     ),
                 )
@@ -2127,9 +2137,12 @@ class CarPlayController(
      * ③两种口各试一次就放弃太急，改为**多轮退避重试**。
      */
     private fun openWirelessRfcommSocket(device: BluetoothDevice): BluetoothSocket {
-        // ①建链前先探一次 SDP（vc168）——原实现只在失败后才探，无法区分
-        // "服务不在" 与 "服务在但框架 SDP 失败"。
-        sdpProbe(device, "pre")
+        // ①建链前发一次 SDP 请求（vc168 引入，vc172 改为**发射后不管**）。
+        // 原为阻塞探测（fetch + 固定 sleep 1.5s ≈ 2.4s），每次连接都付——含一帆风顺时。
+        // 诊断目的已达成（服务始终在广播，失败在框架 SdpHelper.doSdp），
+        // 而 probe 结果只有失败路径才消费 ⇒ 成功路径不该阻塞。
+        // 诊断能力不丢：失败路径的 sdpProbe(round/final) 完整保留。
+        sdpProbeAsync(device)
 
         // ②取消发现并给栈收敛时间（原实现 cancelDiscovery 后立刻建链，而它是异步的）
         if (bluetoothAdapter?.isDiscovering == true) {
@@ -2207,6 +2220,35 @@ class CarPlayController(
      * - 可见 + 全轮失败 ⇒ 框架 SDP 在此 ROM 不可用（需 vc169 反射建 channel socket）
      * - 不可见 ⇒ 才是旧定案说的"iPhone 未广播"，按残留会话处理
      */
+    /**
+     * **发射后不管**：只把 SDP 请求发出去，不等待、不读结果。
+     *
+     * ## vc172：为什么改成这样
+     *
+     * vc168 为诊断（区分"服务不在广播" vs "框架 SDP 失败"）把 [sdpProbe] 前移到建链前，
+     * 而它内部有 `Thread.sleep(SDP_QUERY_SETTLE_MILLIS)` = **1.5s 固定等待** ——
+     * 于是**每次连接都要付约 2.4s**（1.5s sleep + ~0.9s fetch），连一帆风顺时也付。
+     *
+     * 诊断目的早已达成（定案：服务始终在广播，失败在框架 `SdpHelper.doSdp` 间歇性），
+     * 而这 2.4s 是 K60 对照实测里我方与竞品差距的**绝大部分**
+     * （见 `09-逆向-车机与取证/竞品分析-CatPlay-0.68.4-K60实测与补丁.md` §6.2）。
+     *
+     * 关键点：**probe 的产出只有失败路径才用得上**（靠它判断服务在不在）。
+     * 成功路径上它只打一行日志，没人消费 ⇒ 成功路径不该为它阻塞。
+     * 失败路径的 [sdpProbe]（round/final）完整保留，**诊断能力一点不丢**。
+     *
+     * 若某些栈确实靠这次 SDP 预热缓存，收益仍在（请求照样发出去了）——
+     * 只是我们不等它。这是严格优于"阻塞探测"和"并行但仍等结果"的做法。
+     */
+    private fun sdpProbeAsync(device: BluetoothDevice) {
+        runCatching {
+            device.fetchUuidsWithSdp()
+            debugLog("wireless RFCOMM SDP probe[async] issued address=${device.address}")
+        }.onFailure {
+            debugLog("wireless RFCOMM SDP probe[async] failed: ${it.message}")
+        }
+    }
+
     private fun sdpProbe(device: BluetoothDevice, tag: String): Boolean {
         return runCatching {
             device.fetchUuidsWithSdp()
