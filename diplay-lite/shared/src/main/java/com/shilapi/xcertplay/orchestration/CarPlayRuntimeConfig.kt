@@ -74,6 +74,10 @@ class CarPlayRuntimeConfig(
     // 「开热点 + AirPlay 监听 + mDNS + 识别帧 group16+24 + 无线控制环（0x5703 经 USB 隧道）」。
     // Apple 官方「插 USB 弹提醒可无线」流程的配件侧实现；热点参数复用 wirelessHotspotMode 组。
     val usbWirelessUpgrade: Boolean = false,
+    // vc167（外置 USB 蓝牙 dongle 第 2 步）：仅在外置 USB 蓝牙启用时走 usbbt 路径。
+    // true 时无线 RFCOMM 建链处（CarPlayController）改用 UsbBtBootstrapStream，
+    // 其余链路（btProbeMode 三轮握手等）一律不变；默认 false 行为与此前完全一致。
+    val usbBtDongle: Boolean = false,
 ) {
     init {
         require(hostMac.size == 6) { "hostMac must be 6 bytes" }

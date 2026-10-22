@@ -1,6 +1,5 @@
 package com.shilapi.diplay.lite
 
-import android.app.Activity
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
@@ -8,12 +7,9 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
-import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
-import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.RadioButton
 
@@ -42,6 +38,14 @@ class WrapRadioGroup(context: Context) : LinearLayout(context) {
     private var onChange: ((Int) -> Unit)? = null
     private var suppress = false
     private var lastWidth = -1
+
+    /**
+     * 折行重建行之后回调。宿主借此刷新自绘 drawable（选中态染色）——
+     * 因为按钮是 relayout 时才挂进视图树的，宿主在 loadIntoForm 后刷的那次
+     * 会扑空（当时还没有行），必须等折行完成后再刷一次，否则选中态不显示
+     * （K60 横屏实测：四个选项全是空心圈）。
+     */
+    var onRelayout: (() -> Unit)? = null
 
     fun addButtons(vararg buttons: RadioButton) {
         for (b in buttons) {
@@ -108,6 +112,7 @@ class WrapRadioGroup(context: Context) : LinearLayout(context) {
             used += bw + gap
         }
         addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        onRelayout?.invoke()
     }
 }
 
@@ -212,36 +217,11 @@ object Ui {
     }
 }
 
-/**
- * M6k23：悬浮球所有画面常驻 —— 二级页（设置/热点配置/图标）右上角悬浮球。
- * 与主页悬浮球同视觉（半透明胶囊 + 双箭头图标）；点击执行 [onClick]（二级页=返回）。
- * 用法：activity 的根必须是 FrameLayout，先 addView 页面内容再调本函数盖在最上层。
- */
-fun attachPageBall(activity: Activity, root: FrameLayout, onClick: () -> Unit) {
-    val ball = FrameLayout(activity).apply {
-        background = Ui.pillSolid(activity, 0x66FFFFFF)
-        // setClipToOutline 是 API 18+；部分白牌 ROM 谎报 SDK_INT 但 framework 缺方法，改反射探测（与主页同因）。
-        runCatching {
-            FrameLayout::class.java
-                .getMethod("setClipToOutline", Boolean::class.javaPrimitiveType)
-                .invoke(this, true)
-        }
-    }
-    val icon = ImageView(activity)
-    icon.setImageDrawable(IconPainter.arrows(activity, 18, Ui.TEXT))
-    ball.addView(
-        icon,
-        FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER),
-    )
-    val size = Ui.dip(activity, 34)
-    val params = FrameLayout.LayoutParams(size, size, Gravity.TOP or Gravity.END).apply {
-        topMargin = Ui.dip(activity, 10)
-        rightMargin = Ui.dip(activity, 10)
-    }
-    ball.layoutParams = params
-    ball.setOnClickListener { onClick() }
-    root.addView(ball, params)
-}
+// vc163 说明：原 `attachPageBall()`（M6k23）已删除。
+// 它是"每个二级页各自建一个悬浮球"的旧做法，与主页那颗可拖拽球是两套实现，
+// 视觉尺寸（34dp vs 46dp）、是否可拖、点击语义都不统一，切页还会闪。
+// 现统一为 MainActivity.render() 里挂载的**全局悬浮球**，所有页面共用一颗，
+// 位置跨页面保留，点击语义集中在一处（home=收起/唤出面板，子页=逐级返回）。
 
 /**
  * M6k14 自绘开关（API16 无 Material Switch，原生 Switch 样式不符设计图）。

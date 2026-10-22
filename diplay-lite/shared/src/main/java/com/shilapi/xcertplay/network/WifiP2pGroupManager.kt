@@ -326,7 +326,7 @@ class WifiP2pGroupManager(
             if (activeChannel != null) releaseLegacyChannelRestriction(activeChannel)
             activeChannel?.closeCompat()
         }
-        activeThread?.quitSafely()
+        activeThread?.quitCompat()
     }
 
     private fun createChannelListener(
@@ -838,7 +838,7 @@ class WifiP2pGroupManager(
             if (failedChannel != null) releaseLegacyChannelRestriction(failedChannel)
             failedChannel?.closeCompat()
         }
-        failedThread?.quitSafely()
+        failedThread?.quitCompat()
     }
 
     private fun removeGroupBlocking(channel: WifiP2pManager.Channel, expectedName: String? = observedCreatedName ?: requestedName) {
@@ -924,6 +924,23 @@ class WifiP2pGroupManager(
     // 公开于 API27/O MR1，更老版本无 close，Channel 资源随进程回收）。
     private fun WifiP2pManager.Channel.closeCompat() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) close()
+    }
+
+    /**
+     * vc169：**C8815（API16）选 Wi-Fi Direct 必崩的根因修复。**
+     *
+     * `HandlerThread.quitSafely()` 是 **API 18**（Android 4.3）才加入的，API16 上不存在
+     * → `java.lang.NoSuchMethodError: android.os.HandlerThread.quitSafely`，直接闪退。
+     * dropbox 实锤（2026-10-22 16:57，v167）：栈落在 `...quitSafely` ← p2p 建组收尾路径。
+     *
+     * vc158 把 Wi-Fi Direct 从隐藏开关提升为「自动连接方式」一等选项后，
+     * API16 用户一点就会走到这条路径，崩溃随之暴露（此前几乎没人触发）。
+     *
+     * 低版本退化到 `quit()`（API 1+）：差别只是不等队列里剩余消息投递完。
+     * 本处是回调 looper，随建组成功/失败收尾一并停止，立即退出符合预期。
+     */
+    private fun HandlerThread.quitCompat() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) quitSafely() else quit()
     }
 
     // vc156：上游 compat 包 PlatformCompat 同名扩展内联（LocationManager.isLocationEnabled

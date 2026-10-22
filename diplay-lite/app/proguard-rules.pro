@@ -13,3 +13,11 @@
     native <methods>;
 }
 -keep class com.shilapi.xcertplay.transport.LegacyUsbHostNative { *; }
+
+# vc164：**所有**含 native 方法的类统一保留类名与方法名。
+# JNI 按包名+类名+方法名注册（Java_com_shilapi_xcertplay_…_nativeXxx），R8 改名即
+# NoSuchMethodError。已覆盖：NativeOpusDecoder/NativeOpusEncoder（API16 上音频
+# 必经此路，K60 是 API34 走 MediaCodec 探测不到这个坑）。未来新增 JNI 类自动纳入。
+-keepclasseswithmembernames class com.shilapi.xcertplay.** {
+    native <methods>;
+}

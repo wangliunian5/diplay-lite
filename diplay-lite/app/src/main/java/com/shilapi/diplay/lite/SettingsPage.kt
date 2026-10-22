@@ -27,6 +27,7 @@ import android.widget.TextView
 import android.widget.Toast
 import java.io.File
 import com.shilapi.xcertplay.transport.PcapTap
+import com.shilapi.xcertplay.usbbt.UsbBtBootstrapStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -131,6 +132,9 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var cbVoiceMedia: CheckBox
     // vc156（上游 0.2.21 预缓冲移植）：媒体预缓冲开关。
     private lateinit var cbPrebuffer: CheckBox
+    // vc166（外置 USB 蓝牙 dongle 实验第一步）：开关 + USB 设备枚举状态行。
+    private lateinit var cbUsbBt: CheckBox
+    private lateinit var usbBtSummary: TextView
     private lateinit var tvVersion: TextView
 
     // loadIntoForm 期间静默：setChecked 会触发监听，避免半加载状态写盘
@@ -153,8 +157,8 @@ class SettingsPage(private val activity: MainActivity) {
             buildContent(),
             FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT),
         )
-        // M6k23：悬浮球所有画面常驻 —— 右上角球点击返回主页。
-        attachPageBall(activity, root) { activity.goHome() }
+        // vc163：悬浮球已改为 MainActivity 全局常驻（render() 里统一挂载），
+        // 本页不再自建；点击语义（子页逐级返回）集中在 MainActivity 那一处。
         loadIntoForm()
         refreshAllDrawables()
         tvVersion.text = "版本 ${activity.readVersionName()}"
@@ -193,6 +197,10 @@ class SettingsPage(private val activity: MainActivity) {
         rbAutoP2p = radio("Wi-Fi Direct")
         rbAutoUsb = radio("USB连接")
         rgAutoChannel.addButtons(rbAutoCar, rbAutoRelay, rbAutoP2p, rbAutoUsb)
+        // vc164：按钮是折行（onMeasure 里的 relayout）时才挂进视图树的，
+        // loadIntoForm 后那次刷新扑空（当时还没有行）——必须等折行完成后再刷一次，
+        // 否则切页回来选中态不显示（四个全是空心圈，横竖屏都复现）。
+        rgAutoChannel.onRelayout = { refreshRadioDrawables(rgAutoChannel) }
         rgAutoChannel.setOnCheckedChangeListener {
             if (isLoading) return@setOnCheckedChangeListener
             refreshRadioDrawables(rgAutoChannel)
@@ -219,12 +227,7 @@ class SettingsPage(private val activity: MainActivity) {
         rgResolution.setOnCheckedChangeListener { _, _ ->
             if (isLoading) return@setOnCheckedChangeListener
             refreshRadioDrawables(rgResolution)
-            applyResModeButton.visibility =
-                if (currentResolutionMode() != LiteConfig.load(activity).resolutionMode) {
-                    View.VISIBLE
-                } else {
-                    View.GONE
-                }
+            updateApplyResButton()
         }
         val resModeRow = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -293,17 +296,11 @@ class SettingsPage(private val activity: MainActivity) {
             inputResH,
             LinearLayout.LayoutParams(dip(78), ViewGroup.LayoutParams.WRAP_CONTENT),
         )
-        val applyResButton = Button(activity).apply {
-            text = "应用"
-            textSize = 12f
-            minHeight = dip(34)
-            setAllCaps(false)
-            background = Ui.pillSolid(activity, Ui.PRIMARY)
-            setTextColor(Ui.PRIMARY_ON)
-            setPadding(dip(14), dip(5), dip(14), dip(5))
-            setOnClickListener { applyManualResolution() }
-        }
-        resRow.addView(applyResButton, rowStretch(dip(8)))
+        // vc164：手动行的「应用」按钮已删除，并入上方唯一的应用按钮（原来选模式
+        // 亮起一个、手动行又常亮一个，同屏两个应用按钮易混淆）。
+        // 宽高输入变化即时反映在应用按钮的显隐上；越界值由 persistFromForm 统一钳制。
+        inputResW.addTextChangedListener(simpleTextWatcher { updateApplyResButton() })
+        inputResH.addTextChangedListener(simpleTextWatcher { updateApplyResButton() })
         column.addView(resRow, block())
         // 计算说明：与「分辨率自定义」百分比联动。
         column.addView(
@@ -364,6 +361,7 @@ class SettingsPage(private val activity: MainActivity) {
         rbFps40 = radio("40帧")
         rbFps60 = radio("60帧")
         rgFps.addButtons(rbFps25, rbFps30, rbFps40, rbFps60)
+        rgFps.onRelayout = { refreshRadioDrawables(rgFps) }
         rgFps.setOnCheckedChangeListener {
             if (isLoading) return@setOnCheckedChangeListener
             refreshRadioDrawables(rgFps)
@@ -473,6 +471,21 @@ class SettingsPage(private val activity: MainActivity) {
         // 1.1.2（EU5 双向无声）：Siri/助手语音走媒体通道——ASSISTANT/NAVIGATION usage 在
         // PATEO 等老 HAL 上静音，勾选后改走媒体音量（媒体通道已实测出声）。
         cbVoiceMedia = checkbox("Siri/语音提示走媒体音量")
+        // vc166（外置 USB 蓝牙 dongle 实验第一步）：显式勾选后枚举 USB 设备显示摘要，
+        // 不申请权限、不打开设备；本开关当前无实际连接功能（协议栈未移植）。
+        cbUsbBt = checkbox("外置 USB 蓝牙（实验）")
+        usbBtSummary = TextView(activity).apply {
+            setTextColor(Ui.MUTED)
+            textSize = 12f
+            setPadding(dip(24), 0, dip(8), dip(2))
+        }
+        cbUsbBt.setOnCheckedChangeListener { buttonView, _ ->
+            buttonView.setButtonDrawable(Ui.checkbox(activity, buttonView.isChecked))
+            if (!isLoading) {
+                persistFromForm()
+                updateUsbBtSummary()
+            }
+        }
         // vc158：承载方式单选（车机热点 / Wi-Fi Direct）已删除——Wi-Fi Direct 改为
         // 「连接设置 → 自动连接方式」的第四项，语义不再重复。
         column.addView(cbBoot, block(bottom = dip(2)))
@@ -482,7 +495,9 @@ class SettingsPage(private val activity: MainActivity) {
         column.addView(cbAutoConnect, block(bottom = dip(2)))
         column.addView(cbSoftDecode, block(bottom = dip(2)))
         column.addView(cbSpeaker, block(bottom = dip(2)))
-        column.addView(cbVoiceMedia, block())
+        column.addView(cbVoiceMedia, block(bottom = dip(2)))
+        column.addView(cbUsbBt, block(bottom = dip(2)))
+        column.addView(usbBtSummary, block())
 
         // M6k23：自定义返回图标页（选图→裁剪→确认保存）。1.1.3：入口行 -3dp（按钮随行号缩小）。
         column.addView(entryRow("自定义返回图标") { activity.setPage("caricon") }, block(top = dip(14)))
@@ -960,7 +975,12 @@ class SettingsPage(private val activity: MainActivity) {
         cbSpeaker.isChecked = config.speakerForCalls
         cbVoiceMedia.isChecked = config.voiceRoutedToMedia
         cbPrebuffer.isChecked = config.audioPrebuffer
+        cbUsbBt.isChecked = config.usbBtDongle
         isLoading = false
+        // vc164：按载入后的实际值决定应用按钮显隐（isLoading=false 后才不会被守卫拦掉）
+        updateApplyResButton()
+        // vc166：USB 蓝牙实验开关状态行回显
+        updateUsbBtSummary()
     }
 
     /**
@@ -1028,6 +1048,7 @@ class SettingsPage(private val activity: MainActivity) {
                 speakerForCalls = cbSpeaker.isChecked,
                 voiceRoutedToMedia = cbVoiceMedia.isChecked,
                 audioPrebuffer = cbPrebuffer.isChecked,
+                usbBtDongle = cbUsbBt.isChecked,
                 softwareVideoDecoder = cbSoftDecode.isChecked,
                 orientationMode = currentOrientationMode(),
                 avPathMode = if (rbAvBt.isChecked) "bt_audio" else "full",
@@ -1054,43 +1075,38 @@ class SettingsPage(private val activity: MainActivity) {
         else -> "fit"
     }
 
-    /** 1.0.29：手动分辨率显式提交：320-4096 整数校验，确认后与分辨率自定义同款流程（重启生效）。 */
-    private fun applyManualResolution() {
-        val w = inputResW.text.toString().trim().toIntOrNull()
-        val h = inputResH.text.toString().trim().toIntOrNull()
-        val range = "${LiteConfig.MIN_MANUAL_RESOLUTION} - ${LiteConfig.MAX_MANUAL_RESOLUTION}"
-        if (w == null || h == null ||
-            w < LiteConfig.MIN_MANUAL_RESOLUTION || w > LiteConfig.MAX_MANUAL_RESOLUTION ||
-            h < LiteConfig.MIN_MANUAL_RESOLUTION || h > LiteConfig.MAX_MANUAL_RESOLUTION
-        ) {
-            toast("请输入 $range 的整数（横、纵各一个）")
-            return
-        }
-        val current = LiteConfig.load(activity)
-        if (w == current.manualWidth && h == current.manualHeight) {
-            toast("分辨率未变化：${w}×$h")
-            return
-        }
-        inputResW.setText(w.toString())
-        inputResH.setText(h.toString())
-        AppDialog.Builder(activity)
-            .setTitle("确认修改分辨率")
-            .setMessage(
-                "原分辨率：${current.manualWidth}×${current.manualHeight}，确认修改为 ${w}×$h 吗？\n\n" +
-                    "回报给 iPhone 的实际分辨率 = 该值 ×「分辨率自定义」百分比。\n\n" +
-                    "点击「应用」后保存，下次连接生效。",
-            )
-            .setNegativeButton("取消") { _, _ ->
-                inputResW.setText(current.manualWidth.toString())
-                inputResH.setText(current.manualHeight.toString())
-            }
-            .setPositiveButton("应用") { _, _ ->
-                persistFromForm()
-                // vc147：不再重建界面，参数下次连接生效（渲染端丢失竞态定案）。
-                toast("分辨率已保存：${w}×$h，下次连接生效")
-            }
-            .show()
+    /** vc164：分辨率块是否有未应用的改动（模式或手动宽高任一变化即 true）。 */
+    private fun resolutionPendingChanged(): Boolean {
+        val saved = LiteConfig.load(activity)
+        if (currentResolutionMode() != saved.resolutionMode) return true
+        val w = inputResW.text.toString().trim().toIntOrNull() ?: saved.manualWidth
+        val h = inputResH.text.toString().trim().toIntOrNull() ?: saved.manualHeight
+        return w != saved.manualWidth || h != saved.manualHeight
     }
+
+    /** vc164：唯一的应用按钮显隐（模式或手动宽高有未应用改动时亮起）。 */
+    /** vc166：USB 蓝牙实验开关状态行；vc167：勾选时改调 usbbt 探活状态（连接过一次即显示逐级进度）。 */
+    private fun updateUsbBtSummary() {
+        usbBtSummary.text = if (cbUsbBt.isChecked) {
+            UsbBtBootstrapStream.describe(activity)
+        } else {
+            "已关闭。勾选后连接时将探测 USB dongle。"
+        }
+    }
+
+    private fun updateApplyResButton() {
+        if (isLoading) return
+        applyResModeButton.visibility =
+            if (resolutionPendingChanged()) View.VISIBLE else View.GONE
+    }
+
+    /** TextWatcher 样板收敛（只关心 afterTextChanged）。 */
+    private fun simpleTextWatcher(onChange: () -> Unit): android.text.TextWatcher =
+        object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) = onChange()
+        }
 
     /** 分辨率显式提交：10-150 钳位；与当前值不同时弹确认（含 >100 超采样警告），确认后下次连接生效。 */
     private fun applyScale(input: EditText) {

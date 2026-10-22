@@ -60,8 +60,7 @@ class HotspotPage(private val activity: MainActivity, private val mode: String) 
         applyOrientationMode(activity, LiteConfig.load(activity).orientationMode)
         val root = FrameLayout(activity).apply { setBackgroundColor(Ui.BG) }
         root.addView(buildContent())
-        // M6k23：悬浮球所有画面常驻 —— 右上角球点击返回主页。
-        attachPageBall(activity, root) { activity.setPage("settings") }
+        // vc163：悬浮球已改为 MainActivity 全局常驻，本页不再自建。
         loadIntoForm()
         LiteLog.log("ui", "热点配置页打开：$mode")
         return root

@@ -101,6 +101,10 @@ class MainActivity : Activity() {
     private var videoStretchMode = false
     private lateinit var panel: View
     private lateinit var ballRoot: View
+    // vc163：全局悬浮球位置（跨页面保留；null = 尚未拖动过，用默认初始位）。
+    // 拖拽结束时由 attachBallDrag 写入；render() 重建球时读回，切页不再复位。
+    private var ballTopMargin: Int? = null
+    private var ballRightMargin: Int? = null
     private lateinit var statusDot: View
     private lateinit var statusLine: TextView
     // FAILED 态的居中小卡片（标题 + 3 行省略 + 结束）。
@@ -753,52 +757,64 @@ class MainActivity : Activity() {
         }
         root.addView(panel, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
-        if (page == "home") {
-            // M4k/M6k：可拖拽悬浮球，面板收起后的唯一唤回入口（home 专属；子页用 attachPageBall）。
-            val ball = FrameLayout(this).apply {
-                background = Ui.pillSolid(this@MainActivity, 0x66FFFFFF).apply { cornerRadius = dip(23).toFloat() }
-                // setClipToOutline 是 API 18+；部分白牌 ROM（山海等）谎报 SDK_INT≥18 但 framework 缺方法，
-                // SDK_INT 护栏拦不住 → 改反射探测，方法不存在时静默跳过。
-                runCatching {
-                    FrameLayout::class.java
-                        .getMethod("setClipToOutline", Boolean::class.javaPrimitiveType)
-                        .invoke(this, true)
-                }
+        // vc163：**全局悬浮球**——所有页面常驻，不再由各子页各自 attachPageBall 建一个。
+        // 原先是两套球：home 用这里可拖拽的，子页各自 attachPageBall 建一个不可拖的，
+        // 行为与位置都不统一，切页还会闪。现合并成一个，位置跨页面保留。
+        val ball = FrameLayout(this).apply {
+            background = Ui.pillSolid(this@MainActivity, 0x66FFFFFF).apply { cornerRadius = dip(23).toFloat() }
+            // setClipToOutline 是 API 18+；部分白牌 ROM（山海等）谎报 SDK_INT≥18 但 framework 缺方法，
+            // SDK_INT 护栏拦不住 → 改反射探测，方法不存在时静默跳过。
+            runCatching {
+                FrameLayout::class.java
+                    .getMethod("setClipToOutline", Boolean::class.javaPrimitiveType)
+                    .invoke(this, true)
             }
-            val ballIcon = ImageView(this).apply {
-                setImageDrawable(IconPainter.arrows(this@MainActivity, 20, Ui.TEXT))
+        }
+        val ballIcon = ImageView(this).apply {
+            setImageDrawable(IconPainter.arrows(this@MainActivity, 20, Ui.TEXT))
+        }
+        ball.addView(
+            ballIcon,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER),
+        )
+        // 点击语义集中在此一处（不是按页各写一遍）：home=收起/唤出面板，子页=逐级返回。
+        ball.setOnClickListener {
+            when (page) {
+                "home" -> setPanelVisible(!panelVisible)
+                "settings" -> goHome()
+                else -> setPage("settings")
             }
-            ball.addView(
-                ballIcon,
-                FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER),
-            )
-            ball.setOnClickListener { setPanelVisible(!panelVisible) }
-            // 悬浮球初始位置 = 右对齐 + 上下居中；拖拽后吸附最近左/右边。
-            // 1.1.1 UI：横屏（1024x600 车机）右列按键加高后与球重叠 → 初始位改右下角空区；
-            // 竖屏右列窄，保持垂直居中。
-            val ballSize = dip(46)
-            val ballParams = FrameLayout.LayoutParams(ballSize, ballSize, Gravity.TOP or Gravity.END)
-            ballParams.topMargin = if (isLandscapeUi()) {
-                resources.displayMetrics.heightPixels - ballSize - dip(28)
-            } else {
-                ((resources.displayMetrics.heightPixels - ballSize) / 2).coerceAtLeast(0)
-            }
-            ballParams.rightMargin = dip(12)
-            ball.layoutParams = ballParams
-            attachBallDrag(ball, ballParams)
-            ballRoot = ball
-            root.addView(ball, ballParams)
-            // vc146（T3 实测）：wm overscan 车机（1024x600 屏、可视仅 500）上
-            // displayMetrics.heightPixels=600 会把球初始位算到可视区外（y≈526>500），
-            // 球被系统黑条吞掉。布局完成后按 root 实际高度校正一次。
+        }
+        // 悬浮球初始位置 = 右对齐 + 上下居中；拖拽后吸附最近左/右边。
+        // 1.1.1 UI：横屏（1024x600 车机）右列按键加高后与球重叠 → 初始位改右下角空区；
+        // 竖屏右列窄，保持垂直居中。vc163：拖过就沿用上次的边距，不再每次重建都复位。
+        val ballSize = dip(46)
+        val ballParams = FrameLayout.LayoutParams(ballSize, ballSize, Gravity.TOP or Gravity.END)
+        val dmH = resources.displayMetrics.heightPixels
+        ballParams.topMargin = ballTopMargin ?: if (isLandscapeUi()) {
+            dmH - ballSize - dip(28)
+        } else {
+            ((dmH - ballSize) / 2).coerceAtLeast(0)
+        }
+        ballParams.rightMargin = ballRightMargin ?: dip(12)
+        ball.layoutParams = ballParams
+        attachBallDrag(ball, ballParams)
+        ballRoot = ball
+        root.addView(ball, ballParams)
+        // vc146（T3 实测）：wm overscan 车机（1024x600 屏、可视仅 500）上
+        // displayMetrics.heightPixels=600 会把球初始位算到可视区外（y≈526>500），
+        // 球被系统黑条吞掉。布局完成后按 root 实际高度校正一次。
+        // vc163：仅在从未拖动过时校正，否则会把用户拖好的位置又改回默认。
+        if (ballTopMargin == null) {
             ball.post {
                 val rh = root.height
-                if (rh > 0 && rh < resources.displayMetrics.heightPixels) {
+                if (rh > 0 && rh < dmH) {
                     ballParams.topMargin = if (isLandscapeUi()) {
                         rh - ballSize - dip(28)
                     } else {
                         ((rh - ballSize) / 2).coerceAtLeast(0)
                     }
+                    ballTopMargin = ballParams.topMargin
                     ball.layoutParams = ballParams
                 }
             }
@@ -1053,7 +1069,11 @@ class MainActivity : Activity() {
         panelVisible = visible
         // M6k25：子页没有面板显隐机制 —— 只记录状态，回主页 render 时按状态生效。
         // （避免 refreshTask 的 setPanelVisible(!active) 把正在看的子页整个隐藏。）
-        if (page != "home") return
+        if (page != "home") {
+            // vc163：子页面板常显，全局悬浮球保持醒目（不再淡化）。
+            ballRoot.alpha = 1f
+            return
+        }
         panel.visibility = if (visible) View.VISIBLE else View.GONE
         // 面板展开时悬浮球淡化（避免和标题栏抢视觉），收起时恢复醒目。
         ballRoot.alpha = if (visible) 0.5f else 1f
@@ -1090,6 +1110,9 @@ class MainActivity : Activity() {
                         val maxTop = ((parent?.height ?: 0) - view.height).coerceAtLeast(0)
                         params.rightMargin = (downRight - dx).coerceIn(0, maxRight)
                         params.topMargin = (downTop + dy).coerceIn(0, maxTop)
+                        // vc163：全局球位置持久化，切页重建时沿用
+                        ballRightMargin = params.rightMargin
+                        ballTopMargin = params.topMargin
                         view.layoutParams = params
                     }
                     true
@@ -1106,6 +1129,9 @@ class MainActivity : Activity() {
                             } else {
                                 (parentWidth - view.width - dip(12)).coerceAtLeast(0)
                             }
+                            // vc163：吸边后的最终位置也要记住
+                            ballRightMargin = params.rightMargin
+                            ballTopMargin = params.topMargin
                             view.layoutParams = params
                         }
                     } else {

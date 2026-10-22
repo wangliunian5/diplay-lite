@@ -236,9 +236,16 @@ class AppDialog private constructor(
         fun setMessage(text: CharSequence) = apply { message = text }
         fun setView(v: View) = apply { customView = v }
 
+        /**
+         * 普通列表项：与 AlertDialog 一致，**选中后自动关闭**。
+         * （单选列表 setSingleChoiceItems 相反——点选只改选中态，等用户按「保存」。）
+         */
         fun setItems(list: Array<out String>, listener: (AppDialog, Int) -> Unit) = apply {
             items = list
-            onItem = listener
+            onItem = { d, which ->
+                listener(d, which)
+                d.dismiss()
+            }
         }
 
         fun setSingleChoiceItems(
@@ -251,16 +258,33 @@ class AppDialog private constructor(
             onSingleChoice = listener
         }
 
+        /**
+         * vc165：**点按钮即关闭**（与原 AlertDialog 行为一致）。
+         *
+         * 此前只在 listener 为 null 时才 dismiss，而这些回调大多**没有自己关闭弹窗**
+         * （原 AlertDialog 是自动关的，所以调用方从来没写过 dismiss）——
+         * 表现即「点了没反应」：音视频传输方式弹窗的「取消」、运行日志的「清空」
+         * 只做刷新/清缓冲然后弹窗杳然不动（K60 实测实锤）。
+         * 现统一：先回调，再关闭。
+         */
         fun setPositiveButton(text: String, listener: ((AppDialog, Int) -> Unit)? = null) = apply {
-            positive = ButtonSpec(text) { d -> listener?.invoke(d, 0) ?: d.dismiss() }
+            positive = buttonSpec(text, listener)
         }
 
         fun setNegativeButton(text: String, listener: ((AppDialog, Int) -> Unit)? = null) = apply {
-            negative = ButtonSpec(text) { d -> listener?.invoke(d, 0) ?: d.dismiss() }
+            negative = buttonSpec(text, listener)
         }
 
         fun setNeutralButton(text: String, listener: ((AppDialog, Int) -> Unit)? = null) = apply {
-            neutral = ButtonSpec(text) { d -> listener?.invoke(d, 0) ?: d.dismiss() }
+            neutral = buttonSpec(text, listener)
+        }
+
+        private fun buttonSpec(
+            text: String,
+            listener: ((AppDialog, Int) -> Unit)?,
+        ): ButtonSpec = ButtonSpec(text) { d ->
+            listener?.invoke(d, 0)
+            d.dismiss()
         }
 
         fun setCancelable(flag: Boolean) = apply { cancelable = flag }

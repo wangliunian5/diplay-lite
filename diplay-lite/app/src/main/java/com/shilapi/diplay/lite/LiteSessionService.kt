@@ -451,6 +451,8 @@ class LiteSessionService : Service() {
                     wirelessBluetoothDeviceAddress = config.bluetoothAddress.takeIf { it.isNotBlank() },
                     // 1.1.6(vc76)：TS7 无 root 裁决实验——本包关闭有线 cdc_ncm 解绑守护。
                     wiredNcmGuardEnabled = BuildConfig.WIRED_NCM_GUARD_ENABLED,
+                    // vc167（外置 USB 蓝牙 dongle 第 2 步）：开关透传到控制器建链处。
+                    usbBtDongle = config.usbBtDongle,
                 ),
                 airPlayConfig = AirPlayConfig(
                     // 1.0.17：显示名称可自定义（自定义返回图标页），默认 DiPlay；流向 /info name + Bonjour 服务名。
@@ -576,6 +578,14 @@ class LiteSessionService : Service() {
             "enabling relay network" in m -> "启用中继网络失败，请重试"
             "wi-fi is off" in m -> "车机Wi-Fi未开启：中继模式需先打开Wi-Fi"
             "car hotspot is off" in m -> "车机热点未开启：请到车机设置打开热点后重试"
+            // vc170：Wi-Fi Direct 在部分机型上是**硬件/ROM 层面不支持**（C8815 实测：
+            // createGroup 1ms 即回 code=1 / P2P_UNSUPPORTED，非超时非信号）。
+            // 原串来自 WifiP2pGroupManager 的 P2P_UNSUPPORTED 分支（英文），
+            // 这里给出中文并指明可改用的通道，避免用户反复白试。
+            "wi-fi p2p is unsupported" in m ->
+                "该机型不支持 Wi-Fi Direct（P2P）：请在「自动连接方式」改用「车机热点」或「中继热点」"
+            "p2p_unsupported" in m ->
+                "该机型不支持 Wi-Fi Direct（P2P）：请在「自动连接方式」改用「车机热点」或「中继热点」"
             "manual hotspot ssid is not configured" in m -> "当前是车机热点模式，未配置SSID，无法连接"
             "could not establish" in m && "hotspot" in m ->
                 "建立网络失败：${message.substringAfterLast(": ", message)}"

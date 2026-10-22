@@ -72,6 +72,7 @@ import com.shilapi.xcertplay.transport.IphoneUsbMatcher
 import com.shilapi.xcertplay.transport.LockdownCarKitClient
 import com.shilapi.xcertplay.transport.LockdownPairingClient
 import com.shilapi.xcertplay.transport.LockdownPairRecord
+import com.shilapi.xcertplay.usbbt.UsbBtBootstrapStream
 import com.shilapi.xcertplay.transport.NcmFunctionDiscovery
 import com.shilapi.xcertplay.transport.NcmUsbBridge
 import com.shilapi.xcertplay.vehicle.BluetoothAudioHandoff
@@ -215,7 +216,7 @@ class CarPlayController(
     @Volatile private var lastHotspotInfo: WirelessHotspotInfo? = null
     @Volatile private var bonjour: CarPlayBonjour? = null
     @Volatile private var bluetoothSocket: BluetoothSocket? = null
-    @Volatile private var bluetoothStream: BluetoothRfcommDuplexStream? = null
+    @Volatile private var bluetoothStream: BlockingDuplexByteStream? = null
     @Volatile private var wirelessTunnelChannel: Iap2Session? = null
     @Volatile private var wirelessIdentification: Iap2IdentificationConfig? = null
     @Volatile private var wirelessAirPlayEndpoint: Iap2WirelessCarPlayEndpoint? = null
@@ -1047,7 +1048,14 @@ class CarPlayController(
                 closeWirelessStack()
                 return
             }
-            val stream = BluetoothRfcommDuplexStream(socket).also { bluetoothStream = it }
+            // vc167（外置 USB 蓝牙 dongle 第 2 步）：开关开启时改走 usbbt 探活流
+            // （枚举→openDevice→HCI Reset→BD_ADDR，B 批；协议栈未就绪会抛明确异常）。
+            // 未启用时必须走原分支，行为与此前完全一致——下方 btProbeMode 三轮握手一律不动。
+            val stream = if (config.usbBtDongle) {
+                UsbBtBootstrapStream.open(context)
+            } else {
+                BluetoothRfcommDuplexStream(socket)
+            }.also { bluetoothStream = it }
             // [BT-PROBE] t3 蓝牙兼容实验：每代连接轮换一次握手策略，一轮重试拿满三种模式的现场。
             // mode 0 = 现行（发 Marker，等 iPhone 回 Marker 后协商）
             // mode 1 = 静默等待（不发 Marker，纯等 iPhone 先发 Marker）
@@ -1270,14 +1278,21 @@ class CarPlayController(
         }
         val failureClass = lastWirelessFailureClass ?: wirelessFailureClass(error)
         lastWirelessFailureClass = null
-        // 1.1.3（8815 230420 定案）：SDP 发现失败族 = iPhone iAP2 服务未在广播（残留会话），
-        // 自动重试治不了；连续 2 次即给用户明确指引，不再让用户盲试。
+        // 1.1.3（8815 230420 定案）**已于 vc168 证伪**，此处仅保留计数与提示骨架：
+        // 旧定案认为本族 = "iPhone iAP2 服务未在广播（残留会话）"，但 20261022 的 C8815
+        // 日志显示失败时探测 **services=12 且含 iAP2 UUID、iap2Visible=true** —— 服务在广播，
+        // 失败点在框架 `BluetoothSocket$SdpHelper.doSdp`。因此：
+        // ①文案不再声称"iPhone 服务不可见"（会误导用户与后续排查）；
+        // ②保留"重开 iPhone 蓝牙"作为兜底动作（它确实能重置 iPhone 侧 SDP，偶发有效），
+        //   但表述为"蓝牙连接不稳定"而非"服务不可见"。
+        // 真正的判据交给 openWirelessRfcommSocket() 里的 sdpProbe(pre/round/final)。
         if (failureClass == "SERVICE_DISCOVERY_FAILED") {
             sdpFailureConsecutiveCount++
             if (sdpFailureConsecutiveCount == SDP_FAILURE_HINT_AFTER) {
                 onStatus(
                     CarPlayStatus.RecoveryHint(
-                        "iPhone 蓝牙服务不可见（多为残留会话）；请关闭再打开 iPhone 蓝牙后重试",
+                        "蓝牙连接不稳定（车机侧服务发现失败，iPhone 侧服务仍在广播）；" +
+                            "请稍候重试，或关闭再打开 iPhone 蓝牙",
                     ),
                 )
             }
@@ -2103,59 +2118,109 @@ class CarPlayController(
      * 十余次失败（T14 手点 7 次才连上的同族问题），此前每轮重试都用同一种套接字：
      * ①建链前取消适配器在跑的发现——发现扫描与 SDP 建链冲突是老栈的经典坑；
      * ②安全口失败后回落不安全口（API10+；MFi 鉴权在 iAP2 层完成，不依赖 RFCOMM 加密）。
+     *
+     * ## vc168：**原定案已被日志证伪，见下方 sdpProbe() 注释。** 失败不是"iPhone 没广播
+     * iAP2"，而是**框架 `BluetoothSocket$SdpHelper.doSdp` 自己的 SDP 查询失败**。
+     * 本轮据此做三件便宜的事，全部靠日志判据决定下一步：
+     * ①**建链前**先 SDP（原仅失败路径才探）——部分栈的 helper 会读缓存；
+     * ②`cancelDiscovery()` 是异步的，补一个收敛等待窗口；
+     * ③两种口各试一次就放弃太急，改为**多轮退避重试**。
      */
     private fun openWirelessRfcommSocket(device: BluetoothDevice): BluetoothSocket {
-        bluetoothAdapter?.takeIf { it.isDiscovering }?.let { adapter ->
+        // ①建链前先探一次 SDP（vc168）——原实现只在失败后才探，无法区分
+        // "服务不在" 与 "服务在但框架 SDP 失败"。
+        sdpProbe(device, "pre")
+
+        // ②取消发现并给栈收敛时间（原实现 cancelDiscovery 后立刻建链，而它是异步的）
+        if (bluetoothAdapter?.isDiscovering == true) {
             debugLog("wireless RFCOMM canceling discovery before connect")
-            adapter.cancelDiscovery()
+            runCatching { bluetoothAdapter?.cancelDiscovery() }
+            runCatching { Thread.sleep(DISCOVERY_CANCEL_SETTLE_MILLIS) }
+            debugLog(
+                "wireless RFCOMM discovery settle ${DISCOVERY_CANCEL_SETTLE_MILLIS}ms, " +
+                    "discovering=${bluetoothAdapter?.isDiscovering}",
+            )
         }
+
         var lastFailure: Throwable? = null
-        val modes = listOf("secure", "insecure")
-        for ((index, mode) in modes.withIndex()) {
-            try {
-                val uuid = UUID.fromString(IAP2_IPHONE_UUID)
-                val socket = if (mode == "secure") {
-                    device.createRfcommSocketToServiceRecord(uuid)
-                } else {
-                    device.createInsecureRfcommSocketToServiceRecord(uuid)
-                }.also { bluetoothSocket = it }
-                debugLog(
-                    "wireless RFCOMM connecting address=${device.address} " +
-                        "mode=$mode uuid=$IAP2_IPHONE_UUID",
-                )
-                connectBluetoothSocket(socket, device.address)
-                return socket
-            } catch (failure: Throwable) {
-                lastFailure = failure
-                debugLog(
-                    "wireless RFCOMM connect ($mode) failed: " +
-                        (failure.message ?: failure.javaClass.simpleName),
-                )
-                runCatching { bluetoothSocket?.close() }
-                if (index < modes.lastIndex) {
-                    bluetoothAdapter?.takeIf { it.isDiscovering }?.let { adapter ->
-                        debugLog("wireless RFCOMM canceling discovery before fallback")
-                        adapter.cancelDiscovery()
-                    }
-                    runCatching { Thread.sleep(RFCOMM_FALLBACK_DELAY_MILLIS) }
+        // ③多轮退避重试（原为 secure+insecure 各一次即放弃）
+        for (round in 0 until RFCOMM_ROUNDS) {
+            for (mode in listOf("secure", "insecure")) {
+                val startedAt = System.currentTimeMillis()
+                try {
+                    val uuid = UUID.fromString(IAP2_IPHONE_UUID)
+                    val socket = if (mode == "secure") {
+                        device.createRfcommSocketToServiceRecord(uuid)
+                    } else {
+                        device.createInsecureRfcommSocketToServiceRecord(uuid)
+                    }.also { bluetoothSocket = it }
+                    debugLog(
+                        "wireless RFCOMM connecting address=${device.address} " +
+                            "mode=$mode round=$round/${RFCOMM_ROUNDS} uuid=$IAP2_IPHONE_UUID",
+                    )
+                    connectBluetoothSocket(socket, device.address)
+                    debugLog(
+                        "wireless RFCOMM connected address=${device.address} " +
+                            "mode=$mode round=$round elapsedMs=${System.currentTimeMillis() - startedAt}",
+                    )
+                    return socket
+                } catch (failure: Throwable) {
+                    lastFailure = failure
+                    debugLog(
+                        "wireless RFCOMM connect ($mode) failed round=$round " +
+                            "elapsedMs=${System.currentTimeMillis() - startedAt}: " +
+                            (failure.message ?: failure.javaClass.simpleName),
+                    )
+                    runCatching { bluetoothSocket?.close() }
+                    bluetoothSocket = null
                 }
+            }
+            if (round < RFCOMM_ROUNDS - 1) {
+                // 每轮之间再探一次 SDP：观察"服务是否仍在广播"随时间的变化
+                sdpProbe(device, "round$round")
+                if (bluetoothAdapter?.isDiscovering == true) {
+                    debugLog("wireless RFCOMM canceling discovery before next round")
+                    runCatching { bluetoothAdapter?.cancelDiscovery() }
+                }
+                val backoff = RFCOMM_ROUND_BACKOFF_MILLIS[round]
+                runCatching { Thread.sleep(backoff) }
             }
         }
         val failure = lastFailure ?: IOException("RFCOMM connect failed")
-        // 1.1.3（8815 230420 定案）：两种口都失败，多半是 iPhone SDP 上已无 iAP2 服务
-        //（残留会话）。主动拉一次 SDP 服务列表落日志——坐实「iAP2 不在广播列」而非盲猜。
-        // fetchUuidsWithSdp 异步回调后短暂等待再读 device.uuids（仅失败路径，不加正常时延）。
-        runCatching {
+        // 全轮失败：最终再探一次，坐实"服务仍在广播但框架 SDP 建不了链"
+        sdpProbe(device, "final")
+        throw failure
+    }
+
+    /**
+     * vc168：主动拉一次 iPhone 的 SDP 服务列表并落日志。
+     *
+     * **这条探针推翻了 1.1.3（8815 230420）的旧定案。** 旧定案认为"两种口都失败 =
+     * iPhone SDP 上已无 iAP2 服务（残留会话）"，而 20261022 的 C8815 日志显示：
+     * 失败后探测 **services=12，列表中明确含 `00000000-deca-fade-deca-deafdecacafe`，
+     * iap2Visible=true** —— 服务**在**广播。真正的失败点在框架
+     * `BluetoothSocket$SdpHelper.doSdp`（建 socket 时重新做一次 SDP 的那一步）。
+     *
+     * 因此 vc168 把它前移到建链前，并在每轮之间、最终失败时各探一次，
+     * 用"服务可见性 ✕ 建链结果"的交叉判据区分：
+     * - 可见 + 建链成功 ⇒ 时序/缓存问题（本轮修复有效）
+     * - 可见 + 全轮失败 ⇒ 框架 SDP 在此 ROM 不可用（需 vc169 反射建 channel socket）
+     * - 不可见 ⇒ 才是旧定案说的"iPhone 未广播"，按残留会话处理
+     */
+    private fun sdpProbe(device: BluetoothDevice, tag: String): Boolean {
+        return runCatching {
             device.fetchUuidsWithSdp()
             Thread.sleep(SDP_QUERY_SETTLE_MILLIS)
             val advertised = device.uuids?.map { u -> u.uuid.toString() }.orEmpty()
+            val visible = advertised.any { u -> u.equals(IAP2_IPHONE_UUID, ignoreCase = true) }
             debugLog(
-                "wireless RFCOMM SDP probe address=${device.address} " +
-                    "services=${advertised.size} list=$advertised " +
-                    "iap2Visible=${advertised.any { u -> u.equals(IAP2_IPHONE_UUID, ignoreCase = true) }}",
+                "wireless RFCOMM SDP probe[$tag] address=${device.address} " +
+                    "services=${advertised.size} iap2Visible=$visible list=$advertised",
             )
-        }.onFailure { debugLog("wireless RFCOMM SDP probe failed: ${it.message}") }
-        throw failure
+            visible
+        }.onFailure {
+            debugLog("wireless RFCOMM SDP probe[$tag] failed: ${it.message}")
+        }.getOrDefault(false)
     }
 
     private fun connectBluetoothSocket(socket: BluetoothSocket, address: String) {
@@ -3951,6 +4016,14 @@ class CarPlayController(
         )
         private const val RFCOMM_CONNECT_TIMEOUT_MILLIS = 15_000L
         private const val RFCOMM_FALLBACK_DELAY_MILLIS = 150L
+        // vc168（RFCOMM 建链实验轮）：
+        // - cancelDiscovery() 是异步的，原实现取消后立刻建链；给它一个收敛窗口。
+        // - 多轮退避重试：原实现 secure+insecure 各一次即放弃，而日志显示偶发能连上
+        //   （car 13 次成功 2、relay 3 次成功 1），加大重试机会。
+        // 三者都是"便宜假设"，靠 sdpProbe 的交叉判据验证，无效则上 vc169 反射方案。
+        private const val DISCOVERY_CANCEL_SETTLE_MILLIS = 400L
+        private const val RFCOMM_ROUNDS = 3
+        private val RFCOMM_ROUND_BACKOFF_MILLIS = longArrayOf(600L, 1_500L)
         // 1.1.3：SDP 探测等待（fetchUuidsWithSdp 异步回调落缓存）与连续失败提示阈值。
         private const val SDP_QUERY_SETTLE_MILLIS = 1_500L
         private const val SDP_FAILURE_HINT_AFTER = 2

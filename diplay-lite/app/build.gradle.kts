@@ -242,7 +242,15 @@ android {
         //   ①SET_INTERFACE 改描述符驱动 alt + 5次×100ms 重试（cdc_ncm claim/SET 间抢绑竞速）
         //   ②NCM 复用 usbmux 会话同一 fd（内核 claim 位图按 fd 记账，双 fd 割裂=KK ENOENT 根因）
         //   ③SETCONFIGURATION(6) 后 GET_CONFIGURATION 回读验证（errno=0≠内核真切过去）。
-        versionName = "1.2.0"
+        // vc164：版本号开始迭代——versionName 第三位随每次出包 +1（1.2.0 基线 = vc160）。
+        // 每次出包只改 versionPatch 一个数字（+1）：vc164 → 1.2.1，vc165 → 1.2.2，依此 +1。
+        // vc166（外置 USB 蓝牙 dongle 第一步）：版本标记 + 实验开关 + USB 设备探测显示
+        //（UsbDongleProbe.kt 只枚举不打开；前提验证：T3 插 dongle 能否被系统枚举）。
+        // vc167（第二步）：落 A+B 批——usbbt 开关接入 CarPlayController 建链缝 +
+        // USB 传输层探活（枚举→openDevice→HCI Reset→读 BD_ADDR）；UsbDongleProbe
+        // 枚举能力收进 shared/.../usbbt/UsbBtSession 并删除。
+        val versionPatch = 5
+        versionName = "1.2.$versionPatch.dongle"
         // vc143：USBMUX 握手超时 60s→20s（快速进入 full-reset 重试）+ 重试轮次显示
         // （复位提示此前 8s 被覆盖、静默期观感=卡死）。17:40 会话实证 vc142 自愈链路正常。
         // vc144：NCM 同步读成功后 settle 1ms 再 arm 下一次传输——vc143-snap-2008 定案
@@ -300,7 +308,12 @@ android {
         // vc162：横竖屏确认后的重启方式由「Launcher intent + killProcess」改为
         // activity.recreate()——避免 startActivity 未送达就被杀（点了没起来），
         // 且走完整生命周期让 onDestroy 优雅拆栈（原实现不执行 onDestroy）。
-        versionCode = 162
+        // vc163：**悬浮球全局化**——原先是两套球（home 可拖拽 46dp + 子页各自
+        // attachPageBall 建的 34dp 不可拖），视觉/交互/位置都不统一且切页闪烁。
+        // 改为 MainActivity.render() 里挂一颗全局球，所有页面共用、可拖拽、
+        // 位置跨页面保留；点击语义集中一处（home=收起/唤出面板，子页=逐级返回）；
+        // 删除 UiKit.attachPageBall 与三个子页的调用点。
+        versionCode = 170
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties

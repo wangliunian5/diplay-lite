@@ -41,6 +41,9 @@ data class LiteConfig(
     // 开 = 音乐起播/复播水位抬到约 1s，抗 Wi-Fi 断流；关 = 维持 mediaBufferMillis 原阈值
     // （起播更快）。仅媒体流生效，通话/Siri 低延迟流不受影响；重新连接后生效。
     val audioPrebuffer: Boolean = true,
+    // vc166（外置 USB 蓝牙 dongle 实验第一步）：仅控制设置页探测显示，
+    // 不参与任何连接逻辑（协议栈未移植；本开关无实际功能作用）。
+    val usbBtDongle: Boolean = false,
 
     /** vc109：底部触摸失灵区占比‰（0=关闭）。仅影响视频视图高度与触摸映射。 */
     val touchTrimBottomPermille: Int = 0,
@@ -161,6 +164,8 @@ data class LiteConfig(
                 mediaBufferMillis = prefs.getInt("media_buffer_millis", 300),
                 // vc156：媒体预缓冲开关（默认开）。
                 audioPrebuffer = prefs.getBoolean("audio_prebuffer", true),
+                // vc166：外置 USB 蓝牙实验开关（仅探测显示）。
+                usbBtDongle = prefs.getBoolean("usb_bt_dongle", false),
                 // vc109（T3 触摸屏下沿物理失灵）：0=关闭；>0=底部失灵区占比‰（154≈1/6.5）。
                 // 视频视图缩进顶部有效区，触摸映射基于视图尺寸自动重映射，死区天然丢弃。
                 touchTrimBottomPermille = prefs.getInt("touch_trim_bottom_permille", 0),
@@ -223,6 +228,7 @@ data class LiteConfig(
                 .putString("bt_audio_info_variant", config.btAudioInfoVariant)
                 .putInt("media_buffer_millis", config.mediaBufferMillis)
                 .putBoolean("audio_prebuffer", config.audioPrebuffer)
+                .putBoolean("usb_bt_dongle", config.usbBtDongle)
                 .putInt("touch_trim_bottom_permille", config.touchTrimBottomPermille)
                 // vc59 修复（8815 实测）：分辨率设定三键漏写——load 读 video_resolution_mode/
                 // manual_resolution_w/h，但 save 从未写入，导致「手动设定分辨率」确认重启后
