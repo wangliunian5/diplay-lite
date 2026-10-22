@@ -8,7 +8,6 @@ import android.content.IntentFilter
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
-import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
@@ -139,7 +138,12 @@ class MainActivity : Activity() {
 
     private val autostartPoll = object : Runnable {
         override fun run() {
-            if (!autostartWaitActive || !isFinishing) return
+            // vc177（20261023）：此处原为 `!isFinishing`——Activity 存活时 isFinishing=false
+            // ⇒ !isFinishing 恒真 ⇒ 轮询体**从不执行**、也不再 postDelayed，自启等待永远停在
+            // 「等待中」直到 60s 超时弹窗，实际从未发起自动连接（「上车即连」形同虚设）。
+            // 正确语义是「等待未激活 或 页面正在结束 ⇒ 退出」，与下方 refreshTask 的
+            // `if (!isFinishing)` 同一写法。改动仅去掉一个 `!`。
+            if (!autostartWaitActive || isFinishing) return
             val config = LiteConfig.load(this@MainActivity)
             // 就绪判定：勾了蓝牙自启 → 蓝牙已开；勾了热点自启 → AP state=13（AOSP ENABLED）。
             val btReady = !config.bootAutoBluetooth || runCatching {
@@ -667,7 +671,7 @@ class MainActivity : Activity() {
 
     private fun label(value: String, size: Int, color: Int, bold: Boolean = false) = TextView(this).apply {
         text = value; textSize = size.toFloat(); setTextColor(color); gravity = Gravity.CENTER_VERTICAL
-        typeface = if (bold) Typeface.create("sans-serif-medium", Typeface.NORMAL) else Typeface.create("sans-serif", Typeface.NORMAL)
+        typeface = Ui.font(bold)
         setLineSpacing(dip(3).toFloat(), 1f)
     }
 
@@ -678,7 +682,7 @@ class MainActivity : Activity() {
     private fun button(title: String, primary: Boolean, height: Int = 46, click: () -> Unit) = Button(this).apply {
         text = title; isAllCaps = false; textSize = 15f
         setTextColor(if (primary) Ui.BG else Ui.TEXT)
-        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        typeface = Ui.FONT_MEDIUM
         val fill = if (primary) Ui.ACCENT else Ui.CARD
         val stroke = if (primary) Ui.ACCENT else Ui.BORDER
         background = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -1705,7 +1709,9 @@ class MainActivity : Activity() {
             }
         }
         // 默认通道提示与设置页三选项同步（设置页改动后回到主页实时刷新）。
-        val activeChannel = LiteConfig.load(this).activeChannel
+        // vc178：这里每 500ms 跑一次，改读单键（原 LiteConfig.load 全量读 30+ 键并构造
+        // 30 字段 data class，只为取这一个字段）。
+        val activeChannel = LiteConfig.activeChannelOf(this)
         if (activeChannel != shownActiveChannel) {
             shownActiveChannel = activeChannel
             hintLabel.text = defaultChannelHint(activeChannel)

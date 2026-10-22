@@ -117,9 +117,19 @@ object MediaCodecSupport {
 
     /** Wraps one raw AAC-LC access unit in an MPEG-4 ADTS frame. */
     fun adtsFrame(accessUnit: ByteArray, sampleRate: Int, channels: Int): ByteArray {
+        // 与 adtsHeader 共用一份字节计算，避免两处实现漂移（帧长口径必须完全一致）。
+        return adtsHeader(accessUnit.size, sampleRate, channels) + accessUnit
+    }
+
+    /**
+     * vc178：只算 7 字节 ADTS 头（不含载荷）。供零拷贝路径使用——调用方把头与 RTP 载荷分片
+     * 分别写进 codec 输入缓冲，省掉「拷一份载荷 + 拼一份整帧」两次全量拷贝。
+     * 字节语义与 [adtsFrame] 逐字节一致（frameLength = accessUnitLength + 7）。
+     */
+    fun adtsHeader(accessUnitLength: Int, sampleRate: Int, channels: Int): ByteArray {
         val frequencyIndex = aacFrequencyIndex(sampleRate)
         val channelConfig = channels.coerceIn(1, 7)
-        val frameLength = accessUnit.size + 7
+        val frameLength = accessUnitLength + 7
         val header = ByteArray(7)
         header[0] = 0xff.toByte()
         header[1] = 0xf1.toByte()
@@ -128,7 +138,7 @@ object MediaCodecSupport {
         header[4] = ((frameLength ushr 3) and 0xff).toByte()
         header[5] = (((frameLength and 0x7) shl 5) or 0x1f).toByte()
         header[6] = 0xfc.toByte()
-        return header + accessUnit
+        return header
     }
 
     /** Extracts one RFC 3640 AAC access unit from an RTP payload. */

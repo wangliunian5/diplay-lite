@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.view.View
@@ -143,6 +144,21 @@ object Ui {
 
     fun dip(context: Context, dp: Int): Int =
         (dp * context.resources.displayMetrics.density + 0.5f).toInt()
+
+    // ---------- 字体（vc178：整页重建的重复创建点） ----------
+    //
+    // 主页/设置页每次重建都会为**每个** label / button 调用 Typeface.create()。一屏
+    // 40~100 个控件就是 40~100 次：每次都要走一遍字体族名解析 + native 侧全局字体缓存
+    // 加锁查表，结果却是同一个不可变对象。这里静态缓存两个常用字重复用。
+    // Typeface 不可变且线程安全，跨 Activity 共享无副作用；无关 Context，不泄漏 Activity。
+    /** 常规字重（sans-serif）。 */
+    val FONT_REGULAR: Typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+
+    /** 中粗字重（sans-serif-medium）：按钮与强调文本。 */
+    val FONT_MEDIUM: Typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+
+    /** 按字重取缓存字体，替代逐控件 Typeface.create()。 */
+    fun font(bold: Boolean = false): Typeface = if (bold) FONT_MEDIUM else FONT_REGULAR
 
     // ---------- 背景件 ----------
 

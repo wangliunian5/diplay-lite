@@ -153,7 +153,14 @@ internal class MicrophoneUplink(
             nextRecorder.startRecording()
             thread = Thread({
                 // 麦克风采集 + libopus 编码：上行是通话体验的一等公民，同样抬到 URGENT_AUDIO。
-                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                // vc178：setThreadPriority 在部分 ROM 上抛 SecurityException/IllegalArgumentException
+                // （与 AudioRenderer 线程同一风险，那边已包 try/catch）。未捕获会直接杀死采集线程
+                // ⇒ 上行全静、且只剩一句无上下文的 UncaughtException。抬优先级失败不该影响采集。
+                try {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                } catch (error: Throwable) {
+                    Log.w(TAG, "microphone thread priority not raised: ${error.message}")
+                }
                 capture(nextRecorder, nextSocket)
             }, "carplay-mic").apply {
                 isDaemon = true
@@ -291,6 +298,10 @@ internal class MicrophoneUplink(
     private fun attachAudioEffects(recorder: AudioRecord): String {
         val session = recorder.audioSessionId
         if (session <= 0) return "audioEffect=session-unavailable"
+        // vc178：换源时旧 AEC/NS 从不 release——每次静默自愈轮换都泄漏一对 AudioEffect
+        // （AudioEffect 占 native 资源且受全局实例数限制，EU5 上多次轮换后可致后续
+        // create 直接失败）。附加新实例前先释放上一轮。
+        releaseEffects()
         val aec = enableEffect("AEC", AcousticEchoCanceler.isAvailable()) {
             AcousticEchoCanceler.create(session)
         }
@@ -301,6 +312,26 @@ internal class MicrophoneUplink(
         noiseSuppressor = ns
         return "audioEffect=aec:${if (aec != null) "on" else "off"} " +
             "ns:${if (ns != null) "on" else "off"} sessionId=$session"
+    }
+
+    /** vc178：释放 AEC/NS（置空并 release），失败静默——效果释放失败不构成链路故障。 */
+    private fun releaseEffects() {
+        echoCanceler?.let { effect ->
+            try {
+                effect.release()
+            } catch (error: Throwable) {
+                Log.w(TAG, "microphone AEC release failed", error)
+            }
+        }
+        noiseSuppressor?.let { effect ->
+            try {
+                effect.release()
+            } catch (error: Throwable) {
+                Log.w(TAG, "microphone NS release failed", error)
+            }
+        }
+        echoCanceler = null
+        noiseSuppressor = null
     }
 
     private fun <T : AudioEffect> enableEffect(
@@ -500,6 +531,29 @@ internal class MicrophoneUplink(
         synchronized(triedSources) { triedSources.add(opened.source) }
         val previousEffects = "aec:${if (echoCanceler != null) "on" else "off"} " +
             "ns:${if (noiseSuppressor != null) "on" else "off"}"
+        // vc178（顺序修正）：原实现先 release 旧 AudioRecord、再赋字段、最后才 startRecording()。
+        // startRecording 失败时字段已指向一个**从未启动**的新实例、旧实例又已释放，但本函数
+        // return null ⇒ 调用方 `if (rotated != null)` 不成立 ⇒ capture 继续读**已释放**的旧
+        // AudioRecord ⇒ 上行彻底静默且无诊断（正是"静默自愈后反而没声音"的表现）。
+        // 改为：先把新实例跑起来，成功后才停旧实例、才落字段——失败路径因此天然可回滚。
+        val effects = attachAudioEffects(opened.recorder)
+        try {
+            opened.recorder.startRecording()
+        } catch (error: Exception) {
+            Log.e(TAG, "microphone heal restart failed", error)
+            // 回滚：释放刚建的实例与刚附加的效果，旧实例原样继续工作（字段未被改写）。
+            releaseEffects()
+            try {
+                opened.recorder.release()
+            } catch (_: Throwable) {
+            }
+            diagnostics?.invoke(
+                "Microphone silent-source heal: rotated source=${opened.source} failed to start: " +
+                    "${error.message} — rolled back, previous source keeps running " +
+                    "(previous effects $previousEffects)",
+            )
+            return null
+        }
         try {
             old.stop()
         } catch (_: Exception) {
@@ -513,17 +567,6 @@ internal class MicrophoneUplink(
         nativeChannels = opened.channels
         resamplePos = 0.0
         resampleTail = ShortArray(0)
-        val effects = attachAudioEffects(opened.recorder)
-        try {
-            opened.recorder.startRecording()
-        } catch (error: Exception) {
-            Log.e(TAG, "microphone heal restart failed", error)
-            diagnostics?.invoke(
-                "Microphone silent-source heal: rotated source=${opened.source} failed to start: " +
-                    "${error.message} (previous effects $previousEffects)",
-            )
-            return null
-        }
         diagnostics?.invoke(
             "Microphone silent-source heal: rotated to source=${opened.source} " +
                 "rate=${opened.rate} channels=${opened.channels} $effects",

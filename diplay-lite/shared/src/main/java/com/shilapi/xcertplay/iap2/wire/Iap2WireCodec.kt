@@ -86,32 +86,55 @@ object Iap2WireCodec {
         return output
     }
 
-    fun readU8(bytes: ByteArray, offset: Int = 0): Int = u8(bytes[offset])
+    // vc178（网络可控输入边界校验）：iAP2 报文体同样来自对端。原先 readUx/readIx 直接下标
+    // 访问，短报文越界即 AIOOBE——崩溃点离"对端发了畸形包"这个真因很远，且会被上层当成
+    // 未知内部错误。统一前置校验，越界抛 Iap2ProtocolException（它是 IOException，
+    // 走的是上层已有的"对端协议错误"处理路径，不是内部错误）。合法报文零行为变化。
+    private fun requireSpan(bytes: ByteArray, offset: Int, width: Int) {
+        if (offset < 0 || offset > bytes.size - width) {
+            throw Iap2ProtocolException(
+                "iAP2: truncated field (need $width bytes at $offset, have ${bytes.size})",
+            )
+        }
+    }
 
-    fun readI8(bytes: ByteArray, offset: Int = 0): Int = bytes[offset].toInt()
+    fun readU8(bytes: ByteArray, offset: Int = 0): Int {
+        requireSpan(bytes, offset, 1)
+        return u8(bytes[offset])
+    }
+
+    fun readI8(bytes: ByteArray, offset: Int = 0): Int {
+        requireSpan(bytes, offset, 1)
+        return bytes[offset].toInt()
+    }
 
     fun readBool(bytes: ByteArray, offset: Int = 0, nonzeroIsTrue: Boolean = true): Boolean {
         val value = readU8(bytes, offset)
         return if (nonzeroIsTrue) value != 0 else value == 1
     }
 
-    fun readU16(bytes: ByteArray, offset: Int = 0): Int =
-        (u8(bytes[offset]) shl 8) or u8(bytes[offset + 1])
+    fun readU16(bytes: ByteArray, offset: Int = 0): Int {
+        requireSpan(bytes, offset, 2)
+        return (u8(bytes[offset]) shl 8) or u8(bytes[offset + 1])
+    }
 
     fun readI16(bytes: ByteArray, offset: Int = 0): Int {
         val value = readU16(bytes, offset)
         return if (value and 0x8000 != 0) value or -0x1_0000 else value
     }
 
-    fun readU32(bytes: ByteArray, offset: Int = 0): Long =
-        (u8(bytes[offset]).toLong() shl 24) or
+    fun readU32(bytes: ByteArray, offset: Int = 0): Long {
+        requireSpan(bytes, offset, 4)
+        return (u8(bytes[offset]).toLong() shl 24) or
             (u8(bytes[offset + 1]).toLong() shl 16) or
             (u8(bytes[offset + 2]).toLong() shl 8) or
             u8(bytes[offset + 3]).toLong()
+    }
 
     fun readI32(bytes: ByteArray, offset: Int = 0): Int = readU32(bytes, offset).toInt()
 
     fun readU64(bytes: ByteArray, offset: Int = 0): Long {
+        requireSpan(bytes, offset, 8)
         var value = 0L
         repeat(8) { index ->
             value = (value shl 8) or u8(bytes[offset + index]).toLong()

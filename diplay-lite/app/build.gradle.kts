@@ -338,8 +338,21 @@ android {
         // （WaitingForReenumeration）忽略 DETACHED：授权①→重枚举→授权②→出画面全自动，
         // 不再弹结束提示、无需二次点按钮。改动：LiteState.reenumerating 标志 +
         // Service 状态机维护 + MainActivity detach receiver 忽略判断。
-        versionCode = 176
-        val versionPatch = 11
+        // vc177（20261023）：修 `autostartPoll` 判据写反（`!isFinishing` ⇒ 轮询体从不执行，
+        // 开机自启等待 60s 后必然走超时分支，「上车即连」实际从未触发）。仅去掉一个 `!`。
+        // vc178（20261023）：源码盘点批次 1~7 收敛（P1/P2 健壮性，无功能变更）：
+        // ①BplistCodec/Iap2WireCodec 对端字节边界校验（防 NegativeArraySize/OOM 类崩溃）；
+        // ②MicrophoneUplink.rotateSilentRecorder 先起新后停旧 + 失败回滚（修「换了音源后
+        // 上行无声」）与每次轮换泄漏的 AEC/NS；③Iap2LinkChannel.close join 前 notifyAll +
+        // 外层超时 1s→3s（内层脚本可跑 16s，原设定必然假超时）；④CarPlayController 建链
+        // （含最长 ~6s 的收敛 sleep）移出单线程池、forceCarplayConfiguration 的 resume 进
+        // finally（任何 Throwable 都不再永久占用 USB 接口）；⑤AudioRenderer.close 先 stop
+        // 再 interrupt（WRITE_BLOCKING 不响应中断）+ AAC 零拷贝喂 codec（省一次全帧复制）；
+        // ⑥wiredStartWatchdogGeneration 改 AtomicInteger、bonjourGoodbye.await 补中断保护；
+        // ⑦UI：Typeface 静态缓存（整页 40~100 次 create → 复用）、renderState 单键读
+        // activeChannel（原每 500ms 全量 load 30+ 键）。
+        versionCode = 178
+        val versionPatch = 13
         versionName = "1.2.$versionPatch.dongle"
     }
 

@@ -362,8 +362,18 @@ class AndroidMediaSink(
         return videoDecoders.putIfAbsent(type, created) ?: created
     }
 
-    @Synchronized
+    // vc178：原为方法级 @Synchronized —— 而它在**每个音频包**的提交路径上被调用（约 47 次/秒，
+    // 每条音频流一次），每次都要抢整 sink 的监视器，与 close()/videoDecoder() 等共用同一把锁。
+    // 改为：命中路径无锁（audioRenderers 本身是 ConcurrentHashMap，读天然安全）；
+    // 只有"格式变了要重建"才进 synchronized 并双检，原子性不变。
     private fun audioRenderer(type: Int, format: AudioFormat): AudioRenderer {
+        val existing = audioRenderers[type]
+        if (existing?.format == format) return existing
+        return synchronized(this) { audioRendererLocked(type, format) }
+    }
+
+    @Synchronized
+    private fun audioRendererLocked(type: Int, format: AudioFormat): AudioRenderer {
         val existing = audioRenderers[type]
         if (existing?.format == format) return existing
         existing?.close()
@@ -1239,6 +1249,12 @@ private class AudioRenderer(
 
     override fun close() {
         running = false
+        // vc178：原先只 interrupt()。若线程正阻塞在 `track.write(..., WRITE_BLOCKING)`，
+        // interrupt **打不断**这次阻塞写（AudioTrack.write 不响应中断）⇒ run() 的收尾
+        // （含 release() 与 native decoder 释放）永远执行不到 ⇒ 每次重连泄漏一个 AudioTrack
+        // + 一个 native 解码器实例，低端机上累积到 AudioFlinger 拒绝再建轨（音频彻底哑）。
+        // 先 stop() 让阻塞写立即返回，再 interrupt 兜住 sleep/wait 场景。
+        runCatching { track?.stop() }
         thread.interrupt()
     }
 
@@ -1611,20 +1627,19 @@ private class AudioRenderer(
         when (format.codec) {
             AudioCodecKind.LPCM -> writePcm(byteSwapS16(rtp.copyOfRange(12, rtp.size)))
             AudioCodecKind.AAC_LC -> {
-                val accessUnit = rtp.copyOfRange(12, rtp.size)
-                if (accessUnit.isNotEmpty()) {
+                // vc178：零拷贝——直接把 RTP 载荷分片 + ADTS 头写进 codec 输入缓冲，
+                // 不再 copyOfRange 一次、adtsFrame 再拼一次（47 包/秒 × 两次全量拷贝）。
+                val payloadLength = rtp.size - 12
+                if (payloadLength > 0) {
                     if (!firstAacPayloadLogged) {
                         firstAacPayloadLogged = true
                         Log.i(
                             TAG,
-                            "audio AAC access unit bytes=${accessUnit.size} " +
-                                "head=${accessUnit.copyOf(minOf(accessUnit.size, 16)).toHexString()}",
+                            "audio AAC access unit bytes=$payloadLength " +
+                                "head=${rtp.copyOfRange(12, 12 + minOf(payloadLength, 16)).toHexString()}",
                         )
                     }
-                    feedCodec(
-                        MediaCodecSupport.adtsFrame(accessUnit, format.sampleRate, format.channels),
-                        timestampUs,
-                    )
+                    feedAdtsFromRtp(rtp, 12, payloadLength, timestampUs)
                 }
             }
             AudioCodecKind.OPUS -> {
@@ -1775,6 +1790,28 @@ private class AudioRenderer(
     }
 
     private fun feedCodec(payload: ByteArray, presentationTimeUs: Long) {
+        feedCodecInternal(payload, 0, payload.size, presentationTimeUs, adtsHeader = null)
+    }
+
+    /**
+     * vc178：AAC 每包原是「`rtp.copyOfRange(12, size)` 拷一份 + `adtsFrame` 再拼一份」两次全量
+     * 拷贝（约 47 包/秒，老车机上是不必要的 GC 压力）。改为直接把 7 字节 ADTS 头与 RTP 载荷
+     * 分片写进 codec 输入缓冲，**零中间数组**。仅在输入缓冲装得下时走快路径，装不下仍退化到
+     * 原路径（保持"装不下就丢"的既有语义）。
+     */
+    private fun feedAdtsFromRtp(rtp: ByteArray, payloadStart: Int, payloadLength: Int, presentationTimeUs: Long) {
+        if (payloadLength <= 0) return
+        val header = MediaCodecSupport.adtsHeader(payloadLength, format.sampleRate, format.channels)
+        feedCodecInternal(rtp, payloadStart, payloadLength, presentationTimeUs, adtsHeader = header)
+    }
+
+    private fun feedCodecInternal(
+        payload: ByteArray,
+        offset: Int,
+        length: Int,
+        presentationTimeUs: Long,
+        adtsHeader: ByteArray?,
+    ) {
         val codec = codec ?: return
         val index = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
         if (index < 0) {
@@ -1790,16 +1827,18 @@ private class AudioRenderer(
         }
         val input = codecInputBuffer(codec, index) ?: return
         input.clear()
-        if (payload.size <= input.remaining()) {
-            input.put(payload)
-            codec.queueInputBuffer(index, 0, payload.size, presentationTimeUs, 0)
+        val total = length + (adtsHeader?.size ?: 0)
+        if (total <= input.remaining()) {
+            adtsHeader?.let { input.put(it) }
+            input.put(payload, offset, length)
+            codec.queueInputBuffer(index, 0, total, presentationTimeUs, 0)
             inputQueued++
             if (!firstInputQueuedLogged) {
                 firstInputQueuedLogged = true
                 Log.i(
                     TAG,
-                    "audio decoder first input codec=${format.codec} bytes=${payload.size} " +
-                        "head=${payload.copyOf(minOf(payload.size, 16)).toHexString()}",
+                    "audio decoder first input codec=${format.codec} bytes=$total " +
+                        "head=${payload.copyOfRange(offset, offset + minOf(length, 16)).toHexString()}",
                 )
             }
         } else {

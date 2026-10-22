@@ -132,7 +132,7 @@ class CarIconPage(private val activity: MainActivity) {
             text = "自定义返回图标"
             setTextColor(Ui.TEXT)
             textSize = 20f
-            typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
+            typeface = Ui.FONT_MEDIUM
         })
         column.addView(backRow)
         column.addView(TextView(activity).apply {

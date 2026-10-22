@@ -1,6 +1,7 @@
 package com.shilapi.diplay.lite
 
 import android.content.Context
+import android.content.SharedPreferences
 import com.shilapi.xcertplay.airplay.AirPlayDisplaySettings
 
 /**
@@ -137,6 +138,35 @@ data class LiteConfig(
                 .apply()
         }
 
+        /**
+         * vc158 迁移 + 读取 activeChannel 的唯一实现（load 与 activeChannelOf 共用，
+         * 避免两处各写一份迁移判断而漂移）。
+         *
+         * ⚠️ 不能写成 prefs.getString("active_channel", null) ?: ... —— save() 恒写该键，
+         * 老用户的值必为显式的 "car"，Elvis 永不生效，迁移会被静默跳过，
+         * 恰好漏掉最需要迁移的那批人（vc157 里选了承载方式=Wi-Fi Direct 的）。
+         * 旧语义中 wifiP2pMode 仅在非 usb / 非 relay（即 car 通道）下生效，
+         * 故仅当存储值为 car 或缺失时才迁移；relay / usb 保持原值。
+         */
+        private fun readActiveChannel(prefs: SharedPreferences): String = if (
+            prefs.getString("active_channel", null).let { it == null || it == "car" } &&
+            prefs.getBoolean("wifi_p2p_mode", false)
+        ) {
+            "p2p"
+        } else {
+            prefs.getString("active_channel", "car") ?: "car"
+        }
+
+        /**
+         * vc178：只取 activeChannel 一个键，供高频轮询（主页 500ms tick）使用。
+         *
+         * load() 会读 30+ 个键并构造一个 30 字段的 data class；而 tick 每 500ms 只为
+         * 比对这一个字段（设置页改了通道回主页要实时刷新）。改成读单个键，
+         * 语义与 load().activeChannel 完全一致（同一个 readActiveChannel）。
+         */
+        fun activeChannelOf(context: Context): String =
+            readActiveChannel(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE))
+
         fun load(context: Context): LiteConfig {
             val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             return LiteConfig(
@@ -182,22 +212,8 @@ data class LiteConfig(
                 bootAutoHotspot = prefs.getBoolean("boot_auto_hotspot", false),
                 bootAutoWifi = prefs.getBoolean("boot_auto_wifi", false),
                 autoConnect = prefs.getBoolean("auto_connect", false),
-                // vc158：Wi-Fi Direct 由「体验优化里的承载方式开关」改为自动连接方式第四项（p2p）。
-                // 旧版把承载方式选成 Wi-Fi Direct（wifi_p2p_mode=true）的用户迁移为 activeChannel=p2p。
-                //
-                // ⚠️ 不能写成 prefs.getString("active_channel", null) ?: ... —— save() 恒写该键，
-                // 老用户的值必为显式的 "car"，Elvis 永不生效，迁移会被静默跳过，
-                // 恰好漏掉最需要迁移的那批人（vc157 里选了承载方式=Wi-Fi Direct 的）。
-                // 旧语义中 wifiP2pMode 仅在非 usb / 非 relay（即 car 通道）下生效，
-                // 故仅当存储值为 car 或缺失时才迁移；relay / usb 保持原值。
-                activeChannel = if (
-                    prefs.getString("active_channel", null).let { it == null || it == "car" } &&
-                    prefs.getBoolean("wifi_p2p_mode", false)
-                ) {
-                    "p2p"
-                } else {
-                    prefs.getString("active_channel", "car") ?: "car"
-                },
+                // 迁移逻辑见 readActiveChannel（load 与 activeChannelOf 共用）。
+                activeChannel = readActiveChannel(prefs),
                 relaySsid = prefs.getString("relay_ssid", "").orEmpty(),
                 relayPassword = prefs.getString("relay_password", "").orEmpty(),
                 carIpv6Channel = prefs.getInt("car_ipv6_channel", 0),

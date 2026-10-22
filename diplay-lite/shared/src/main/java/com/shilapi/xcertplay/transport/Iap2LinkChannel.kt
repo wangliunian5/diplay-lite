@@ -148,7 +148,17 @@ class Iap2LinkChannel private constructor(
                 lock.notifyAll()
             }
         }
+        // vc178：join 前先唤醒所有等在 lock 上的等待方（sendControlAwaitCapacity/recvControl）。
+        // 上面 closeUnderlyingOnce 只断了底层流的阻塞 recv，但等在本对象监视器上的调用方
+        // 依赖这里再广播一次才能带着 terminated 返回；漏掉会让它们干等到各自超时。
+        synchronized(lock) {
+            lock.notifyAll()
+        }
         try {
+            // vc178：worker 单次循环最长可达 4s×4=16s（重试退避），而 join 原为 1s ⇒
+            // close 必然超时返回，worker 仍活着却已被当作"已关闭"，调用方随即重建链路，
+            // 新旧 worker 互抢同一个 stream（表现为有线 iAP2 偶发死链）。join 放宽到 3s：
+            // 既覆盖正常工作循环，也不至于让 close 长时间卡住调用线程。
             worker.join(CLOSE_JOIN_MILLIS)
         } catch (interrupted: InterruptedException) {
             Thread.currentThread().interrupt()
@@ -375,7 +385,8 @@ class Iap2LinkChannel private constructor(
         private const val RECEIVE_CHUNK_BYTES = 8_192
         private const val RECEIVE_POLL_MILLIS = 100L
         private const val MINIMUM_RECEIVE_POLL_MILLIS = 1L
-        private const val CLOSE_JOIN_MILLIS = 1_000L
+        /** vc178：1s < worker 单次循环上限（4s×4 重试），放宽到 3s（见 close() 注释）。 */
+        private const val CLOSE_JOIN_MILLIS = 3_000L
         private const val NANOS_PER_MILLISECOND = 1_000_000L
         private const val MAX_WAIT_MILLIS = Long.MAX_VALUE / NANOS_PER_MILLISECOND
         private const val MAX_PENDING_COMMANDS = 64

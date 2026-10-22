@@ -187,6 +187,14 @@ class CarPlayController(
             null
         } ?: BluetoothAdapter.getDefaultAdapter()
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
+    /**
+     * vc178：USB 主机（建链/重枚举/usbmux 打开）专用串行线程。
+     * 原先这些任务跑在共享的 [executor] 上，而 `IphoneUsbHost` 内部最多会睡
+     * 0.8s（配置落定）+0.3s（重试）+最长 5s（vc111 枚举收敛轮询）≈ 6s；同一队列上排着的
+     * teardown / 拆栈任务只能干等，实测表现是「点了断开或拔线后界面卡住好几秒才响应」。
+     * 建链是长阻塞任务，本就不该和拆栈抢同一条线程。close 时与 [executor] 一并 shutdownNow。
+     */
+    private val usbHostExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val touchExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val tunnelExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -306,7 +314,10 @@ class CarPlayController(
     // 额度 2 次封顶（耗尽落 ControlEnded，不再无限循环重建占住「有线链路建立中」）；代际
     // 令牌使 teardown/重 arm 后的待触发计时器失活。会话真建立即归零（对齐 wiredRetryCount 语义）。
     private val wiredStartWatchdogRetries = AtomicInteger(0)
-    @Volatile private var wiredStartWatchdogGeneration = 0
+    // vc178：代际令牌由 armWiredEstablishWatchdog()（主线程）与 closeWiredStack()（teardown
+    // 线程）两处并发自增。原 `@Volatile var ++` 非原子，同刻调用会丢更新 → 旧计时器未被
+    // 失活、或新计时器一出生就被判失效（表现为「判死后自动重试不触发」）。改 AtomicInteger。
+    private val wiredStartWatchdogGeneration = AtomicInteger(0)
     // vc97③：wedge 判别器数据源——控制环最近收帧时刻（usbmux 控制口心跳在此浮现）。
     // Ipv6NcmBridge fatal 判定时探查：控制口活=端点级楔死快拆 / 控制口同停=iPhone 停发宽限。
     @Volatile private var wiredControlLastRxAtNanos = 0L
@@ -709,9 +720,12 @@ class CarPlayController(
                     mfiSession = null
                     closeBestEffort("location provider") { locationProvider?.close() }
                 } finally {
+                    // vc178：USB 主机线程与共享 executor 一起收（它上面的建链任务同样含阻塞 sleep）。
+                    usbHostExecutor.shutdownNow()
                     executor.shutdownNow()
                     try {
                         executor.awaitTermination(EXECUTOR_CLOSE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+                        usbHostExecutor.awaitTermination(EXECUTOR_CLOSE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
                     } catch (_: InterruptedException) {
                         Thread.currentThread().interrupt()
                     }
@@ -2414,7 +2428,15 @@ class CarPlayController(
                 isDaemon = true
                 start()
             }
-            bonjourGoodbye.await(300, TimeUnit.MILLISECONDS)
+            // vc178：teardown 线程若在关闭期间被中断，await 抛 InterruptedException 会连带
+            // 掀掉整条 teardown（step=2/5 起的 AirPlay 下线、iAP2 隧道回收全部不执行 →
+            // 资源泄漏 + iOS 侧认为会话还在）。吞掉并按约定恢复中断标志，让后续步骤照常走完。
+            try {
+                bonjourGoodbye.await(300, TimeUnit.MILLISECONDS)
+            } catch (interrupted: InterruptedException) {
+                Thread.currentThread().interrupt()
+                debugLog("wireless teardown resource=Bonjour goodbye wait interrupted")
+            }
             debugLog(
                 "wireless teardown resource=Bonjour goodbyeFlushed=" +
                     (bonjourGoodbye.count == 0L) + " (async close continues in background)",
@@ -2701,7 +2723,8 @@ class CarPlayController(
         reenumerationPerformed = true
         reenumerationSourceDeviceName = device.deviceName
         onStatus(CarPlayStatus.SelectingConfiguration)
-        iphoneHost?.requestCarPlayReenumerationAsync(device, executor) { transition ->
+        // vc178：改走 usbHostExecutor（建链含最长 ~6s 阻塞 sleep，不再占用共享 executor）。
+        iphoneHost?.requestCarPlayReenumerationAsync(device, usbHostExecutor) { transition ->
             when (transition) {
                 is IphoneUsbHost.TransitionResult.ReenumerationRequested -> {
                     // M6k24d 诊断：0x52 的响应字节决定 iPhone 是否接受 CarPlay 模式切换。
@@ -2865,7 +2888,7 @@ class CarPlayController(
         }
         iphoneHost?.openIap2UsbSessionAsync(
             target,
-            executor,
+            usbHostExecutor, // vc178：同上，建链不再占用共享 executor
             callback = { result ->
                 when (result) {
                     is IphoneUsbHost.Iap2SessionResult.Connected -> {
@@ -3015,12 +3038,18 @@ class CarPlayController(
             NcmClaimTrace.trace("vc103q EBUSY -> suspend usbmux claim ok=$suspended")
             debugLog("vc103q EBUSY -> suspend usbmux claim ok=$suspended")
             if (suspended) {
-                errno = runCatching { LegacyUsbHostNative.setConfiguration(fd, 6) }.getOrDefault(-1)
-                NcmClaimTrace.trace("vc103q retry setConfiguration(6) errno=$errno")
-                debugLog("vc103q retry setConfiguration(6) errno=$errno")
-                val resumed = usbSession.resumeUsbmuxClaim()
-                NcmClaimTrace.trace("vc103q resume usbmux claim ok=$resumed")
-                debugLog("vc103q resume usbmux claim ok=$resumed")
+                // vc178：挂起后必须恢复——原先 resume 是直线代码，中间只要出任何 Throwable
+                // （Error、NPE 等）就永久停在"已 release 接口"状态，后续 usbmux 全部失败，
+                // 表象是有线连接彻底坏掉且无报错。改为 finally 保证恢复。
+                try {
+                    errno = runCatching { LegacyUsbHostNative.setConfiguration(fd, 6) }.getOrDefault(-1)
+                    NcmClaimTrace.trace("vc103q retry setConfiguration(6) errno=$errno")
+                    debugLog("vc103q retry setConfiguration(6) errno=$errno")
+                } finally {
+                    val resumed = usbSession.resumeUsbmuxClaim()
+                    NcmClaimTrace.trace("vc103q resume usbmux claim ok=$resumed")
+                    debugLog("vc103q resume usbmux claim ok=$resumed")
+                }
             }
         }
     }
@@ -3038,9 +3067,9 @@ class CarPlayController(
         wiredControlReturned = false
         wiredEstablishWatchdogFired = false
         wiredStreamSeen = false
-        val generation = ++wiredStartWatchdogGeneration
+        val generation = wiredStartWatchdogGeneration.incrementAndGet()
         mainHandler.postDelayed({
-            if (generation != wiredStartWatchdogGeneration) return@postDelayed
+            if (generation != wiredStartWatchdogGeneration.get()) return@postDelayed
             if (closed || wiredControlReturned || wiredStreamSeen) return@postDelayed
             wiredEstablishWatchdogFired = true
             val retries = wiredStartWatchdogRetries.incrementAndGet()
@@ -3590,7 +3619,7 @@ class CarPlayController(
      * （实测一次为用户断开按钮、一次根因=对端关 event 连接），reason 全量落盘。 */
     private fun closeWiredStack(restoreNetwork: Boolean = true, reason: String = "unspecified") {
         // vc153：teardown 取消待触发的启动看门狗计时器（代际令牌失活）。
-        wiredStartWatchdogGeneration += 1
+        wiredStartWatchdogGeneration.incrementAndGet()
         debugLog("wired teardown starting reason=$reason")
         val activeServer = airPlayServer
         airPlayServer = null
