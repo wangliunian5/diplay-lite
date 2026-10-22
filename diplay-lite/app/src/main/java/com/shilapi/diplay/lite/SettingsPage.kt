@@ -1,7 +1,6 @@
 package com.shilapi.diplay.lite
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.app.Dialog
 import android.content.pm.ActivityInfo
 import android.graphics.Color
@@ -91,9 +90,12 @@ class SettingsPage(private val activity: MainActivity) {
     // M6k19：音乐缓存毫秒输入
     private lateinit var inputBuffer: EditText
     // M6k19：默认自动连接方式三选一（从主页 toggle 迁移）
-    private lateinit var rgAutoChannel: RadioGroup
+    // vc161：改 WrapRadioGroup——竖屏下四个选项挤一行会错位（RadioGroup 只能单行）
+    private lateinit var rgAutoChannel: WrapRadioGroup
     private lateinit var rbAutoCar: RadioButton
     private lateinit var rbAutoRelay: RadioButton
+    // vc158：自动连接方式第四项（Wi-Fi Direct）。
+    private lateinit var rbAutoP2p: RadioButton
     private lateinit var rbAutoUsb: RadioButton
     private lateinit var rgOrientation: RadioGroup
     private lateinit var rbOrientLand: RadioButton
@@ -120,18 +122,13 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var cbAutoConnect: CheckBox
     private lateinit var cbSoftDecode: CheckBox
     // vc157：帧率四档单选（25/30/40/60），替代原「限制 30 帧」复选框。
-    private lateinit var rgFps: RadioGroup
+    private lateinit var rgFps: WrapRadioGroup
     private lateinit var rbFps25: RadioButton
     private lateinit var rbFps30: RadioButton
     private lateinit var rbFps40: RadioButton
     private lateinit var rbFps60: RadioButton
     private lateinit var cbSpeaker: CheckBox
     private lateinit var cbVoiceMedia: CheckBox
-    // vc157：无线承载方式二选一（车机热点 / Wi-Fi Direct）。P2P 一级模式下凭据由系统
-    // 随机生成，热点 SSID/密码不适用。
-    private lateinit var rgCarrier: RadioGroup
-    private lateinit var rbCarrierHotspot: RadioButton
-    private lateinit var rbCarrierP2p: RadioButton
     // vc156（上游 0.2.21 预缓冲移植）：媒体预缓冲开关。
     private lateinit var cbPrebuffer: CheckBox
     private lateinit var tvVersion: TextView
@@ -183,18 +180,20 @@ class SettingsPage(private val activity: MainActivity) {
         column.addView(sectionLabel("连接设置"), block(top = dip(8), bottom = dip(4)))
         column.addView(entryRow("车机热点配置") { activity.openHotspotPage("car") }, block(top = dip(4)))
         column.addView(entryRow("中继热点配置") { activity.openHotspotPage("relay") }, block(top = dip(8)))
-        // M6k19：默认自动连接方式（三选一，从主页 toggle 迁移至此）。
-        // 打开 App 时按此通道自动连接：car=车机热点 / relay=中继热点 / usb=USB（USB 通道待接入时仅记录）。
-        // 1.1.3（UI 字号调整）：加回「自动连接方式」小标题，三个单选归属其下。
+        // M6k19：默认自动连接方式（原三选一，从主页 toggle 迁移至此）。
+        // 打开 App 时按此通道自动连接：car=车机热点 / relay=中继热点 / p2p=Wi-Fi Direct /
+        // usb=USB（USB 通道待接入时仅记录）。
+        // vc158：Wi-Fi Direct 由「体验优化里的承载方式开关」改为本组第四项，承载方式单选删除。
+        // 1.1.3（UI 字号调整）：加回「自动连接方式」小标题，四个单选归属其下。
         column.addView(subSectionLabel("自动连接方式"), block(top = dip(8), bottom = dip(2)))
-        rgAutoChannel = RadioGroup(activity).apply { orientation = LinearLayout.HORIZONTAL }
+        // vc161：宽度不够时自动折行（竖屏四项一行放不下 → 折成两行）
+        rgAutoChannel = WrapRadioGroup(activity)
         rbAutoCar = radio("车机热点")
         rbAutoRelay = radio("中继热点")
+        rbAutoP2p = radio("Wi-Fi Direct")
         rbAutoUsb = radio("USB连接")
-        rgAutoChannel.addView(rbAutoCar)
-        rgAutoChannel.addView(rbAutoRelay)
-        rgAutoChannel.addView(rbAutoUsb)
-        rgAutoChannel.setOnCheckedChangeListener { _, _ ->
+        rgAutoChannel.addButtons(rbAutoCar, rbAutoRelay, rbAutoP2p, rbAutoUsb)
+        rgAutoChannel.setOnCheckedChangeListener {
             if (isLoading) return@setOnCheckedChangeListener
             refreshRadioDrawables(rgAutoChannel)
             persistFromForm()
@@ -330,12 +329,12 @@ class SettingsPage(private val activity: MainActivity) {
             val target = currentOrientationMode()
             if (target == previous) return@setOnCheckedChangeListener
             // M6k24g：改方向改为「重启后全局生效」——重启从冷启动即按新方向渲染。
-            AlertDialog.Builder(activity)
+            AppDialog.Builder(activity)
                 .setTitle("应用横竖屏设置")
                 .setMessage(
                     "原方向：${if (previous == "portrait") "强制竖屏" else "强制横屏"}，" +
                         "确认修改为${if (target == "portrait") "强制竖屏" else "强制横屏"}吗？\n\n" +
-                        "点击「应用」后将自动重启软件，重启后全局应用新方向；点击主页连接即按新方向声明画面。",
+                        "点击「应用」后软件将自动重启，重启后按新方向全局生效。",
                 )
                 .setNegativeButton("取消") { _, _ ->
                     isLoading = true
@@ -345,12 +344,33 @@ class SettingsPage(private val activity: MainActivity) {
                 }
                 .setPositiveButton("应用并重启") { _, _ ->
                     persistFromForm()
-                    // vc147：不再重建界面，参数下次连接生效（渲染端丢失竞态定案）。
-                    toast("已应用，下次连接生效")
+                    // vc159：方向是启动级全局属性（onCreate 读 config 决定 requestedOrientation），
+                    // vc147 的「下次连接生效」对它不成立——改为真实冷重启，与文案对齐。
+                    restartAppForOrientation()
                 }
                 .show()
         }
         column.addView(rgOrientation, block(top = dip(6)))
+
+        // ── 画面帧率（vc158：由「体验优化」组移入本组，归属画面设置）──
+        // 四档 25/30/40/60：25=弱机自救/省流档（降负载减轻老硬解噪点）；
+        // 40/60=流畅优先（弱硬解机型高帧率高码率可能出噪块，自行降档）。
+        // 直接落盘不弹确认——帧率已纳入 appliedVideoKey 机制，连接时检测到变化会二次确认。
+        column.addView(subSectionLabel("画面帧率"), block(top = dip(8), bottom = dip(2)))
+        // vc161：同 WrapRadioGroup（短标签多数情况仍是一行，窄屏自动折行）
+        rgFps = WrapRadioGroup(activity)
+        rbFps25 = radio("25帧")
+        rbFps30 = radio("30帧")
+        rbFps40 = radio("40帧")
+        rbFps60 = radio("60帧")
+        rgFps.addButtons(rbFps25, rbFps30, rbFps40, rbFps60)
+        rgFps.setOnCheckedChangeListener {
+            if (isLoading) return@setOnCheckedChangeListener
+            refreshRadioDrawables(rgFps)
+            runCatching { persistFromForm() }
+            toast("已应用，下次连接生效")
+        }
+        column.addView(rgFps, block(top = dip(6)))
 
         // ── 音频设置：导航触发压低 / 音频缓存 / 音视频链路 / 音频流选择 ──
         column.addView(sectionLabel("音频设置"), block(top = dip(16), bottom = dip(4)))
@@ -370,7 +390,7 @@ class SettingsPage(private val activity: MainActivity) {
         // 开 = 音乐起播/复播水位抬到约 1s，Wi-Fi 短断流不再卡顿；代价是切歌起播稍慢。
         cbPrebuffer = checkbox("音乐预缓冲（抗Wi-Fi卡顿，起播稍慢）")
         column.addView(cbPrebuffer, block(bottom = dip(4)))
-        // 音视频传输方式（1.1.3：加回小标题；二选一选定后弹窗确认、应用并重启）
+        // 音视频传输方式（1.1.3：加回小标题；二选一选定后弹窗确认、下次连接生效）
         column.addView(subSectionLabel("音视频传输方式"), block(top = dip(8), bottom = dip(2)))
         val avGroup = RadioGroup(activity).apply { orientation = LinearLayout.HORIZONTAL }
         rbAvFull = radio("全CarPlay")
@@ -383,7 +403,7 @@ class SettingsPage(private val activity: MainActivity) {
             val previous = LiteConfig.load(activity).avPathMode
             val target = if (rbAvBt.isChecked) "bt_audio" else "full"
             if (target == previous) return@setOnCheckedChangeListener
-            AlertDialog.Builder(activity)
+            AppDialog.Builder(activity)
                 .setTitle("应用音视频传输方式")
                 .setMessage(
                     if (target == "bt_audio") {
@@ -396,11 +416,11 @@ class SettingsPage(private val activity: MainActivity) {
                             "3. 在输出列表中选择车机蓝牙名称。\n\n" +
                             "画面始终由 CarPlay 推流，音乐改走车机蓝牙出声。" +
                             "每次重连后如输出被系统改回，需重新选择一次（部分 iPhone 会记住该选择）。\n\n" +
-                            "点击「应用」后将自动重启软件，重启后全局应用新方式。"
+                            "点击「应用」后保存，下次连接生效。"
                     } else {
                         "原方式：${if (previous == "bt_audio") "蓝牙音频+CarPlay" else "全CarPlay"}，" +
                             "确认修改为全CarPlay吗？\n\n" +
-                            "点击「应用」后将自动重启软件，重启后全局应用新方式。"
+                            "点击「应用」后保存，下次连接生效。"
                     },
                 )
                 .setNegativeButton("取消") { _, _ ->
@@ -409,7 +429,7 @@ class SettingsPage(private val activity: MainActivity) {
                     refreshRadioDrawables(avGroup)
                     isLoading = false
                 }
-                .setPositiveButton("应用并重启") { _, _ ->
+                .setPositiveButton("应用") { _, _ ->
                     persistFromForm()
                     // vc147：不再重建界面，参数下次连接生效（渲染端丢失竞态定案）。
                     toast("已应用，下次连接生效")
@@ -449,51 +469,20 @@ class SettingsPage(private val activity: MainActivity) {
         cbBootWifi = checkbox("开机自启WIFI")
         cbAutoConnect = checkbox("启动后自动连接")
         cbSoftDecode = checkbox("强制软解")
-        // vc157：帧率四档单选（替代「限制 30 帧」复选框）。25=弱网省流/弱机自救档（降负载
-        // 减轻老硬解噪点）；40/60=流畅优先（弱硬解机型高帧率高码率可能出噪块，自行降档）。
-        // 直接落盘不弹确认——帧率已纳入 appliedVideoKey 机制，连接时检测到变化会二次确认。
-        rgFps = RadioGroup(activity).apply { orientation = LinearLayout.HORIZONTAL }
-        rbFps25 = radio("25帧")
-        rbFps30 = radio("30帧")
-        rbFps40 = radio("40帧")
-        rbFps60 = radio("60帧")
-        rgFps.addView(rbFps25)
-        rgFps.addView(rbFps30)
-        rgFps.addView(rbFps40)
-        rgFps.addView(rbFps60)
-        rgFps.setOnCheckedChangeListener { _, _ ->
-            if (isLoading) return@setOnCheckedChangeListener
-            refreshRadioDrawables(rgFps)
-            runCatching { persistFromForm() }
-            toast("已应用，下次连接生效")
-        }
         cbSpeaker = checkbox("通话声音走媒体音量")
         // 1.1.2（EU5 双向无声）：Siri/助手语音走媒体通道——ASSISTANT/NAVIGATION usage 在
         // PATEO 等老 HAL 上静音，勾选后改走媒体音量（媒体通道已实测出声）。
         cbVoiceMedia = checkbox("Siri/语音提示走媒体音量")
-        // vc157：无线承载方式二选一（车机热点 / Wi-Fi Direct）。Wi-Fi Direct = 直接建 P2P GO，
-        // 不依赖车机热点开关（P2P 凭据系统随机生成，热点 SSID/密码不适用）。
-        rgCarrier = RadioGroup(activity).apply { orientation = LinearLayout.HORIZONTAL }
-        rbCarrierHotspot = radio("车机热点")
-        rbCarrierP2p = radio("Wi-Fi Direct")
-        rgCarrier.addView(rbCarrierHotspot)
-        rgCarrier.addView(rbCarrierP2p)
-        rgCarrier.setOnCheckedChangeListener { _, _ ->
-            if (isLoading) return@setOnCheckedChangeListener
-            refreshRadioDrawables(rgCarrier)
-            runCatching { persistFromForm() }
-            toast("已应用，下次连接生效")
-        }
+        // vc158：承载方式单选（车机热点 / Wi-Fi Direct）已删除——Wi-Fi Direct 改为
+        // 「连接设置 → 自动连接方式」的第四项，语义不再重复。
         column.addView(cbBoot, block(bottom = dip(2)))
         column.addView(cbBootBluetooth, block(bottom = dip(2)))
         column.addView(cbBootHotspot, block(bottom = dip(2)))
         column.addView(cbBootWifi, block(bottom = dip(2)))
         column.addView(cbAutoConnect, block(bottom = dip(2)))
         column.addView(cbSoftDecode, block(bottom = dip(2)))
-        column.addView(rgFps, block(bottom = dip(2)))
         column.addView(cbSpeaker, block(bottom = dip(2)))
-        column.addView(cbVoiceMedia, block(bottom = dip(2)))
-        column.addView(rgCarrier, block(bottom = dip(2)))
+        column.addView(cbVoiceMedia, block())
 
         // M6k23：自定义返回图标页（选图→裁剪→确认保存）。1.1.3：入口行 -3dp（按钮随行号缩小）。
         column.addView(entryRow("自定义返回图标") { activity.setPage("caricon") }, block(top = dip(14)))
@@ -654,7 +643,7 @@ class SettingsPage(private val activity: MainActivity) {
             }
         }
         val scroll = ScrollView(activity).apply { addView(body) }
-        AlertDialog.Builder(activity)
+        AppDialog.Builder(activity)
             .setTitle("开源许可与声明")
             .setView(scroll)
             .setPositiveButton("关闭", null)
@@ -773,14 +762,14 @@ class SettingsPage(private val activity: MainActivity) {
     private fun showAudioStreamDialog(label: String, isMedia: Boolean) {
         val current = if (isMedia) mediaAudioStreamValue else navAudioStreamValue
         val names = (0..20).map { if (it == 0) "0 · 自动路由" else it.toString() }.toTypedArray()
-        val dialog = AlertDialog.Builder(activity)
+        val dialog = AppDialog.Builder(activity)
             .setTitle(label)
             .setSingleChoiceItems(names, current) { _, which ->
                 // 点选即试听：与实际播放同路径（0=usage，1~20=传统 stream type）
                 AudioChannelPreview.play(activity, which, isMedia)
             }
             .setPositiveButton("保存") { d, _ ->
-                val selected = (d as AlertDialog).listView.checkedItemPosition
+                val selected = d.getCheckedItemPosition()
                 if (isMedia) mediaAudioStreamValue = selected else navAudioStreamValue = selected
                 updateStreamValueTexts()
                 persistFromForm()
@@ -886,24 +875,33 @@ class SettingsPage(private val activity: MainActivity) {
             leftMargin = left
         }
 
-    private fun refreshRadioDrawables(group: RadioGroup) {
+    /**
+     * vc161：改递归遍历——WrapRadioGroup 是「多行容器」，单选按钮在行内而非直接子级，
+     * 原单层遍历取不到（且会 ClassCastException）。对普通 RadioGroup 行为不变。
+     */
+    private fun refreshRadioDrawables(group: ViewGroup) {
         for (i in 0 until group.childCount) {
-            val rb = group.getChildAt(i) as RadioButton
-            rb.setButtonDrawable(Ui.radio(activity, rb.isChecked))
+            when (val child = group.getChildAt(i)) {
+                is RadioButton -> child.setButtonDrawable(Ui.radio(activity, child.isChecked))
+                is ViewGroup -> refreshRadioDrawables(child)
+            }
         }
     }
 
-    /** 四组单选全部刷新选中态染色（自绘 drawable 不感知 checked 状态变化，必须手动重设）。 */
+    /**
+     * 各组单选全部刷新选中态染色（自绘 drawable 不感知 checked 状态变化，必须手动重设）。
+     * vc161：改用容器字段而非 `.parent` —— WrapRadioGroup 的按钮挂在**行**上，
+     * 取 parent 只能刷到一行，会漏掉折行后另一行的按钮。
+     */
     private fun refreshAllDrawables() {
-        (rbOrientLand.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
-        (rbAutoCar.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
-        (rbAvFull.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
+        refreshRadioDrawables(rgOrientation)
+        refreshRadioDrawables(rgAutoChannel)
+        // avGroup 是局部变量（非字段），且其仍是 RadioGroup、按钮为直接子级，用 parent 取
+        (rbAvFull.parent as? ViewGroup)?.let { refreshRadioDrawables(it) }
         // 1.0.29：分辨率设定组。
-        (rbResFit.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
+        refreshRadioDrawables(rgResolution)
         // vc157：帧率四档组。
-        (rbFps25.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
-        // vc157：无线承载方式组。
-        (rbCarrierHotspot.parent as? RadioGroup)?.let { refreshRadioDrawables(it) }
+        refreshRadioDrawables(rgFps)
     }
 
     // ---------- 表单读写 ----------
@@ -916,6 +914,7 @@ class SettingsPage(private val activity: MainActivity) {
         inputBuffer.setText(config.mediaBufferMillis.toString())
         when (config.activeChannel) {
             "relay" -> rbAutoRelay.isChecked = true
+            "p2p" -> rbAutoP2p.isChecked = true
             "usb" -> rbAutoUsb.isChecked = true
             else -> rbAutoCar.isChecked = true
         }
@@ -960,10 +959,28 @@ class SettingsPage(private val activity: MainActivity) {
         }
         cbSpeaker.isChecked = config.speakerForCalls
         cbVoiceMedia.isChecked = config.voiceRoutedToMedia
-        // vc157：无线承载方式回显（默认车机热点）。
-        if (config.wifiP2pMode) rbCarrierP2p.isChecked = true else rbCarrierHotspot.isChecked = true
         cbPrebuffer.isChecked = config.audioPrebuffer
         isLoading = false
+    }
+
+    /**
+     * vc159 引入，vc161 改实现：方向是**启动级全局属性**（onCreate 读 config 决定
+     * requestedOrientation），vc147 的「下次连接生效」对它不成立，必须让 onCreate 重跑。
+     *
+     * ⚠️ 原实现（Launcher intent + `killProcess`）有两个问题，vc161 已改掉：
+     * ① `startActivity` 是异步的，紧接着 `killProcess`，车机这类慢 AMS 上可能
+     *    **intent 还没送达进程就被杀** → 表现为「点了应用没起来」；
+     * ② `killProcess` **不走 onDestroy**，LiteSessionService 无法优雅拆栈
+     *    （iPhone 收不到断开信号）、VPN 不解绑，只能靠下次启动 `ensureCleanVpnState()`
+     *    自检兜底。
+     *
+     * 改 `recreate()`：同样完整重跑 onCreate（满足"启动级属性"要求），但走完整生命周期，
+     * onDestroy 会正常清理会话与 VPN，且不杀进程。
+     * LiteConfig.save 走 commit()，persistFromForm 完成即已落盘，重建不丢
+     * （nova 3e「apply 未落盘」教训）。
+     */
+    private fun restartAppForOrientation() {
+        activity.recreate()
     }
 
     /** 全量读控件合并落盘（copy 保底；信道/加密归热点配置页，这里不触碰）。 */
@@ -994,8 +1011,10 @@ class SettingsPage(private val activity: MainActivity) {
                 resolutionMode = currentResolutionMode(),
                 manualWidth = manualW,
                 manualHeight = manualH,
+                // vc158：新增 p2p（Wi-Fi Direct）通道选项。
                 activeChannel = when {
                     rbAutoRelay.isChecked -> "relay"
+                    rbAutoP2p.isChecked -> "p2p"
                     rbAutoUsb.isChecked -> "usb"
                     else -> "car"
                 },
@@ -1008,8 +1027,6 @@ class SettingsPage(private val activity: MainActivity) {
                 },
                 speakerForCalls = cbSpeaker.isChecked,
                 voiceRoutedToMedia = cbVoiceMedia.isChecked,
-                // vc157：无线承载方式落盘（Wi-Fi Direct 优先于热点，仅 car 通道生效）。
-                wifiP2pMode = rbCarrierP2p.isChecked,
                 audioPrebuffer = cbPrebuffer.isChecked,
                 softwareVideoDecoder = cbSoftDecode.isChecked,
                 orientationMode = currentOrientationMode(),
@@ -1056,12 +1073,12 @@ class SettingsPage(private val activity: MainActivity) {
         }
         inputResW.setText(w.toString())
         inputResH.setText(h.toString())
-        AlertDialog.Builder(activity)
+        AppDialog.Builder(activity)
             .setTitle("确认修改分辨率")
             .setMessage(
                 "原分辨率：${current.manualWidth}×${current.manualHeight}，确认修改为 ${w}×$h 吗？\n\n" +
                     "回报给 iPhone 的实际分辨率 = 该值 ×「分辨率自定义」百分比。\n\n" +
-                    "点击「应用」后将自动重启软件，重启后生效。",
+                    "点击「应用」后保存，下次连接生效。",
             )
             .setNegativeButton("取消") { _, _ ->
                 inputResW.setText(current.manualWidth.toString())
@@ -1094,9 +1111,9 @@ class SettingsPage(private val activity: MainActivity) {
             if (clamped > 100) {
                 append("注意：高于 100% 会放大视频画面（超采样），弱硬件可能卡顿发热。\n\n")
             }
-            append("点击「应用」后将自动重启软件，重启后应用新的分辨率；点击主页连接即按新参数连接。")
+            append("点击「应用」后保存，下次连接生效。")
         }
-        AlertDialog.Builder(activity)
+        AppDialog.Builder(activity)
             .setTitle(if (clamped > 100) "放大超采样确认" else "确认修改分辨率")
             .setMessage(message)
             .setNegativeButton("取消") { _, _ -> input.setText(current.toString()) }
@@ -1136,7 +1153,7 @@ class SettingsPage(private val activity: MainActivity) {
             setPadding(dip(12), dip(8), dip(12), dip(8))
         }
         val scroll = ScrollView(activity).apply { addView(body) }
-        AlertDialog.Builder(activity)
+        AppDialog.Builder(activity)
             .setTitle("运行日志")
             .setView(scroll)
             .setNeutralButton("清空") { _, _ -> LiteLog.clear() }
@@ -1202,7 +1219,7 @@ class SettingsPage(private val activity: MainActivity) {
             addView(giteeLabel("问题描述（必填，将随日志一起上传）"))
             addView(descInput, block(top = dip(6)))
         }
-        AlertDialog.Builder(activity)
+        AppDialog.Builder(activity)
             .setTitle("上传运行日志")
             .setView(column)
             .setNegativeButton("取消", null)

@@ -276,7 +276,31 @@ android {
         // 选 P2P 时直接建 GO，不再依赖车机热点开关状态（绕过 SoftAP 判死逻辑）；
         // 同时帧率由 limit30Fps 布尔升级为四档（25/30/40/60，默认 60），
         // 修复页面重建后指示灯变灰/断开按钮消失（render 末尾清空渲染哨兵）。
-        versionCode = 157
+        // vc158（UI 调整）：①竖屏弹窗宽度收敛（AlertDialog 按物理横屏宽布局会被裁，
+        // 22 处构建点统一走 showFitted()）；②Wi-Fi Direct 由「体验优化里的承载方式开关」
+        // 改为「自动连接方式」第四项（车机热点/中继热点/Wi-Fi Direct/USB连接），
+        // 承载方式单选删除，旧 wifi_p2p_mode=true 迁移为 activeChannel=p2p；
+        // ③帧率四档从体验优化组移入「画面设置」，小节标题「画面帧率」。
+        // vc159（设置页闪退修复）：vc158 帧率组迁移残留——rgFps 在体验优化组旧位置
+        // 忘删（第二次 addView 同一实例）→ 点设置必崩 IllegalStateException；
+        // logcat -b crash 实锤，删除旧挂载行（SettingsPage buildContent 单条 column，横竖屏同崩）。
+        // vc160（弹窗错位修复）：vc158 的 fitWidthToScreen 用 displayMetrics 短边做锚点，
+        // 冷启动横→竖旋转后 dm 陈旧 → 弹窗仍右溢（K60 实测）；改 decorView.width 优先
+        // + setGravity(CENTER)。横竖屏弹窗行为改真实冷重启（启动级属性「下次连接生效」
+        // 不成立），音视频/分辨率/超采样文案对齐「下次连接生效」。
+        // vc161（弹窗错位根治）：放弃 AlertDialog 独立 Window——Manifest 是
+        // screenOrientation=landscape + configChanges 自处理，运行时强制竖屏，
+        // Dialog 由 WMS 按 display 坐标系居中于横屏 frame → 竖屏下必右溢，
+        // 改宽度/锚点都无效（vc158/vc160 两次实测均未解决）。
+        // 新增 AppDialog.kt：**应用内覆盖层**（同 errorCardView 做法），22 处调用点
+        // 由 AlertDialog.Builder 机械替换；fitWidthToScreen/showFitted 随之删除。
+        // 追加两条竖屏修复：①弹窗内容区改「包内容、限高 70%」（短内容不再留白）
+        // ②自动连接方式/画面帧率两组单选改 WrapRadioGroup 可折行容器
+        //   （竖屏四项一行放不下；首版折行挂在 onSizeChanged 导致整组空白，改 onMeasure）。
+        // vc162：横竖屏确认后的重启方式由「Launcher intent + killProcess」改为
+        // activity.recreate()——避免 startActivity 未送达就被杀（点了没起来），
+        // 且走完整生命周期让 onDestroy 优雅拆栈（原实现不执行 onDestroy）。
+        versionCode = 162
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties

@@ -84,9 +84,6 @@ data class LiteConfig(
     // 1.0.17：CarPlay 显示名称（/info name + Bonjour 服务名）。自定义返回图标页可改，
     // 选厂家预置图标时自动替换为厂家名；空串回落 "DiPlay"。
     val carIconName: String = "DiPlay",
-    // vc157：Wi-Fi Direct 一级模式（默认关）。开 = car 通道无线承载直接用 P2P GO
-    // （不再依赖车机热点开关状态，绕过 SoftAP 判死）；关 = 车机热点 MANUAL。仅 car 通道生效。
-    val wifiP2pMode: Boolean = false,
 ) {
     companion object {
         private const val PREFS = "diplay_lite"
@@ -180,7 +177,22 @@ data class LiteConfig(
                 bootAutoHotspot = prefs.getBoolean("boot_auto_hotspot", false),
                 bootAutoWifi = prefs.getBoolean("boot_auto_wifi", false),
                 autoConnect = prefs.getBoolean("auto_connect", false),
-                activeChannel = prefs.getString("active_channel", "car") ?: "car",
+                // vc158：Wi-Fi Direct 由「体验优化里的承载方式开关」改为自动连接方式第四项（p2p）。
+                // 旧版把承载方式选成 Wi-Fi Direct（wifi_p2p_mode=true）的用户迁移为 activeChannel=p2p。
+                //
+                // ⚠️ 不能写成 prefs.getString("active_channel", null) ?: ... —— save() 恒写该键，
+                // 老用户的值必为显式的 "car"，Elvis 永不生效，迁移会被静默跳过，
+                // 恰好漏掉最需要迁移的那批人（vc157 里选了承载方式=Wi-Fi Direct 的）。
+                // 旧语义中 wifiP2pMode 仅在非 usb / 非 relay（即 car 通道）下生效，
+                // 故仅当存储值为 car 或缺失时才迁移；relay / usb 保持原值。
+                activeChannel = if (
+                    prefs.getString("active_channel", null).let { it == null || it == "car" } &&
+                    prefs.getBoolean("wifi_p2p_mode", false)
+                ) {
+                    "p2p"
+                } else {
+                    prefs.getString("active_channel", "car") ?: "car"
+                },
                 relaySsid = prefs.getString("relay_ssid", "").orEmpty(),
                 relayPassword = prefs.getString("relay_password", "").orEmpty(),
                 carIpv6Channel = prefs.getInt("car_ipv6_channel", 0),
@@ -188,7 +200,6 @@ data class LiteConfig(
                 relayIpv6Channel = prefs.getInt("relay_ipv6_channel", 0),
                 relayIpv4Channel = prefs.getInt("relay_ipv4_channel", 0),
                 carIconName = prefs.getString("car_icon_name", "DiPlay").orEmpty().ifBlank { "DiPlay" },
-                wifiP2pMode = prefs.getBoolean("wifi_p2p_mode", false),
             )
         }
 
@@ -235,8 +246,6 @@ data class LiteConfig(
                 .putInt("relay_ipv6_channel", config.relayIpv6Channel)
                 .putInt("relay_ipv4_channel", config.relayIpv4Channel)
                 .putString("car_icon_name", config.carIconName)
-                // vc157：Wi-Fi Direct 一级模式开关。
-                .putBoolean("wifi_p2p_mode", config.wifiP2pMode)
                 // 注意：applied_video_key 故意不在这里写 —— 它只由 saveAppliedVideoKey() 维护，
                 // 否则表单保存（每次勾选都会触发）会用默认值把它冲掉。
                 //

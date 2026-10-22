@@ -1,7 +1,6 @@
 package com.shilapi.diplay.lite
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothProfile
 import android.content.Context
@@ -62,7 +61,7 @@ internal object Diagnostics {
             toast(activity, "CarPlay 会话进行中，请断开连接后再执行系统诊断")
             return
         }
-        AlertDialog.Builder(activity)
+        AppDialog.Builder(activity)
             .setTitle("系统诊断")
             .setMessage(
                 "将对车机硬件逐项检测（蓝牙 / Wi-Fi / 热点 / USB / ROOT），" +
@@ -92,7 +91,7 @@ internal object Diagnostics {
     private fun quickCheckConfirm(activity: Activity) {
         if (!running.compareAndSet(false, true)) return
         val skip = Runnable { markReported(activity); running.set(false) }
-        AlertDialog.Builder(activity)
+        AppDialog.Builder(activity)
             .setTitle("首次使用建议")
             .setMessage("建议先对车机硬件做一次快速检测（约 10 秒，零副作用），\n" +
                 "了解本机支持哪些连接方式。\n\n若检测期间弹出 ROOT 授权请求，请选择允许。\n\n" +
@@ -425,7 +424,7 @@ internal object Diagnostics {
 
     /** 逐项检测过程弹窗：文本区逐项更新 + 人工步骤按钮行。 */
     private class ProgressPanel(activity: Activity) {
-        private val dialog: AlertDialog
+        private val dialog: AppDialog
         private val text = TextView(activity)
         private val buttonsRow = LinearLayout(activity)
         private val body = StringBuilder()
@@ -455,7 +454,7 @@ internal object Diagnostics {
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
                 ))
             }
-            dialog = AlertDialog.Builder(activity)
+            dialog = AppDialog.Builder(activity)
                 .setTitle("系统检测中")
                 .setView(column)
                 .setCancelable(false)
@@ -516,13 +515,14 @@ internal object Diagnostics {
                     setPadding(36, 24, 36, 24)
                 })
             }
-            val builder = AlertDialog.Builder(activity)
+            val builder = AppDialog.Builder(activity)
                 .setTitle("诊断报告")
                 .setView(scroll)
                 .setPositiveButton("关闭", null)
             if (onUpload != null) {
                 builder.setNeutralButton("上传诊断日志") { _, _ -> onUpload() }
             }
+            // vc161：弹窗改为应用内覆盖层 AppDialog，不再需要宽度收敛。
             builder.show()
         }
     }

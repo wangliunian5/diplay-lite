@@ -373,7 +373,7 @@ internal class SteeringPage(private val activity: MainActivity) {
     }
 
     private fun confirmClearConfig() {
-        android.app.AlertDialog.Builder(activity)
+        AppDialog.Builder(activity)
             .setTitle("清除已学配置")
             .setMessage("将清除全部已学习的方控按键绑定，确定吗？")
             .setNegativeButton("取消", null)
@@ -390,7 +390,7 @@ internal class SteeringPage(private val activity: MainActivity) {
 
     /** 1 对 1 清除单个键位的绑定。 */
     private fun confirmClearOne(op: String, label: String) {
-        android.app.AlertDialog.Builder(activity)
+        AppDialog.Builder(activity)
             .setTitle("清除绑定")
             .setMessage("将清除【$label】的按键绑定，确定吗？")
             .setNegativeButton("取消", null)

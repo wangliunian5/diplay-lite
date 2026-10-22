@@ -1,7 +1,6 @@
 package com.shilapi.diplay.lite
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.content.Intent
 import android.provider.Settings
@@ -94,7 +93,7 @@ object SystemSettingsJumps {
         entries.forEach { labels.add("${it.name ?: "未知设备"}\n${it.address}") }
         labels.add("手动输入地址…")
         labels.add("清除选择（恢复自动）")
-        AlertDialog.Builder(activity)
+        AppDialog.Builder(activity)
             .setTitle("选择 iPhone 蓝牙设备")
             .setItems(labels.toTypedArray()) { _, which ->
                 when {
@@ -113,7 +112,7 @@ object SystemSettingsJumps {
             hint = "AA:BB:CC:DD:EE:FF"
             setText(current)
         }
-        AlertDialog.Builder(activity)
+        AppDialog.Builder(activity)
             .setTitle("手动输入蓝牙地址")
             .setView(input)
             .setNegativeButton("取消", null)

@@ -1,7 +1,6 @@
 package com.shilapi.diplay.lite
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -130,7 +129,7 @@ class MainActivity : Activity() {
 
     // 1.0.16（方案四②）：开机自启等待弹窗——上电后等勾选的蓝牙/热点就绪并稳定 10s 再自动连接。
     private var autostartWaitActive = false
-    private var autostartDialog: AlertDialog? = null
+    private var autostartDialog: AppDialog? = null
     private var autostartStableSecs = 0
     private var autostartDeadline = 0L
 
@@ -169,7 +168,7 @@ class MainActivity : Activity() {
                 autostartWaitActive = false
                 autostartDialog?.apply {
                     setMessage("等待超时：勾选的蓝牙/热点未就绪，自动连接已取消")
-                    setButton(AlertDialog.BUTTON_POSITIVE, "确定") { d, _ -> d.dismiss() }
+                    setPositiveButton("确定")
                     show()
                 }
                 autostartDialog = null
@@ -584,7 +583,7 @@ class MainActivity : Activity() {
 
     /** 主页返回：确认退出弹窗（防止误触直接杀会话）。 */
     private fun confirmExit() {
-        AlertDialog.Builder(this)
+        AppDialog.Builder(this)
             .setTitle("退出 DiPlay Lite")
             .setMessage("确认退出软件吗？")
             .setNegativeButton("取消", null)
@@ -1020,6 +1019,8 @@ class MainActivity : Activity() {
 
     private fun defaultChannelHint(channel: String): String = when (channel) {
         "relay" -> "默认通道：中继热点。车机与手机同连随身WIFI后自动建立 CarPlay。"
+        // vc158：Wi-Fi Direct 成为自动连接方式第四项。
+        "p2p" -> "默认通道：Wi-Fi Direct。车机自建点对点组，iPhone 加入后自动建立 CarPlay。"
         "usb" -> "默认通道：USB 连接。数据线直连，当 iPhone 提示时允许 CarPlay。"
         else -> "默认通道：车机热点。手机连上车机热点后自动建立 CarPlay。"
     }
@@ -1164,6 +1165,16 @@ class MainActivity : Activity() {
                     return
                 }
                 startSession(config, key)
+            }
+            // vc158：Wi-Fi Direct 独立通道。与 car 同为无线，但凭据由系统随机生成，
+            // 因此不需要（也不应）校验手填的热点名称/密码。
+            "p2p" -> {
+                val key = LiteConfig.videoKeyOf(config.videoScalePercent, config.videoFps)
+                if (config.appliedVideoKey.isNotEmpty() && config.appliedVideoKey != key) {
+                    confirmVideoChange()
+                    return
+                }
+                startSession(config, key, "p2p")
             }
             "relay" -> {
                 if (config.relaySsid.isBlank()) {
@@ -1322,7 +1333,7 @@ class MainActivity : Activity() {
      */
     private fun showVpnConfirmDialog(config: LiteConfig, videoKey: String) {
         LiteLog.log("ui", "USB 通道：系统 VPN 授权被跳过（mPackage 残留），弹 app 内确认框")
-        val dialog = android.app.AlertDialog.Builder(this)
+        val dialog = AppDialog.Builder(this)
             .setTitle("VPN 连接确认")
             .setMessage("本次 USB 有线连接需要建立 VPN 网络通道，是否继续？")
             .setPositiveButton("确定") { _, _ ->
@@ -1342,7 +1353,7 @@ class MainActivity : Activity() {
      * ① 已 root → 授权后点「重试授权」自动写 appops + 复检建链；
      * ② 无 root → 提示改用无线连接（车机热点/中继），此类车机有线结构性不可用。
      * 重试的 su 写入放后台线程（grantVpnConsentViaRoot 内部 4s 轮询），结果 post 回
-     * 主线程；API16 兼容：仅用 AlertDialog 既有 API，无新依赖。
+     * 主线程；API16 兼容：仅用自绘 AppDialog（应用内覆盖层），无新依赖。
      */
     private fun showVpnConsentGuideDialog(prepareBroken: Boolean) {
         val reason = if (prepareBroken) {
@@ -1351,7 +1362,7 @@ class MainActivity : Activity() {
             "车机系统缺失 VPN 授权组件（vpndialogs 被裁剪）"
         }
         LiteLog.log("ui", "USB 通道：VPN 授权失败引导页展示（$reason）")
-        android.app.AlertDialog.Builder(this)
+        AppDialog.Builder(this)
             .setTitle("USB 有线模式需要 VPN 授权")
             .setMessage(
                 "$reason，且当前未获取 root，无法完成一次性授权。\n\n" +
@@ -1389,7 +1400,12 @@ class MainActivity : Activity() {
     /** vc154：引导页「改用无线连接」动作——沿用最近一次用过的无线通道（无记录走车机热点）。 */
     private fun switchToWirelessFromGuide() {
         val saved = getSharedPreferences(SESSION_PREFS, MODE_PRIVATE).getString(SESSION_CHANNEL_KEY, null)
-        val channel = if (saved == "relay") "relay" else "car"
+        // vc158：沿用最近一次用过的无线通道（car / p2p / relay），无记录走车机热点。
+        val channel = when (saved) {
+            "relay" -> "relay"
+            "p2p" -> "p2p"
+            else -> "car"
+        }
         LiteLog.log("ui", "VPN 授权引导页：用户选择改用无线连接（channel=$channel）")
         connect(channel)
     }
@@ -1481,6 +1497,12 @@ class MainActivity : Activity() {
                 "ui",
                 "发起连接（relay）：ssid=${config.relaySsid} videoKey=$videoKey duck=${config.navDuckPercent}%",
             )
+        } else if (channel == "p2p") {
+            // vc158：Wi-Fi Direct 凭据由系统随机生成，日志不打印手填热点字段。
+            LiteLog.log(
+                "ui",
+                "发起连接（p2p/Wi-Fi Direct）：凭据随机生成 videoKey=$videoKey duck=${config.navDuckPercent}%",
+            )
         } else {
             LiteLog.log(
                 "ui",
@@ -1506,7 +1528,7 @@ class MainActivity : Activity() {
      * （1054/1068/1318 的 key 比较自然通过）。
      */
     private fun confirmVideoChange() {
-        AlertDialog.Builder(this)
+        AppDialog.Builder(this)
             .setTitle("已修改分辨率/帧率")
             .setMessage(
                 "视频参数将在下次连接时生效。\n\n" +
@@ -1541,11 +1563,12 @@ class MainActivity : Activity() {
         val config = LiteConfig.load(this)
         if (!config.autoConnect) return
         val channel = config.activeChannel
-        if (channel != "car" && channel != "relay" && channel != "usb") return
+        // vc158：新增 p2p（Wi-Fi Direct）通道。
+        if (channel != "car" && channel != "relay" && channel != "usb" && channel != "p2p") return
         val ssidBlank = when (channel) {
             "car" -> config.ssid.isBlank()
             "relay" -> config.relaySsid.isBlank()
-            else -> false // USB 有线不依赖热点凭据
+            else -> false // USB 有线 / Wi-Fi Direct 均不依赖手填热点凭据
         }
         if (ssidBlank) return
         autoConnectTried = true
@@ -1581,7 +1604,7 @@ class MainActivity : Activity() {
         autostartWaitActive = true
         autostartStableSecs = 0
         autostartDeadline = System.currentTimeMillis() + AUTOSTART_WAIT_TIMEOUT_MILLIS
-        autostartDialog = AlertDialog.Builder(this)
+        autostartDialog = AppDialog.Builder(this)
             .setTitle("开机自启动")
             .setMessage("等待勾选的蓝牙或WIFI热点启动…")
             .setCancelable(false)

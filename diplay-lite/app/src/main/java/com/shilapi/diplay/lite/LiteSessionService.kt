@@ -277,6 +277,8 @@ class LiteSessionService : Service() {
         val config = LiteConfig.load(this)
         val usb = requestedChannel == "usb"
         val relay = requestedChannel == "relay"
+        // vc158：Wi-Fi Direct 成为自动连接方式第四项（p2p），不再走 wifiP2pMode 开关。
+        val p2p = requestedChannel == "p2p"
         if (usb) {
             // U4 USB 有线：不走 Wi-Fi/蓝牙段，热点凭据校验全部跳过。
         } else if (relay && config.relaySsid.isBlank()) {
@@ -422,19 +424,19 @@ class LiteSessionService : Service() {
                     // 会话永远建不起来）。C8815 之所以"碰巧"正常，是因为 API16 的
                     // NetworkInterface.getIndex 取不到（回退 0），IPv6 分支被跳过而落到 IPv4。
                     // RELAY：双 client 接随身WiFi，manualHotspotSsid/Passphrase 字段复用为中继凭据。
-                    // vc157：wifiP2pMode 开（仅 car 通道）→ WIFI_P2P 一级模式，直接建 P2P GO
+                    // vc158：p2p = 自动连接方式选了 Wi-Fi Direct，直接建 P2P GO，
                     // 不再依赖车机热点开关；SSID/密码传 null（P2P 凭据系统随机，必填校验不适用）。
                     wirelessHotspotMode = when {
                         usb -> WirelessHotspotMode.MANUAL_IPV4
                         relay -> WirelessHotspotMode.RELAY
-                        config.wifiP2pMode -> WirelessHotspotMode.WIFI_P2P
+                        p2p -> WirelessHotspotMode.WIFI_P2P
                         else -> WirelessHotspotMode.MANUAL_IPV4
                     },
-                    manualHotspotSsid = if (usb || (!relay && config.wifiP2pMode)) null else ssid,
+                    manualHotspotSsid = if (usb || p2p) null else ssid,
                     manualHotspotPassphrase = when {
                         usb -> null
                         relay -> passphrase.takeIf { it.isNotEmpty() }
-                        !relay && config.wifiP2pMode -> null
+                        p2p -> null
                         security == ManualHotspotSecurity.OPEN -> null
                         else -> config.password
                     },

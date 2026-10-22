@@ -1,6 +1,5 @@
 package com.shilapi.diplay.lite
 
-import android.app.AlertDialog
 import android.graphics.Typeface
 import android.view.Gravity
 import android.view.View
@@ -226,7 +225,7 @@ class HotspotPage(private val activity: MainActivity, private val mode: String) 
     private fun pickChannel(title: String, current: Int, options: List<Int>, recommended: Set<Int>, onPicked: (Int) -> Unit) {
         val labels = options.map { channelOptionLabel(it, recommended) }.toTypedArray()
         val checked = options.indexOf(current).coerceAtLeast(0)
-        AlertDialog.Builder(activity)
+        AppDialog.Builder(activity)
             .setTitle(title)
             .setSingleChoiceItems(labels, checked) { dialog, which ->
                 val picked = options.getOrNull(which) ?: 0

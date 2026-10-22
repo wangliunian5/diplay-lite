@@ -10,10 +10,106 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.RadioButton
+
+// vc161 说明：vc158 / vc160 曾在此提供 Dialog.fitWidthToScreen() 与
+// AlertDialog.Builder.showFitted()，试图靠「收敛宽度」解决竖屏弹窗被裁。
+// 两次实测均未解决（宽度值算对了，问题在 Dialog 独立 Window 由 WMS 按 display
+// 坐标系定位，居中于横屏 frame）。该方案已废弃，弹窗改为应用内覆盖层
+// AppDialog（见 AppDialog.kt 头注释），这两个 helper 随之删除，避免留下死代码。
+
+/**
+ * vc161：可自动换行的单选容器。
+ *
+ * RadioGroup 本质是 LinearLayout，**只能单行**。竖屏（窄）下四个选项（如
+ * 「自动连接方式」= 车机热点/中继热点/Wi-Fi Direct/USB连接）挤在一行放不下，
+ * 会被压缩成文字折行 → 表现为选项错位、对不齐（K60 竖屏实测）。
+ *
+ * 本容器按可用宽度贪心折行（放得下就一行，放不下自动多行），
+ * 并自行维护互斥选中（RadioGroup 的单选逻辑依赖直接父子关系，折行后需手写）。
+ */
+class WrapRadioGroup(context: Context) : LinearLayout(context) {
+    init {
+        orientation = VERTICAL
+    }
+
+    private val items = mutableListOf<RadioButton>()
+    private var onChange: ((Int) -> Unit)? = null
+    private var suppress = false
+    private var lastWidth = -1
+
+    fun addButtons(vararg buttons: RadioButton) {
+        for (b in buttons) {
+            items.add(b)
+            b.setOnCheckedChangeListener { _, checked ->
+                if (suppress) return@setOnCheckedChangeListener
+                if (checked) {
+                    suppress = true
+                    items.forEach { if (it !== b) it.isChecked = false }
+                    suppress = false
+                }
+                onChange?.invoke(items.indexOf(b))
+            }
+        }
+        relayout(lastWidth)
+    }
+
+    fun setOnCheckedChangeListener(listener: (Int) -> Unit) {
+        onChange = listener
+    }
+
+    /** 选中某项（其余自动取消）。 */
+    fun check(button: RadioButton?) {
+        suppress = true
+        items.forEach { it.isChecked = (it === button) }
+        suppress = false
+    }
+
+    /**
+     * 折行必须在 **onMeasure** 里做：此时宽度从 MeasureSpec 一定拿得到。
+     * 不能挂在 onSizeChanged——addButtons 时容器尚未挂到层级（宽=0，relayout 直接 return），
+     * 挂上后若尺寸不再变化 onSizeChanged 不会再来 → 按钮永远进不了视图树，
+     * 表现为「选项整组空白」（K60 竖屏实测）。lastWidth 守卫保证只在宽度变化时重建，
+     * relayout 内部 addView 触发的二次 measure 会在此收敛。
+     */
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val w = MeasureSpec.getSize(widthMeasureSpec)
+        if (w > 0 && w != lastWidth) relayout(w)
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+    }
+
+    private fun relayout(w: Int) {
+        lastWidth = w
+        if (w <= 0 || items.isEmpty()) return
+        // 先把按钮从旧行里摘出来，再重建行
+        for (i in 0 until childCount) (getChildAt(i) as? ViewGroup)?.removeAllViews()
+        removeAllViews()
+
+        val gap = (10 * resources.displayMetrics.density).toInt()
+        var row = LinearLayout(context).apply { orientation = HORIZONTAL }
+        var used = 0
+        for (b in items) {
+            b.measure(
+                MeasureSpec.makeMeasureSpec(w, MeasureSpec.AT_MOST),
+                MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED),
+            )
+            val bw = b.measuredWidth
+            if (used > 0 && used + gap + bw > w) {
+                addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+                row = LinearLayout(context).apply { orientation = HORIZONTAL }
+                used = 0
+            }
+            row.addView(b)
+            used += bw + gap
+        }
+        addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+    }
+}
 
 /**
  * M6k14 深色 UI 工具箱：回归零 XML 纪律后，全部视觉常量与背景件收敛在此。

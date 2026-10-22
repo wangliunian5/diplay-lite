@@ -65,8 +65,14 @@ CONTENT_PATTERNS = (
     # Credentials embedded directly into remote URLs, e.g. the Gitee/GitHub remotes
     # that carry a personal access token. Never match a literal secret here -- this
     # script itself ships in the public tree, so it must never contain one.
+    #
+    # The credential segment deliberately excludes '<' and '>': documentation
+    # routinely shows the push recipe as `https://oauth2:<TOKEN>@gitee.com/...`,
+    # and flagging that placeholder would fail the build for a file that is in fact
+    # telling the reader never to persist a token. A real token has no angle
+    # brackets, so it is still caught.
     ("credentials in remote URL",
-     re.compile(rb"https://[^\s/:@]+:[^\s/:@]+@(?:gitee|github)\.com")),
+     re.compile(rb"https://[^\s/:@]+:[^\s/:@<>]+@(?:gitee|github)\.com")),
     ("GitHub PAT", re.compile(rb"\bghp_[A-Za-z0-9]{20,}\b")),
     ("hardcoded secret assignment",
      re.compile(rb"(?i)\b(token|password|secret|api_?key)\s*[=:]\s*[\"'][^\"'\s]{8,}[\"']")),
