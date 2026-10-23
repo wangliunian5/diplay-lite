@@ -375,6 +375,8 @@ class CarPlayController(
     @Volatile private var wiredUsbSession: Iap2UsbSession? = null
     @Volatile private var wiredCsm: Iap2Session? = null
     @Volatile private var wiredBridge: Ipv6NcmBridge? = null
+    /** vc180：最近一次有线 attach 失败的可诊断原因（供 [wiredAttachFailureMessage] 生成用户文案）。 */
+    @Volatile private var lastWiredAttachFailure: String? = null
     // vc68：有线 mDNS 应答器（iOS16.x 在 NCM 链路上 mDNS 发现 _airplay，无应答拒绝起会话）
     @Volatile private var wiredBonjour: WiredBonjourAdvertiser? = null
     // vc110（T3 KK 域）：JmDNS 查询接收失效后的自研替代，二者互斥（优先 responder）
@@ -3145,7 +3147,7 @@ class CarPlayController(
             val ncmHostMac = ncm.hostMac ?: config.hostMac
             debugLog("ncm using hostMac=${ncmHostMac.macString()}")
             val bridge = attachWiredNetwork(ncm, ncmHostMac)
-                ?: throw IphoneUsbException.DeviceUnavailable("Could not attach the NCM/AirPlay transport")
+                ?: throw IphoneUsbException.DeviceUnavailable(wiredAttachFailureMessage())
             wiredBridge = bridge
             ncmOwnedLocally = false
             debugLog("wired NCM/AirPlay transport attached")
@@ -3469,6 +3471,29 @@ class CarPlayController(
     }
 
     /**
+     * vc180：有线 attach 失败的用户可见文案分级。
+     *
+     * 旧文案恒为「USB 网络通道建立失败，请拔插数据线重试」——对内核无 TUN 的车机
+     * （AC822X/API17 实测：5 次全在同一处 7~19ms 内失败）是纯误导：拔插多少次都不可能
+     * 成功。按原因分两类：
+     * ① 结构性不可治（内核无 TUN 节点 / VpnJni 建不出接口）→ 直说不支持，引导改无线；
+     * ② 其余（VPN 未授权、IPv6 ioctl 失败、等待超时）→ 保留原提示并括注技术细节，
+     *    便于远程定位（细节来自 [WiredVpnService.lastFailure]）。
+     */
+    private fun wiredAttachFailureMessage(): String {
+        val detail = lastWiredAttachFailure
+        return when {
+            detail == null -> "Could not attach the NCM/AirPlay transport"
+            detail.contains("no TUN device node") ||
+                detail.contains("Cannot create interface") ||
+                detail.contains("CONFIG_TUN missing") ->
+                "USB 有线需要车机内核支持 VPN 隧道（TUN），本车机缺少 /dev/tun，" +
+                    "有线模式不可用；请改用无线连接（车机热点/中继）"
+            else -> "Could not attach the NCM/AirPlay transport ($detail)"
+        }
+    }
+
+    /**
      * 有线数据面 attach（对应上游 attachVpn，Lite 裁剪为三步）：
      * 1) WiredVpnService 仅承担 establish()（需要系统 VPN 授权），fd 交付给桥；
      * 2) AirPlayTcpServer 绑 NCM 链路本地地址（与无线共用进程内 server，互斥使用）；
@@ -3476,6 +3501,19 @@ class CarPlayController(
      */
     private fun attachWiredNetwork(ncm: NcmUsbBridge, hostMac: ByteArray): Ipv6NcmBridge? {
         onStatus(CarPlayStatus.AttachingNetwork)
+        // vc180（AC822X/API17 定案）：TUN 设备节点缺失 = 结构性不可治，立刻收手。
+        // 旧行为：照走完整 USB 建链（枚举 + 选配置 + claim NCM + Lockdown 配对），
+        // 实测白跑 11s 后在同一点报「wired VPN TUN unavailable」，用户只看到
+        // 「请拔插数据线重试」——拔插一万次也不可能成功（内核根本没 TUN）。
+        // 只判「缺失」这一个方向：节点存在但 establish 仍失败时不在此列，继续走原流程，
+        // 原因由 WiredVpnService.lastFailure() 带出（vc180 新增）。
+        if (!WiredVpnService.tunDevicePresent()) {
+            val reason = "no TUN device node (no /dev/tun, no /dev/net/tun); the kernel has no TUN support"
+            lastWiredAttachFailure = reason
+            debugLog("wired TUN device node missing: $reason")
+            ncm.close()
+            return null
+        }
         // vc74：内置 cdc_ncm 解绑守护（TS7 内核反复绑定 6.3 与 App 抢接口，外置循环实测
         // 有效后内置；无 root 静默降级）。claim(force=true) 只在 claim 时解绑一次，此后
         // 内核的周期性 rebind 由本守护处理。
@@ -3502,7 +3540,11 @@ class CarPlayController(
         }
         val tun = WiredVpnService.awaitTun(WIRED_VPN_TUN_TIMEOUT_MILLIS)
         if (tun == null) {
-            debugLog("wired VPN TUN unavailable")
+            // vc180：把 establish 的真实失败原因带出来（远程日志此前只有这一句无因的
+            // 「unavailable」，看不到是未授权、内核无 TUN 还是 IPv6 ioctl 失败）。
+            val reason = WiredVpnService.lastFailure()
+            lastWiredAttachFailure = reason
+            debugLog("wired VPN TUN unavailable${reason?.let { ": $it" } ?: ""}")
             ncm.close()
             return null
         }

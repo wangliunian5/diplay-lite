@@ -5,6 +5,7 @@ import android.net.VpnService
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -24,7 +25,12 @@ class WiredVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val linkLocal = intent?.getStringExtra(EXTRA_LINK_LOCAL) ?: DEFAULT_LINK_LOCAL
-        val tun = try {
+        // vc180：失败原因必须留痕。此前 establish 的失败只 Log.w 到 logcat，而日志上云
+        // 只带 LiteLog（进程内 [tag] 行），system logcat 不在其中 → 远程诊断完全盲区
+        // （AC822X/API17 远程只能看到「wired VPN TUN unavailable」，看不到为什么）。
+        val environment = probeTunEnvironment()
+        var failure: String? = null
+        val tun: ParcelFileDescriptor? = try {
             val builder = Builder()
                 .addAddress(linkLocal, 64)
                 .addRoute("fe80::", 64)
@@ -43,10 +49,23 @@ class WiredVpnService : VpnService() {
             } catch (error: Throwable) {
                 Log.w(TAG, "wired vpn allowFamily unavailable: ${error.message}")
             }
-            builder.establish()
+            val fd = builder.establish()
+            if (fd == null) {
+                // vc180：AOSP 4.x 的 Vpn.establish 在「未 prepared（mPackage 非本包）」或
+                // 「调用 UID 与 mPackage 的 UID 不一致」时直接 return null，不抛异常。
+                // 必须与抛异常分开记录，否则只能看到一个 null（AC822X 同款盲区）。
+                failure =
+                    "establish returned null: VPN is not prepared for this package, or the calling UID does not match"
+            }
+            fd
         } catch (error: Throwable) {
             Log.w(TAG, "wired vpn establish failed: ${error.message}")
+            failure = "establish threw ${error.javaClass.simpleName}: ${error.message}"
             null
+        }
+        if (failure != null) {
+            failure = "$failure; environment: $environment"
+            Log.w(TAG, "wired vpn unavailable: $failure")
         }
         if (tun != null) {
             // vc148b（T3 实测 shown=0 定案）：修复动作移出主线程——ensureTunMulticast
@@ -63,11 +82,44 @@ class WiredVpnService : VpnService() {
             // 直接覆盖泄漏——establish 前先关存量 fd（request() 路径此时已置 null，no-op）。
             established?.let { runCatching { it.close() } }
             established = tun
+            lastFailure = failure
             latch.countDown()
         }
         // 不常驻：fd 交付后即可停止；控制器持有 fd 的所有权。
         stopSelf(startId)
         return START_NOT_STICKY
+    }
+
+    /**
+     * vc180（AC822X/API17 远程排查定案）：TUN 能力前置体检。
+     *
+     * AOSP 4.2 的 VpnJni `create_interface()` 直接 `open("/dev/tun", O_RDWR|O_NONBLOCK)` 且
+     * **不检查 open 的返回值**，紧接着 `ioctl(tun, TUNSETIFF, &ifr)`；内核缺 CONFIG_TUN
+     * （或 /dev 下无节点）时 ioctl 作用在 fd=-1 上失败 → `ALOGE("Cannot allocate TUN")`
+     * → JNI `create()` 抛 `IllegalStateException("Cannot create interface")`。
+     * 同类死法还有 VpnJni 全局的 `inet6 = socket(AF_INET6, SOCK_DGRAM, 0)` 取不到
+     * （内核无 IPv6）→ IPv6 地址/路由 ioctl 全失败 → `IllegalStateException("Cannot set address")`。
+     * 二者在远程日志上都只是一句「wired VPN TUN unavailable」，无法区分，故建立前先体检。
+     * 只判存在性、不判权限：VpnJni 是在 system_server（uid 1000）里 open，app 侧
+     * canRead()=false 不代表系统侧打不开（/dev 目录一般 755，stat 本身可得）。
+     */
+    private fun probeTunEnvironment(): String {
+        val legacy = File("/dev/tun")
+        val modern = File("/dev/net/tun")
+        val node = when {
+            legacy.exists() -> "/dev/tun present"
+            modern.exists() -> "/dev/net/tun present"
+            else -> "no /dev/tun and no /dev/net/tun (kernel CONFIG_TUN missing?)"
+        }
+        val ipv6 = try {
+            val channel = java.nio.channels.DatagramChannel.open()
+            val opened = channel.isOpen
+            runCatching { channel.close() }
+            if (opened) "AF_INET6 socket ok" else "AF_INET6 channel not open"
+        } catch (error: Throwable) {
+            "AF_INET6 socket unavailable: ${error.message}"
+        }
+        return "$node; $ipv6"
     }
 
     /**
@@ -206,6 +258,19 @@ class WiredVpnService : VpnService() {
         private val lock = Any()
         private var established: ParcelFileDescriptor? = null
         private var latch = CountDownLatch(0)
+        /** vc180：上一次建立失败的原因（异常类型/消息 + TUN 环境体检），成功或未建过为 null。 */
+        private var lastFailure: String? = null
+
+        /** vc180：取上一次失败原因（供控制器写进 LiteLog 与用户可见文案）。 */
+        fun lastFailure(): String? = synchronized(lock) { lastFailure }
+
+        /**
+         * vc180：TUN 设备节点是否存在——建链**前**的粗判，用于确定无望时立刻收手，
+         * 不白跑一整轮 USB 枚举 + Lockdown 配对（AC822X 实测白跑 11s 才报同一句错）。
+         * 只判存在性：节点存在 ≠ 一定能 establish（还可能是 IPv6/ioctl 层失败），
+         * 故仅用于「缺失即失败」的方向，存在时照常进入原流程。
+         */
+        fun tunDevicePresent(): Boolean = File("/dev/tun").exists() || File("/dev/net/tun").exists()
 
         /** 拉起服务并请求建立 TUN；返回等待句柄。 */
         fun request(linkLocal: String): CountDownLatch {
@@ -214,6 +279,7 @@ class WiredVpnService : VpnService() {
                     runCatching { old.close() }
                     established = null
                 }
+                lastFailure = null
                 latch = CountDownLatch(1)
                 return latch
             }

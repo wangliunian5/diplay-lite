@@ -364,8 +364,17 @@ android {
         // TCP 探测」兜底同样失效，车机明明已拿到 192.168.137.35 却被判成「AP 隔离」硬失败
         // （同网段 K60 adb 通信正常，链路是活的）。改为查 /proc/net/arp 能解析到网关真实
         // MAC 即判链路活；解析不到仍回落 ICMP+TCP 原失败路径，保护不丢。
-        versionCode = 179
-        val versionPatch = 14
+        // vc180：有线 TUN 失败可观测化 + 失败文案可行动化（AC822X/API17 远程排查定案）。
+        // ① 该车机 5 次有线全在 network/attach 后 7~19ms 报「wired VPN TUN unavailable」：
+        //    AOSP 4.2 的 VpnJni create_interface() 直接 open("/dev/tun") 且不检查返回值，
+        //    内核缺 CONFIG_TUN 时 ioctl 作用在 fd=-1 上 → IllegalStateException("Cannot
+        //    create interface")；原因此前只 Log.w 到 system logcat，而日志上云只带 LiteLog
+        //    → 远程完全盲区。现把异常类型/消息 + /dev/tun 与 AF_INET6 体检记进 LiteLog，
+        //    并区分 establish「抛异常」与「返回 null（未 prepared/UID 不匹配）」两种失败。
+        // ② /dev/tun 缺失时建链前即收手（不再白跑 11s 的 USB 枚举 + Lockdown 配对），
+        //    失败文案改「内核不支持 TUN，请改用无线」，替代误导性的「请拔插数据线重试」。
+        versionCode = 180
+        val versionPatch = 15
         versionName = "1.2.$versionPatch.dongle"
     }
 
