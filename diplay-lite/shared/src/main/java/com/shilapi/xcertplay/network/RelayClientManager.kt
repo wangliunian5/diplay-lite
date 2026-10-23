@@ -5,6 +5,7 @@ import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import java.io.File
 import java.io.IOException
 import java.net.Inet4Address
 import java.net.InetAddress
@@ -152,6 +153,27 @@ class RelayClientManager(
 
     /** 已配置过的同名网络直接复用；否则新增一条（WPA2 或开放）。返回生效的 networkId。 */
     private fun attachNetwork(wifi: WifiManager): Int {
+        // vc179（K60 API34 实测，2026-10-23）：**先判「已经连在目标网上」。**
+        //
+        // 本文件整条链路用的是 legacy `WifiManager` 配置 API（configuredNetworks /
+        // addNetwork / updateNetwork / enableNetwork / reconnect），这些从 **API 30（Android 11）**
+        // 起对第三方应用一律失效——`addNetwork()` 恒返回 -1，`getConfiguredNetworks()` 读不到
+        // 任何已保存网络。K60（API34）上表现为：系统明明已经连着 7205 且 4-way handshake
+        // COMPLETED、IP 也拿到了，DiPlay 却读不到该配置 → 走 add 分支 → -1 → 抛
+        // 「check the password」，**与密码毫无关系，纯属误导**（该文案是给 API16 老车机写的，
+        // 那时 addNetwork 返回 -1 确实多半是凭据非法）。
+        //
+        // 高版本上唯一能走通的路径就是「系统设置里已经连好，App 直接复用」。这条短路对
+        // API16 老车机同样正确（本来就已经连上还去 update/disconnect/reconnect 纯属自伤），
+        // 因此不做版本分支，无条件前置。
+        if (isJoinedWithIp(wifi)) {
+            val liveId = wifi.connectionInfo?.networkId ?: -1
+            onDiagnostic(
+                "relay: already joined '$ssid' with an IP (netId=$liveId); " +
+                    "reusing the live connection, skipping the legacy Wi-Fi config API",
+            )
+            return liveId
+        }
         val existing = try {
             wifi.configuredNetworks.orEmpty().firstOrNull { it.SSID == quoted(ssid) }
         } catch (_: Exception) {
@@ -198,7 +220,8 @@ class RelayClientManager(
                     val added = wifi.addNetwork(relayConfiguration(-1))
                     if (added < 0) {
                         throw IOException(
-                            "Updating relay network '$ssid' password failed (code=$added)",
+                            "Updating relay network '$ssid' password failed (code=$added)" +
+                                legacyApiHint(),
                         )
                     }
                     onDiagnostic("relay: re-added network id=$added with current password")
@@ -211,7 +234,7 @@ class RelayClientManager(
             val added = wifi.addNetwork(config)
             if (added < 0) {
                 throw IOException(
-                    "Adding relay network '$ssid' failed (code=$added); check the password",
+                    "Adding relay network '$ssid' failed (code=$added)" + legacyApiHint(),
                 )
             }
             onDiagnostic("relay: added network id=$added")
@@ -235,6 +258,25 @@ class RelayClientManager(
             preSharedKey = ""
             allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE)
         }
+    }
+
+    /**
+     * vc179（K60 API34 实测）：`addNetwork()` 返回 -1 的**含义随版本而变**，不能再一律说
+     * 「check the password」。
+     *
+     * - **API ≤ 29**：legacy 配置 API 可用，-1 通常是凭据/配置非法（密码太短、SSID 非法、
+     *   WPA3 不匹配等）→ 让用户在中继页核对密码。
+     * - **API ≥ 30（Android 11+）**：`addNetwork()` 对第三方应用**恒返回 -1**，与密码无关。
+     *   K60（API34）实测正是这一档：系统已连着 7205 且握手 COMPLETED，App 仍拿到 -1。
+     *   → 必须告诉用户去「系统 Wi-Fi 设置」先连上该网络，再回 App 点连接（此时由
+     *   [attachNetwork] 的 isJoinedWithIp 短路直接复用，不再碰配置 API）。
+     */
+    private fun legacyApiHint(): String = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        "; the legacy Wi-Fi config API is no longer available to third-party apps on " +
+            "Android 11+ (this is NOT a password problem). Join '$ssid' from the system " +
+            "Wi-Fi settings first, then connect again"
+    } else {
+        "; check the passphrase/encryption in relay settings"
     }
 
     /** 本机已经连在该 SSID 上并且拿到了 IP（用于避免无意义的 update/disconnect）。 */
@@ -261,6 +303,16 @@ class RelayClientManager(
             ?: throw IOException("RELAY_UNREACHABLE: relay network returned no gateway")
         for (attempt in 1..REACHABLE_ATTEMPTS) {
             if (closed) throw IOException("Relay client closed during reachability check")
+            // vc179：先看二层。ARP 命中即判「链路活」，不再要求网关应答 ICMP/TCP。
+            // 依据见 [gatewayResolvableByArp] 注释——ping 与 TCP 探测在纯 NAT 网关上都会
+            // 失败，而这类网关（Windows 承载网络 192.168.137.1 就是）恰恰是最常见的中继热点。
+            if (gatewayResolvableByArp(gatewayAddress)) {
+                onDiagnostic(
+                    "relay: gateway $gatewayAddress present in ARP cache (L2 reachable) — " +
+                        "skipping ICMP/TCP probes (attempt $attempt)",
+                )
+                return
+            }
             try {
                 if (gatewayAddress.isReachable(REACHABLE_TIMEOUT_MILLIS)) {
                     onDiagnostic("relay: gateway $gatewayAddress reachable (attempt $attempt)")
@@ -299,6 +351,44 @@ class RelayClientManager(
             "RELAY_UNREACHABLE: gateway ${gatewayAddress.hostAddress} did not answer ICMP or TCP; " +
                 "the relay router may block this device (AP isolation) or the iPhone is on another network",
         )
+    }
+
+    /**
+     * vc179（C8815 2026-10-23 07:50 实测）：**网关可达性的正确判据是二层，不是三层服务。**
+     *
+     * vc174 加的 TCP(53/80/443) 兜底在 Windows 承载网络上**同样失效**——`192.168.137.1`
+     * 只是个纯 NAT 网关：防火墙禁 ICMP 回显（ping 无应答），自身又不监听 53/80/443
+     * （它不是路由器，没有管理页面）。于是 ping 与 TCP 双双无应答，被判成
+     * 「AP 隔离」硬失败——而实测同一时刻车机已拿到 `192.168.137.35`、K60 在同网段
+     * `192.168.137.228` 上 adb 通信完全正常，**链路是活的，纯属误杀**。
+     *
+     * 换成 ARP：能解析到网关的真实 MAC（非全零）就说明二层通、连对了网。理由——
+     * - 客户端→网关的 ARP **一定**被应答，否则根本发不出任何 IP 包（DHCP 也拿不到）；
+     * - 开了 AP 隔离只会阻断**客户端之间**的三层转发，不影响客户端到网关的 ARP，
+     *   所以本判据不会把真隔离误判为通（隔离的后果改由后续 AirPlay/TCP 阶段暴露）；
+     * - 连错网 / 网关不存在 / Wi-Fi 实际没通时，ARP 缓存里也不会有该网关条目 →
+     *   仍然会落到原有的 ICMP+TCP 失败路径，保护不丢。
+     *
+     * `/proc/net/arp` 全局可读，API16 起可用，无需任何权限。
+     */
+    private fun gatewayResolvableByArp(gatewayAddress: InetAddress): Boolean {
+        val target = gatewayAddress.hostAddress ?: return false
+        val unresolved = "00:00:00:00:00:00"
+        return try {
+            val file = File("/proc/net/arp")
+            if (!file.exists()) return false
+            file.useLines { lines ->
+                lines.drop(1).any { line ->
+                    val cols = line.trim().split(Regex("\\s+"))
+                    cols.size >= 4 &&
+                        cols[0] == target &&
+                        !cols[3].equals(unresolved, ignoreCase = true)
+                }
+            }
+        } catch (_: Exception) {
+            // 少数 ROM 限制读取；按「未解析」计，回落到 ICMP/TCP 判据
+            false
+        }
     }
 
     /**

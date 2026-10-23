@@ -351,8 +351,21 @@ android {
         // ⑥wiredStartWatchdogGeneration 改 AtomicInteger、bonjourGoodbye.await 补中断保护；
         // ⑦UI：Typeface 静态缓存（整页 40~100 次 create → 复用）、renderState 单键读
         // activeChannel（原每 500ms 全量 load 30+ 键）。
-        versionCode = 178
-        val versionPatch = 13
+        // vc179（K60 API34 实测，20261023）：中继通道在 Android 11+ 上**根本没被支持过**——
+        // RelayClientManager 全链路用的是 legacy WifiManager 配置 API（configuredNetworks /
+        // addNetwork / updateNetwork），自 API 30 起对第三方应用一律失效（addNetwork 恒返回 -1、
+        // 读不到任何已保存网络）。K60 实测：系统已连着 7205 且握手 COMPLETED、IP 已拿到，
+        // App 仍报「Adding relay network '7205' failed (code=-1); check the password」——
+        // 纯属误导，与密码无关。改动：①attachNetwork 开头短路「已连目标网且有 IP 就复用，
+        // 不碰配置 API」（高版本唯一可用路径，对 API16 同样正确）；②addNetwork 失败文案按
+        // 版本区分，API30+ 明确提示「不是密码问题，去系统 Wi-Fi 设置先连上」。
+        // ③（C8815 07:50 实测）网关可达性判据换成**二层 ARP**：Windows 承载网络 192.168.137.1
+        // 是纯 NAT 网关——防火墙禁 ping 且自身不监听 53/80/443，于是 vc174 的「ICMP 不通补
+        // TCP 探测」兜底同样失效，车机明明已拿到 192.168.137.35 却被判成「AP 隔离」硬失败
+        // （同网段 K60 adb 通信正常，链路是活的）。改为查 /proc/net/arp 能解析到网关真实
+        // MAC 即判链路活；解析不到仍回落 ICMP+TCP 原失败路径，保护不丢。
+        versionCode = 179
+        val versionPatch = 14
         versionName = "1.2.$versionPatch.dongle"
     }
 
