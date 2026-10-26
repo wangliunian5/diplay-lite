@@ -45,6 +45,9 @@ data class LiteConfig(
     // vc166（外置 USB 蓝牙 dongle 实验第一步）：仅控制设置页探测显示，
     // 不参与任何连接逻辑（协议栈未移植；本开关无实际功能作用）。
     val usbBtDongle: Boolean = false,
+    // vc184：外置 USB 蓝牙 dongle 自定义蓝牙名称（写进 HCI 本地名称，iPhone 蓝牙列表显示）。
+    // 空串/超 HCI 名上限(248 字节)回落默认 "DiPlay CarPlay"。
+    val usbBtDongleName: String = "DiPlay CarPlay",
 
     /** vc109：底部触摸失灵区占比‰（0=关闭）。仅影响视频视图高度与触摸映射。 */
     val touchTrimBottomPermille: Int = 0,
@@ -104,6 +107,9 @@ data class LiteConfig(
         // 压低上限放宽到 100：用户可以选择"不压低"（100 = 等于没压）。
         const val MIN_DUCK_PERCENT = 30
         const val MAX_DUCK_PERCENT = 100
+
+        // vc184：HCI 本地名称上限（248 字节），超出回落默认名。
+        const val MAX_USB_BT_NAME_BYTES = 248
 
         // M6k19：音乐缓存输入范围（ms）
         const val MIN_MEDIA_BUFFER_MILLIS = 10
@@ -196,6 +202,10 @@ data class LiteConfig(
                 audioPrebuffer = prefs.getBoolean("audio_prebuffer", true),
                 // vc166：外置 USB 蓝牙实验开关（仅探测显示）。
                 usbBtDongle = prefs.getBoolean("usb_bt_dongle", false),
+                // vc184：外置蓝牙自定义名称（空/超长回落默认 "DiPlay CarPlay"）。
+                usbBtDongleName = prefs.getString("usb_bt_dongle_name", "DiPlay CarPlay")
+                    .orEmpty().ifBlank { "DiPlay CarPlay" }
+                    .let { if (it.toByteArray(Charsets.UTF_8).size > MAX_USB_BT_NAME_BYTES) "DiPlay CarPlay" else it },
                 // vc109（T3 触摸屏下沿物理失灵）：0=关闭；>0=底部失灵区占比‰（154≈1/6.5）。
                 // 视频视图缩进顶部有效区，触摸映射基于视图尺寸自动重映射，死区天然丢弃。
                 touchTrimBottomPermille = prefs.getInt("touch_trim_bottom_permille", 0),
@@ -245,6 +255,7 @@ data class LiteConfig(
                 .putInt("media_buffer_millis", config.mediaBufferMillis)
                 .putBoolean("audio_prebuffer", config.audioPrebuffer)
                 .putBoolean("usb_bt_dongle", config.usbBtDongle)
+                .putString("usb_bt_dongle_name", config.usbBtDongleName)
                 .putInt("touch_trim_bottom_permille", config.touchTrimBottomPermille)
                 // vc59 修复（8815 实测）：分辨率设定三键漏写——load 读 video_resolution_mode/
                 // manual_resolution_w/h，但 save 从未写入，导致「手动设定分辨率」确认重启后

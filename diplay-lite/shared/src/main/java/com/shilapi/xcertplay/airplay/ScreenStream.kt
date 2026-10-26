@@ -43,15 +43,21 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
         return bound.localPort
     }
 
-    // API16 车机实测：绑 IPv6 通配 [::] 抛异常会让该流被拒，回退 IPv4 通配（本热点对端为 IPv4）。
+    /**
+     * 端口绑定。
+     * **vc187**：原实现绑 `InetAddress.getByName("::")`，在 NCM（IPv6 link-local）链路上会抛
+     * `Can't bind to a link-local address without a scope id` ⇒ 每次建链都回退 IPv4
+     * （t3 20261025-212928 实测 24 次）。改为直接用 `InetSocketAddress(0)`（通配地址、不指名 `::`），
+     * 双栈行为不变但不再触发 scope 检查，消除无谓回退。
+     */
     private fun bindAnyPort(): ServerSocket {
         val primary = ServerSocket()
         primary.reuseAddress = true
         return try {
-            primary.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+            primary.bind(InetSocketAddress(0))
             primary
         } catch (error: Exception) {
-            onDiagnostic("video 端口 IPv6 通配绑定失败，回退 IPv4: ${error.message}")
+            onDiagnostic("video 端口通配绑定失败，回退 IPv4: ${error.message}")
             safeClose(primary)
             ServerSocket().apply {
                 reuseAddress = true

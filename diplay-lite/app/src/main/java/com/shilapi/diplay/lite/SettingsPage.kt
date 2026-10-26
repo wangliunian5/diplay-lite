@@ -132,9 +132,12 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var cbVoiceMedia: CheckBox
     // vc156（上游 0.2.21 预缓冲移植）：媒体预缓冲开关。
     private lateinit var cbPrebuffer: CheckBox
-    // vc166（外置 USB 蓝牙 dongle 实验第一步）：开关 + USB 设备枚举状态行。
-    private lateinit var cbUsbBt: CheckBox
-    private lateinit var usbBtSummary: TextView
+    // vc184：外置蓝牙选择（车机蓝牙 / 外置蓝牙）单选 + 自定义名称输入框 + 应用键。
+    private lateinit var rgBtSelect: WrapRadioGroup
+    private lateinit var rbBtCar: RadioButton
+    private lateinit var rbBtUsb: RadioButton
+    private lateinit var btNameRow: LinearLayout
+    private lateinit var inputBtName: EditText
     private lateinit var tvVersion: TextView
 
     // loadIntoForm 期间静默：setChecked 会触发监听，避免半加载状态写盘
@@ -207,6 +210,65 @@ class SettingsPage(private val activity: MainActivity) {
             persistFromForm()
         }
         column.addView(rgAutoChannel, block(top = dip(6)))
+        // vc184：蓝牙选择（车机蓝牙 / 外置蓝牙）单选 —— 同级靠左与上方自动连接方式对齐。
+        column.addView(subSectionLabel("蓝牙选择"), block(top = dip(8), bottom = dip(2)))
+        rgBtSelect = WrapRadioGroup(activity)
+        rbBtCar = radio("车机蓝牙")
+        rbBtUsb = radio("外置蓝牙")
+        rgBtSelect.addButtons(rbBtCar, rbBtUsb)
+        rgBtSelect.onRelayout = { refreshRadioDrawables(rgBtSelect) }
+        rgBtSelect.setOnCheckedChangeListener {
+            if (isLoading) return@setOnCheckedChangeListener
+            refreshRadioDrawables(rgBtSelect)
+            updateBtNameRowVisibility()
+            persistFromForm()
+        }
+        column.addView(rgBtSelect, block(top = dip(6)))
+        // vc184：外置蓝牙自定义名称（仅选中外置蓝牙时显示；展示当前名、可输入、点应用重启生效）。
+        btNameRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dip(4), 0, 0)
+        }
+        btNameRow.addView(
+            TextView(activity).apply {
+                text = "外置蓝牙自定义名称"
+                setTextColor(Ui.TEXT)
+                textSize = 13f
+            },
+            // vc186：与 buildValueRow（分辨率自定义）完全同构——标题 weight=1 无 margin，
+            // 输入框 dip(110)+rightMargin10、应用键无 margin，保证 K60 实机两侧完全对齐。
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        inputBtName = EditText(activity).apply {
+            background = Ui.fillInput(activity)
+            setHintTextColor(Ui.SUB)
+            setTextColor(Ui.TEXT)
+            hint = "DiPlay CarPlay"
+            textSize = 13f
+            setSingleLine(true)
+            gravity = Gravity.CENTER
+            setPadding(dip(10), dip(7), dip(10), dip(7))
+        }
+        btNameRow.addView(
+            inputBtName,
+            LinearLayout.LayoutParams(dip(110), LinearLayout.LayoutParams.WRAP_CONTENT).apply { rightMargin = dip(10) },
+        )
+        btNameRow.addView(
+            Button(activity).apply {
+                text = "应用"
+                textSize = 12f
+                minHeight = dip(34)
+                setAllCaps(false)
+                background = Ui.pillSolid(activity, Ui.PRIMARY)
+                setTextColor(Ui.PRIMARY_ON)
+                setPadding(dip(14), dip(5), dip(14), dip(5))
+                setOnClickListener { applyBtName() }
+            },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+        )
+        // vc186：垂直间距对齐 buildValueRow 的 block(top=4, bottom=4)。
+        column.addView(btNameRow, block(top = dip(4), bottom = dip(4)))
 
         // ── 画面设置：分辨率自定义百分比 / 分辨率设定 / 横竖屏切换 ──
         column.addView(sectionLabel("画面设置"), block(top = dip(16), bottom = dip(4)))
@@ -471,21 +533,6 @@ class SettingsPage(private val activity: MainActivity) {
         // 1.1.2（EU5 双向无声）：Siri/助手语音走媒体通道——ASSISTANT/NAVIGATION usage 在
         // PATEO 等老 HAL 上静音，勾选后改走媒体音量（媒体通道已实测出声）。
         cbVoiceMedia = checkbox("Siri/语音提示走媒体音量")
-        // vc166（外置 USB 蓝牙 dongle 实验第一步）：显式勾选后枚举 USB 设备显示摘要，
-        // 不申请权限、不打开设备；本开关当前无实际连接功能（协议栈未移植）。
-        cbUsbBt = checkbox("外置 USB 蓝牙（实验）")
-        usbBtSummary = TextView(activity).apply {
-            setTextColor(Ui.MUTED)
-            textSize = 12f
-            setPadding(dip(24), 0, dip(8), dip(2))
-        }
-        cbUsbBt.setOnCheckedChangeListener { buttonView, _ ->
-            buttonView.setButtonDrawable(Ui.checkbox(activity, buttonView.isChecked))
-            if (!isLoading) {
-                persistFromForm()
-                updateUsbBtSummary()
-            }
-        }
         // vc158：承载方式单选（车机热点 / Wi-Fi Direct）已删除——Wi-Fi Direct 改为
         // 「连接设置 → 自动连接方式」的第四项，语义不再重复。
         column.addView(cbBoot, block(bottom = dip(2)))
@@ -496,8 +543,6 @@ class SettingsPage(private val activity: MainActivity) {
         column.addView(cbSoftDecode, block(bottom = dip(2)))
         column.addView(cbSpeaker, block(bottom = dip(2)))
         column.addView(cbVoiceMedia, block(bottom = dip(2)))
-        column.addView(cbUsbBt, block(bottom = dip(2)))
-        column.addView(usbBtSummary, block())
 
         // M6k23：自定义返回图标页（选图→裁剪→确认保存）。1.1.3：入口行 -3dp（按钮随行号缩小）。
         column.addView(entryRow("自定义返回图标") { activity.setPage("caricon") }, block(top = dip(14)))
@@ -911,6 +956,7 @@ class SettingsPage(private val activity: MainActivity) {
     private fun refreshAllDrawables() {
         refreshRadioDrawables(rgOrientation)
         refreshRadioDrawables(rgAutoChannel)
+        refreshRadioDrawables(rgBtSelect)
         // avGroup 是局部变量（非字段），且其仍是 RadioGroup、按钮为直接子级，用 parent 取
         (rbAvFull.parent as? ViewGroup)?.let { refreshRadioDrawables(it) }
         // 1.0.29：分辨率设定组。
@@ -975,12 +1021,15 @@ class SettingsPage(private val activity: MainActivity) {
         cbSpeaker.isChecked = config.speakerForCalls
         cbVoiceMedia.isChecked = config.voiceRoutedToMedia
         cbPrebuffer.isChecked = config.audioPrebuffer
-        cbUsbBt.isChecked = config.usbBtDongle
+        // vc184：蓝牙选择单选 + 自定义名称回显（接管原「外置 USB 蓝牙（实验）」开关）。
+        rbBtCar.isChecked = !config.usbBtDongle
+        rbBtUsb.isChecked = config.usbBtDongle
+        inputBtName.setText(config.usbBtDongleName)
         isLoading = false
         // vc164：按载入后的实际值决定应用按钮显隐（isLoading=false 后才不会被守卫拦掉）
         updateApplyResButton()
-        // vc166：USB 蓝牙实验开关状态行回显
-        updateUsbBtSummary()
+        // vc184：外置蓝牙自定义名称行可见性（仅选中外置蓝牙时显示）
+        updateBtNameRowVisibility()
     }
 
     /**
@@ -1048,7 +1097,7 @@ class SettingsPage(private val activity: MainActivity) {
                 speakerForCalls = cbSpeaker.isChecked,
                 voiceRoutedToMedia = cbVoiceMedia.isChecked,
                 audioPrebuffer = cbPrebuffer.isChecked,
-                usbBtDongle = cbUsbBt.isChecked,
+                usbBtDongle = rbBtUsb.isChecked,
                 softwareVideoDecoder = cbSoftDecode.isChecked,
                 orientationMode = currentOrientationMode(),
                 avPathMode = if (rbAvBt.isChecked) "bt_audio" else "full",
@@ -1084,14 +1133,22 @@ class SettingsPage(private val activity: MainActivity) {
         return w != saved.manualWidth || h != saved.manualHeight
     }
 
-    /** vc164：唯一的应用按钮显隐（模式或手动宽高有未应用改动时亮起）。 */
-    /** vc166：USB 蓝牙实验开关状态行；vc167：勾选时改调 usbbt 探活状态（连接过一次即显示逐级进度）。 */
-    private fun updateUsbBtSummary() {
-        usbBtSummary.text = if (cbUsbBt.isChecked) {
-            UsbBtBootstrapStream.describe(activity)
-        } else {
-            "已关闭。勾选后连接时将探测 USB dongle。"
-        }
+    /** vc184：仅选中外置蓝牙时显示自定义名称行。 */
+    private fun updateBtNameRowVisibility() {
+        btNameRow.visibility = if (rbBtUsb.isChecked) View.VISIBLE else View.GONE
+    }
+
+    /** vc184：外置蓝牙自定义名称提交 —— 落盘后重启软件生效（HCI 名写入在 dongle 初始化阶段）。 */
+    private fun applyBtName() {
+        if (isLoading) return
+        val raw = inputBtName.text.toString().trim()
+        val name = if (raw.isEmpty() || raw.toByteArray(Charsets.UTF_8).size > LiteConfig.MAX_USB_BT_NAME_BYTES) {
+            "DiPlay CarPlay"
+        } else raw
+        inputBtName.setText(name)
+        val current = LiteConfig.load(activity)
+        LiteConfig.save(activity, current.copy(usbBtDongleName = name))
+        toast("蓝牙名称已保存，重启软件后生效")
     }
 
     private fun updateApplyResButton() {

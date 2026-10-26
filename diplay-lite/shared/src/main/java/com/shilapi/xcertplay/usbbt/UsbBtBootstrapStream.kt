@@ -7,7 +7,7 @@ import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 /**
  * vc167（外置 USB 蓝牙 dongle 第 2 步 B 批）/ vc181（外置 USB 蓝牙 C/D 批）：usbbt 接入缝。
  *
- * 接入缝（唯一）：CarPlayController 无线建链处 `UsbBtBootstrapStream.open(context)`，
+ * 接入缝（唯一）：CarPlayController 无线建链处 `UsbBtBootstrapStream.open(context, name)`，
  * 该文件一行不改。C/D 批起 [open] 走完整建链：
  * 枚举 dongle → 权限 → 打开驱动 → Host 初始化（HCI Reset→…→ScanEnable）
  * → 等待 iPhone 回连（SSP Just-Works 自动配对）→ 认证/加密 → SDP 查 RFCOMM 信道
@@ -33,13 +33,8 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
         private const val LINK_TIMEOUT_MILLIS = 90_000L
         private const val TAKE_SLICE_MILLIS = 1000L
 
-        /** dongle 身份（上游 UsbBtSettings.name 动态名落死；COD/信道/IO 能力对照上游）。 */
-        private val IDENTITY = UsbBtIdentity(
-            name = "DiPlay CarPlay",
-            classOfDevice = 2098184,
-            iap2RfcommChannel = 1,
-            ioCapability = 1, // NoInputNoOutput（Just-Works）
-        )
+        /** vc184：等系统 USB 授权弹窗的最长窗口（车机屏幕上用户读题+点允许要留足时间）。 */
+        private const val PERMISSION_WAIT_MILLIS = 90_000L
 
         /** 最近一次探测/建链的逐级状态（设置页状态行直接显示；未探测过 = 空串）。 */
         @Volatile
@@ -55,14 +50,37 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
          * usbbt 建链入口（开关开启时由 CarPlayController 调用，工作线程）。
          * 成功返回跑在 iAP2 RFCOMM DLC 上的流；任何一步失败抛带状态文本的异常。
          */
-        fun open(context: Context): BlockingDuplexByteStream {
+        fun open(
+            context: Context,
+            name: String,
+            onDiagnostic: (String) -> Unit = {},
+        ): BlockingDuplexByteStream {
+            // vc186：诊断出口——usbbt 过程日志此前只走 system logcat，而日志上云只带 LiteLog，
+            // 导致 vc183~vc185 三份 t3 日志里 usbbt 过程 0 条、根因无法二分。
+            // 这里统一经 diagSink 转发给调用方（CarPlayController.debugLog → uiListener.onDebugLog → LiteLog）。
+            diagSink = { line ->
+                Log.i(TAG, line)
+                runCatching { onDiagnostic(line) }
+            }
+            // vc184：dongle 身份名称由设置页自定义（回落默认 "DiPlay CarPlay"）。
+            val identity = UsbBtIdentity(
+                name = name.ifBlank { "DiPlay CarPlay" },
+                classOfDevice = 2098184,
+                iap2RfcommChannel = 1,
+                ioCapability = 1, // NoInputNoOutput（Just-Works）
+            )
             val usb = UsbBtSession.manager(context) ?: fail("USB 服务不可用")
             val dongle = UsbBtSession.findDongle(usb)
                 ?: fail("未检测到 USB 蓝牙 dongle（请确认已插入）")
             status("已检测到 dongle（${UsbBtSession.deviceLabel(dongle)}）")
             if (!UsbBtSession.hasPermission(context, dongle)) {
-                UsbBtSession.requestPermission(context, dongle)
-                fail("无 USB 权限，已请求系统授权（允许后重试连接）")
+                // vc184（t3 反馈）：原地等系统授权弹窗结果——用户点「允许」后本轮直接继续建链，
+                // 不再要求「允许后重试连接」；ROM 不弹窗/被拒/超时则带明确状态失败。
+                status("等待 USB 授权（请在系统弹窗中点允许）…")
+                if (!UsbBtSession.awaitPermission(context, dongle, PERMISSION_WAIT_MILLIS)) {
+                    fail("USB 授权未完成（弹窗未出现/被拒绝/超时），请重试连接并在弹窗中点允许")
+                }
+                status("USB 授权完成，继续建链")
             }
             // host 与 driver 互需引用：先开 driver（转发 listener 兜住早期事件），再建 host 回接
             val hostRef = arrayOfNulls<UsbBtHost>(1)
@@ -88,10 +106,10 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
             var driver: UsbBtDriver? = null
             try {
                 val ready = java.util.concurrent.CountDownLatch(1)
-                driver = UsbBtDriver.open(context, dongle, forward)
+                driver = UsbBtDriver.open(context, dongle, forward, diagSink)
                     ?: fail("打开 dongle 失败：设备刚重枚举或打开被拒")
                 status("已打开 dongle（${UsbBtSession.deviceLabel(dongle)}）")
-                host = UsbBtHost(IDENTITY, driver, { msg -> Log.i(TAG, msg) }).also {
+                host = UsbBtHost(identity, driver, { msg -> Log.i(TAG, msg) }).also {
                     it.onStatus = { text -> status(text) }
                     it.onReady = { ready.countDown() }
                     hostRef[0] = it
@@ -142,9 +160,14 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
             return "已检测到 dongle（${UsbBtSession.deviceLabel(dongle)}），待连接时探活"
         }
 
+        /** vc186：诊断/状态输出口（open 时按调用方注入；默认仅 system logcat）。 */
+        @Volatile
+        private var diagSink: (String) -> Unit = { line -> Log.i(TAG, line) }
+
         private fun status(text: String) {
             lastStatusText = text
-            Log.i(TAG, text)
+            // vc186：状态行进 diagSink（→LiteLog 上云），不再只落 system logcat。
+            diagSink(text)
         }
 
         private fun fail(reason: String): Nothing {

@@ -1068,7 +1068,9 @@ class CarPlayController(
             // （枚举→openDevice→HCI Reset→BD_ADDR，B 批；协议栈未就绪会抛明确异常）。
             // 未启用时必须走原分支，行为与此前完全一致——下方 btProbeMode 三轮握手一律不动。
             val stream = if (config.usbBtDongle) {
-                UsbBtBootstrapStream.open(context)
+                // vc186：把 usbbt 全过程诊断接进 debugLog（→uiListener.onDebugLog→LiteLog 上云），
+                // 否则 usbbt 只有 system logcat，远程拿不到 portReset/forceClaim/errno 证据。
+                UsbBtBootstrapStream.open(context, config.usbBtDongleName) { msg -> debugLog(msg) }
             } else {
                 BluetoothRfcommDuplexStream(socket)
             }.also { bluetoothStream = it }
@@ -2153,6 +2155,37 @@ class CarPlayController(
      * ③两种口各试一次就放弃太急，改为**多轮退避重试**。
      */
     private fun openWirelessRfcommSocket(device: BluetoothDevice): BluetoothSocket {
+        // vc186⓪：**建链前适配器体检**（照搬 vc180 有线 TUN 的 probeTunEnvironment 思路）。
+        // 判据来自 LiteSessionService.kt 既有先验「getAddress() 非全零才可信」：
+        // 「开关 ON 但硬件未初始化」的半残栈（FE6 20261025 实证：native 栈 /dev/stpbt 缺失致
+        // address=00:00:00:00:00:00）会让后续 RFCOMM 白跑 3 轮×2 模式（15s 超时或毫秒立败），
+        // 用户只见"无线链路建立中"干等。体检不过即收手并给可行动文案，不再浪费时间。
+        // 注意：API31+ 读 getAddress() 需 BLUETOOTH_CONNECT，无权限会抛 SecurityException
+        // （既有教训：05-果实-实测过程-02 的 USB 闪退）——读不到只跳过体检，不得误判为半残。
+        val adapter = bluetoothAdapter
+        val stateResult = runCatching { adapter?.state }
+        val addressResult = runCatching { adapter?.address }
+        val state = stateResult.getOrNull()
+        val localAddress = addressResult.getOrNull()
+        debugLog(
+            "wireless RFCOMM precheck adapterState=$state" +
+                " localAddress=${if (addressResult.isSuccess) localAddress else "<unreadable>"}",
+        )
+        if (adapter != null && state != null && state != BluetoothAdapter.STATE_ON) {
+            throw IOException(
+                "bluetooth adapter not on: state=$state; " +
+                    "本机蓝牙未开启，请打开车机蓝牙后重试",
+            )
+        }
+        if (adapter != null && addressResult.isSuccess &&
+            (localAddress.isNullOrBlank() || localAddress == "00:00:00:00:00:00")
+        ) {
+            throw IOException(
+                "bluetooth adapter half-dead: getAddress()=$localAddress while state=$state; " +
+                    "本机蓝牙适配器未真正初始化（MAC 为空/全零）——系统蓝牙栈异常，" +
+                    "请检查系统蓝牙或重启车机后重试",
+            )
+        }
         // ①建链前发一次 SDP 请求（vc168 引入，vc172 改为**发射后不管**）。
         // 原为阻塞探测（fetch + 固定 sleep 1.5s ≈ 2.4s），每次连接都付——含一帆风顺时。
         // 诊断目的已达成（服务始终在广播，失败在框架 SdpHelper.doSdp），
@@ -2172,6 +2205,12 @@ class CarPlayController(
         }
 
         var lastFailure: Throwable? = null
+        // vc186：累计每次尝试的异常类型/耗时——此前失败原因被吞（只剩一句无信息的
+        // "RFCOMM connect failed"），无法区分「本地栈毫秒立败」与「iPhone 不应答(15s 超时)」，
+        // 而这两者用户处置完全不同。
+        val attempts = ArrayList<String>()
+        var fastFailures = 0
+        var timeouts = 0
         // ③多轮退避重试（原为 secure+insecure 各一次即放弃）
         for (round in 0 until RFCOMM_ROUNDS) {
             for (mode in listOf("secure", "insecure")) {
@@ -2195,9 +2234,14 @@ class CarPlayController(
                     return socket
                 } catch (failure: Throwable) {
                     lastFailure = failure
+                    val elapsed = System.currentTimeMillis() - startedAt
+                    // vc186：立败(<1s，本地栈直接拒绝) 与 超时(≈15s，iPhone 不应答) 分开计数。
+                    if (elapsed < 1000) fastFailures++ else timeouts++
+                    attempts += "$mode/r$round ${failure.javaClass.simpleName}:" +
+                        "${failure.message ?: "-"} ${elapsed}ms"
                     debugLog(
                         "wireless RFCOMM connect ($mode) failed round=$round " +
-                            "elapsedMs=${System.currentTimeMillis() - startedAt}: " +
+                            "elapsedMs=$elapsed: " +
                             (failure.message ?: failure.javaClass.simpleName),
                     )
                     runCatching { bluetoothSocket?.close() }
@@ -2215,7 +2259,14 @@ class CarPlayController(
                 runCatching { Thread.sleep(backoff) }
             }
         }
-        val failure = lastFailure ?: IOException("RFCOMM connect failed")
+        // vc186：失败原因不再吞——保留 "RFCOMM connect failed" 前缀以兼容既有失败分类，
+        // 附带各轮摘要与立败/超时计数（App 层据此分级文案），cause 保留原异常。
+        val failure = IOException(
+            "RFCOMM connect failed after $RFCOMM_ROUNDS rounds" +
+                " (fastFail=$fastFailures, timeout=$timeouts)" +
+                (if (attempts.isNotEmpty()) ": " + attempts.joinToString(" | ") else ""),
+            lastFailure,
+        )
         // 全轮失败：最终再探一次，坐实"服务仍在广播但框架 SDP 建不了链"
         sdpProbe(device, "final")
         throw failure
@@ -3179,6 +3230,10 @@ class CarPlayController(
                         armWiredEstablishWatchdog()
                     }
                 },
+                // vc187：把「AirPlay 会话是否已激活」交给 0x4301 重发判据。wiredStreamSeen
+                // 由 wiredSessionListener 的 onSessionActive / onVideoFrameRendered 置位，
+                // 且每次 armWiredEstablishWatchdog 会重置为 false——正是同一条真值口径。
+                airPlayActive = { wiredStreamSeen },
             )
             debugLog("wired control ended terminal=${result.terminal} stage=${result.stage}")
             // 1.0.16（方案四①）：只有终态（用户已断开/controller 已关）才做网络恢复；自动重试路径不动 Wi-Fi。
@@ -4091,7 +4146,11 @@ class CarPlayController(
         // 60s 判死 × 多轮重试 = 数分钟「有线链路建立中」假死。15s 判死 + 重试 2 次封顶 +
         // 第 2 轮前 0x52 重枚举升级；健康平台会话 2~13s 内激活即令计时器失活（对齐上游
         // WiredStartWatchdog：工作车机 0x4301 后 2~13s 会话即激活）。
-        private const val WIRED_ESTABLISH_WATCHDOG_MILLIS = 15_000L
+        // **vc187（t3 20261025-215214 实测）**：6 次成功轮的 0x4301→视频 SETUP 耗时
+        // 6.6~11.0s（全部 <15s），说明 **15s 并没有误杀慢连接**；7 次超时里 6 次是 iPhone
+        // 收到 0x4301 后根本没发起 RTSP。放宽到 25s 只为兜住唯一一次卡在 14.4s 的握手，
+        // 真正的解是 Iap2WiredControlClient 侧按 airPlayActive 重发 0x4301（同版修复）。
+        private const val WIRED_ESTABLISH_WATCHDOG_MILLIS = 25_000L
         // vc153：有线启动看门狗判死后的自动重试轮数封顶（超出落 ControlEnded 终态）。
         private const val WIRED_START_WATCHDOG_MAX_RETRIES = 2
         private const val WIRED_WEDGE_RETRY_DELAY_MILLIS = 30_000L

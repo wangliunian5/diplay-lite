@@ -30,6 +30,14 @@ class Iap2WiredControlClient(
         onIncoming: (Iap2Frame) -> Unit = {},
         onProgress: (String) -> Unit = {},
         onStage: (Iap2WiredControlStage) -> Unit = {},
+        // vc187（t3 KK 实测 20261025）：0x4301 重发的**真判据**——AirPlay 会话是否已激活。
+        // 旧判据 streamFrames==0 被 iPhone 的常规控制帧污染而彻底饿死（v1.2.20 t3 两条日志
+        // 实证：14 次 0x4301 首发、resend **0 次**）。污染源是 0xae01/0x4158/0x4155/
+        // 0x1d00/0x1d02/0xaa02/0xaa00/0xaa05——它们都不在 LINK_CONTROL 域 0x5000..0x5FFF
+        // 白名单内，一律 streamFrames++，导致「iPhone 有活动」被误读成「AirPlay 已起流」。
+        // 而 AirPlay 是 **TCP 层**会话，iAP2 侧永远看不到它的建立——iAP2 层根本不存在
+        // 能证明流已起的帧。判据必须由掌握 AirPlay 会话状态的 controller 注入。
+        airPlayActive: () -> Boolean = { false },
     ): Iap2WiredControlResult {
         require(availableCurrentMilliAmps in 0..0xffff) {
             "availableCurrentMilliAmps must be in 0..65535"
@@ -76,13 +84,13 @@ class Iap2WiredControlClient(
                     locationSentLogged = true
                     onProgress("iap2 tx=0xfffb location-information")
                 }
-                // vc93：0x4301 已发且零流帧、重发预算未耗尽 → recv 短轮询，让重发有节拍。
-                // vc97①：判据换 streamFrames（无流帧）——forwardedFrames 含心跳恒 >0。
+                // vc187：判据换成 !airPlayActive()（AirPlay 会话未激活），streamFrames 退居
+                // 纯诊断用途——它测的是「iAP2 上有活动」，与「AirPlay 流已建立」是两回事。
                 val startResendPending = stage == Iap2WiredControlStage.CARPLAY_START_SENT &&
-                    streamFrames == 0 && carPlayStartResends < MAX_CARPLAY_START_RESENDS
+                    !airPlayActive() && carPlayStartResends < MAX_CARPLAY_START_RESENDS
                 val pollTimeout = when {
                     locationActive -> min(remaining, LOCATION_POLL_INTERVAL_MILLIS)
-                    startResendPending -> min(remaining, CARPLAY_START_RESEND_INTERVAL_MILLIS)
+                    startResendPending -> min(remaining, RESEND_POLL_INTERVAL_MILLIS)
                     else -> remaining
                 }
                 val incoming = session.recv(pollTimeout)
@@ -150,16 +158,25 @@ class Iap2WiredControlClient(
                 //（CSM 帧不断浮出，recv 永不返回 null），vc93 把检查放在 null 分支内会被心跳
                 // 饿死、一次都不触发。移到每轮循环尾按 elapsed 判定后，链路静默与心跳常驻两种
                 // 形态均正确；有流帧后 forwardedFrames>0，startResendPending 自然转 false 停发。
-                if (startResendPending &&
-                    elapsedSinceNanos(lastCarPlayStartAtNanos) >= CARPLAY_START_RESEND_INTERVAL_MILLIS
-                ) {
-                    send(carPlayStartSession(endpoint), deadlineNanos)
-                    carPlayStartResends += 1
-                    lastCarPlayStartAtNanos = System.nanoTime()
-                    onProgress(
-                        "iap2 tx=0x4301 carplay-start-session " +
-                            "resend=$carPlayStartResends/$MAX_CARPLAY_START_RESENDS",
-                    )
+                if (startResendPending) {
+                    // vc187：首补先宽限 6s——t3 实测健康路径 0x4301→首个 RTSP 报文 1.7~5.3s，
+                    // 宽限内不打扰；其后每 4s 补发（最长覆盖到 18s），整体落在 controller
+                    // 25s 建立期看门狗窗口内。AirPlay 一激活 airPlayActive() 即转 true 停发。
+                    val neededMillis = if (carPlayStartResends == 0) {
+                        CARPLAY_START_RESEND_GRACE_MILLIS
+                    } else {
+                        CARPLAY_START_RESEND_INTERVAL_MILLIS
+                    }
+                    if (elapsedSinceNanos(lastCarPlayStartAtNanos) >= neededMillis) {
+                        send(carPlayStartSession(endpoint), deadlineNanos)
+                        carPlayStartResends += 1
+                        lastCarPlayStartAtNanos = System.nanoTime()
+                        onProgress(
+                            "iap2 tx=0x4301 carplay-start-session " +
+                                "resend=$carPlayStartResends/$MAX_CARPLAY_START_RESENDS " +
+                                "streamFrames=$streamFrames",
+                        )
+                    }
                 }
             }
         } finally {
@@ -205,10 +222,15 @@ class Iap2WiredControlClient(
         // vc97①：iAP2 LinkControl/SessionControl 域——域内帧（0x5001 心跳、0x5201）非流帧。
         private val LINK_CONTROL_MESSAGE_ID_RANGE = 0x5000..0x5FFF
         private const val LOCATION_POLL_INTERVAL_MILLIS = 1_000L
-        // vc93：0x4301 重发预算——2s 间隔、最多 6 次（覆盖 controller 侧建立期看门狗
-        // 8s 窗口内约 3 次补发，重建代际内给足 iPhone 二次响应机会）。
-        private const val CARPLAY_START_RESEND_INTERVAL_MILLIS = 2_000L
-        private const val MAX_CARPLAY_START_RESENDS = 6
+        // vc187：0x4301 重发节拍——首发后宽限 6s 才补第一次，其后每 4s、最多 4 次
+        //（补发落在 6/10/14/18s，全部在 controller 25s 建立期看门狗窗口内）。
+        // 旧值 2s×6 在旧判据下从未触发（t3 实证 14 次首发 0 次补发）；新判据下若沿用
+        // 2s 会在健康握手（首 RTSP 1.7~5.3s）进行中就打断，故先宽限再补。
+        private const val CARPLAY_START_RESEND_GRACE_MILLIS = 6_000L
+        private const val CARPLAY_START_RESEND_INTERVAL_MILLIS = 4_000L
+        private const val MAX_CARPLAY_START_RESENDS = 4
+        // vc187：补发待发状态时按 1s 短轮询——4s 长轮询会把节拍拖成 8/12/16s，宽限失效。
+        private const val RESEND_POLL_INTERVAL_MILLIS = 1_000L
         private const val DEFAULT_TIMEOUT_MILLIS = 60_000L
         private const val MAX_TIMEOUT_MILLIS = 24 * 60 * 60 * 1_000L
         private const val MAX_RECV_TIMEOUT_MILLIS = 5 * 60 * 1_000L

@@ -659,6 +659,20 @@ class AirPlaySession(
                 }
                 if (closed.get() || generation != siriWatchdogGeneration.get()) return@Thread
                 if (activeAudioKinds.containsValue("media")) return@Thread
+                // vc187（t3 实测 20261025）：视频流仍在就**不许拿整条会话陪葬**。
+                // 实证链条：Siri 四连发 → 第 4 次后 10s 无 audio SETUP → 本看门狗 session.close()
+                // → NCM 入向端点随之楔死 3s→20s → Ipv6NcmBridge 判 usb wedge → wired teardown
+                // 全链断（t3 单份日志 48 次 wired teardown、3 次完整楔死）。同期视频仍在收包
+                //（21:22:24 video packets=5）＝链路健康，代价却是「音频慢」被升级成「连不上」。
+                // 只给语音提示让用户自己处理，不动链路。
+                if (activeStreams.contains(STREAM_TYPE_MAIN_SCREEN)) {
+                    debugLog(
+                        "airplay Siri audio stall: no audio SETUP after " +
+                            "${SIRI_AUDIO_RESTORE_TIMEOUT_MS}ms; video stream still active " +
+                            "— session kept (teardown costs the whole link)",
+                    )
+                    return@Thread
+                }
                 debugLog(
                     "airplay Siri audio stall: no audio SETUP after " +
                         "${SIRI_AUDIO_RESTORE_TIMEOUT_MS}ms; requesting session recovery",
@@ -680,15 +694,15 @@ class AirPlaySession(
     }
 
     private fun openKeepAlive(): Int {
-        // API16 车机实测：绑 IPv6 通配 [::] 抛异常会让 AirPlay SETUP 返回 500。
-        // 优先 [::]，失败回退 IPv4 通配（本热点对端为 IPv4）
+        // vc187：原绑 `InetAddress.getByName("::")`，在 IPv6 link-local 链路（NCM）上抛
+        // `Can't bind to a link-local address without a scope id`；改用通配 InetSocketAddress(0)。
         val socket = try {
             DatagramSocket(null).apply {
                 reuseAddress = true
-                bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+                bind(InetSocketAddress(0))
             }
         } catch (error: Exception) {
-            debugLog("airplay keepalive 端口 IPv6 通配绑定失败，回退 IPv4: ${error.message}")
+            debugLog("airplay keepalive 端口通配绑定失败，回退 IPv4: ${error.message}")
             DatagramSocket(null).apply {
                 reuseAddress = true
                 bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
@@ -714,12 +728,11 @@ class AirPlaySession(
     }
 
     private fun openEvent(): Int {
-        // API16 车机实测：绑 IPv6 通配 [::] 抛异常会让 AirPlay SETUP 返回 500。
-        // 优先 [::]（双栈，兼容 IPv6 对端），失败回退 IPv4 通配（本热点对端为 IPv4）
+        // vc187：同 openKeepAlive——不指名 `::`，用通配地址（双栈行为不变，避免 scope id 报错）。
         val server = try {
-            ServerSocket(0, 50, InetAddress.getByName("::"))
+            ServerSocket(0, 50)
         } catch (error: Exception) {
-            debugLog("airplay event 端口 IPv6 通配绑定失败，回退 IPv4: ${error.message}")
+            debugLog("airplay event 端口通配绑定失败，回退 IPv4: ${error.message}")
             ServerSocket(0, 50, InetAddress.getByName("0.0.0.0"))
         }
         eventServer = server
@@ -891,7 +904,10 @@ class AirPlaySession(
 
         // vc84：Siri 结束后等 iPhone 重发媒体音频 SETUP 的窗口。fe6t2 实测 Siri 结束后
         // iPhone 侧若健康会在秒级重来；10s 足够覆盖慢协商，又不至于让静音悬置太久。
-        const val SIRI_AUDIO_RESTORE_TIMEOUT_MS = 10_000L
+        // vc187：10s → 20s。t3（KK/NCM）上语音流压力会把整条链路拖慢（video 收包间隔
+        // readMaxMs 已达 1256ms），10s 会把「音频恢复慢」误判成「音频死了」。配合上方
+        // 「视频仍在则不拆会话」闸门，超时只影响真正无视频的音频-only 场景。
+        const val SIRI_AUDIO_RESTORE_TIMEOUT_MS = 20_000L
 
         const val READ_CHUNK_BYTES = 16 * 1024
         const val EVENT_READY_POLL_MILLIS = 25L

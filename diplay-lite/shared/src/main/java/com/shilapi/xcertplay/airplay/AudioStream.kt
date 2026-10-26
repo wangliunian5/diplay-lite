@@ -561,15 +561,16 @@ class AudioStream(
 
     private class PendingFrame(val rtp: ByteArray, val sample: Int)
 
-    // API16 车机实测：绑 IPv6 通配 [::] 抛异常会让该流被拒，回退 IPv4 通配（本热点对端为 IPv4）。
+    // vc187：与 ScreenStream 同款——原绑 `InetAddress.getByName("::")` 在 IPv6 link-local 链路
+    // （NCM）上抛 `Can't bind to a link-local address without a scope id`；改用通配 `InetSocketAddress(0)`。
     private fun bindAnyPort(): DatagramSocket {
         val socket = DatagramSocket(null)
         socket.reuseAddress = true
         return try {
-            socket.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+            socket.bind(InetSocketAddress(0))
             socket
         } catch (error: Exception) {
-            onDiagnostic("audio 端口 IPv6 通配绑定失败，回退 IPv4: ${error.message}")
+            onDiagnostic("audio 端口通配绑定失败，回退 IPv4: ${error.message}")
             runCatching { socket.close() }
             DatagramSocket(null).apply {
                 reuseAddress = true

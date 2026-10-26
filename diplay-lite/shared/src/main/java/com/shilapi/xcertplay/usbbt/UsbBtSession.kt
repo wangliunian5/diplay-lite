@@ -80,20 +80,27 @@ internal object UsbBtSession {
         }
 
     /**
-     * 触发系统 USB 权限弹窗（异步）。结果经 [PERMISSION_ACTION] 广播回报，
-     * B 批只发起不等待（open 路径会以「无权限」状态结束本轮探测）。
+     * 触发系统 USB 权限弹窗并**同步等待**广播回报（t3 反馈 vc184：原地等授权，
+     * 允许后本轮直接继续建链，免去「允许后再点一次连接」；ROM 不弹窗时也能靠超时
+     * + 日志 granted= 行判别「没弹窗」还是「被拒绝」）。
+     *
+     * 返回 true = 广播回报 granted 且 hasPermission 复核为真（个别 ROM 广播 granted
+     * 但授权未落地的兜底）；false = 被拒 / 超时 / 复核失败。
      */
-    fun requestPermission(context: Context, device: UsbDevice) {
+    fun awaitPermission(context: Context, device: UsbDevice, timeoutMillis: Long): Boolean {
         val app = context.applicationContext
-        val usb = manager(app) ?: return
+        val usb = manager(app) ?: return false
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var granted = false
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
-                val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
                 Log.i(TAG, "usb permission granted=$granted device=${deviceLabel(device)}")
                 try {
                     app.unregisterReceiver(this)
                 } catch (_: Throwable) {
                 }
+                latch.countDown()
             }
         }
         val filter = IntentFilter(PERMISSION_ACTION)
@@ -123,6 +130,23 @@ internal object UsbBtSession {
             flags,
         )
         usb.requestPermission(device, pi)
-        Log.i(TAG, "usb permission requested for ${deviceLabel(device)}")
+        Log.i(TAG, "usb permission requested for ${deviceLabel(device)} (await ${timeoutMillis}ms)")
+        val done = try {
+            latch.await(timeoutMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            false
+        }
+        if (!done) {
+            Log.w(TAG, "usb permission wait timeout (${timeoutMillis}ms) — ROM 未弹窗或用户未响应")
+            try {
+                app.unregisterReceiver(receiver)
+            } catch (_: Throwable) {
+            }
+            return false
+        }
+        // 广播 granted=true 后复核：防个别 ROM 广播与授权状态不同步
+        val ok = granted && hasPermission(app, device)
+        Log.i(TAG, "usb permission final ok=$ok (granted=$granted, hasPermission=${hasPermission(app, device)})")
+        return ok
     }
 }

@@ -78,6 +78,8 @@ class CarPlayRuntimeConfig(
     // true 时无线 RFCOMM 建链处（CarPlayController）改用 UsbBtBootstrapStream，
     // 其余链路（btProbeMode 三轮握手等）一律不变；默认 false 行为与此前完全一致。
     val usbBtDongle: Boolean = false,
+    // vc184：外置蓝牙自定义名称（写进 HCI 本地名称，iPhone 蓝牙列表显示）。
+    val usbBtDongleName: String = "DiPlay CarPlay",
 ) {
     init {
         require(hostMac.size == 6) { "hostMac must be 6 bytes" }

@@ -463,6 +463,8 @@ class LiteSessionService : Service() {
                     wiredNcmGuardEnabled = BuildConfig.WIRED_NCM_GUARD_ENABLED,
                     // vc167（外置 USB 蓝牙 dongle 第 2 步）：开关透传到控制器建链处。
                     usbBtDongle = config.usbBtDongle,
+                    // vc184：外置蓝牙自定义名称透传（写进 dongle HCI 本地名称）。
+                    usbBtDongleName = config.usbBtDongleName,
                 ),
                 airPlayConfig = AirPlayConfig(
                     // 1.0.17：显示名称可自定义（自定义返回图标页），默认 DiPlay；流向 /info name + Bonjour 服务名。
@@ -592,10 +594,44 @@ class LiteSessionService : Service() {
             "could not join relay network" in m ->
                 "加入中继网络超时：请核对随身WiFi名称/密码；若确认无误，多半是热点开了WPA3（老车机不支持，请改WPA2/AES）或DHCP较慢，可再试一次"
             "relay ssid is not configured" in m -> "当前是中继热点模式，未配置SSID，无法连接"
-            "adding relay network" in m -> "添加中继网络失败：请核对随身WiFi密码"
+            // vc181（K60 API34 实测）：`addNetwork()` 返回 -1 在 Android 11+ 上是**系统限制**
+            // 而非密码错误——第三方 App 自 API30 起被禁止自动配置/连接 Wi-Fi。此时正确引导是
+            // 「去系统 Wi-Fi 设置先连上该热点，再回 App 点连接」（App 会由 isJoinedWithIp 短路复用，
+            // 不再碰配置 API）。老车机（API≤29）仍可走 legacy API，-1 多半才是密码/加密问题。
+            "adding relay network" in m -> {
+                // 从原始英文串里抠出 SSID（形如 '7205'），避免依赖上层字段作用域。
+                val relaySsid = Regex("relay network '([^']+)'").find(message)?.groupValues?.get(1)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    val hint = if (relaySsid != null) "「$relaySsid」" else "该热点"
+                    "添加中继网络失败：Android 11+ 已禁止第三方App自动连Wi-Fi，密码本身没问题。请先在系统Wi-Fi设置里连上$hint，再回到本App点连接"
+                } else {
+                    "添加中继网络失败：请核对随身WiFi密码"
+                }
+            }
             "enabling relay network" in m -> "启用中继网络失败，请重试"
             "wi-fi is off" in m -> "车机Wi-Fi未开启：中继模式需先打开Wi-Fi"
             "car hotspot is off" in m -> "车机热点未开启：请到车机设置打开热点后重试"
+            // vc186：蓝牙 RFCOMM 失败分级（FE6 20261025 实证——原生栈半残会先 15s 超时、
+            // 后转为毫秒立败，而用户原本只看到一句裸英文 "bt socket connect failed"）。
+            // 判据来自 CarPlayController 新建链前体检与 fastFail/timeout 计数。
+            "bluetooth adapter half-dead" in m ->
+                "本机蓝牙未真正初始化（系统蓝牙栈异常，蓝牙地址为空/全零）：请检查车机系统蓝牙设置，或重启车机后重试"
+            "bluetooth adapter not on" in m ->
+                "车机蓝牙未开启：请先打开蓝牙后重试"
+            "rfcomm connect failed" in m -> {
+                val fast = Regex("fastFail=(\\d+)").find(message)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                val slow = Regex("timeout=(\\d+)").find(message)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                when {
+                    fast > 0 && slow > 0 ->
+                        "蓝牙连接先超时后快速失败：系统蓝牙栈状态异常（多见于蓝牙栈被改动/驱动未就绪）。请检查系统蓝牙或重启车机后重试"
+                    fast > 0 ->
+                        "蓝牙连接被本机拒绝：请确认iPhone已与车机配对且iPhone蓝牙已开启；若近期改动过系统蓝牙，请重启车机"
+                    slow > 0 ->
+                        "iPhone无应答：请解锁iPhone、确认蓝牙可见并靠近车机；仍失败请在iPhone上忽略此设备后重新配对"
+                    else ->
+                        "蓝牙连接失败：请确认iPhone已配对且蓝牙已开启"
+                }
+            }
             // vc170：Wi-Fi Direct 在部分机型上是**硬件/ROM 层面不支持**（C8815 实测：
             // createGroup 1ms 即回 code=1 / P2P_UNSUPPORTED，非超时非信号）。
             // 原串来自 WifiP2pGroupManager 的 P2P_UNSUPPORTED 分支（英文），

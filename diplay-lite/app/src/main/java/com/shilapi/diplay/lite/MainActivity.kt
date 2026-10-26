@@ -116,6 +116,8 @@ class MainActivity : Activity() {
     private lateinit var disconnectButton: Button
     // 默认通道提示行：设置页改默认通道后回主页实时刷新。
     private lateinit var hintLabel: TextView
+    // vc184：主页状态卡底部「当前蓝牙」行（车机蓝牙 / 外置蓝牙 + 名称）。
+    private lateinit var btModeLabel: TextView
 
     private var panelVisible = true
     private var lastActive = false
@@ -1041,6 +1043,12 @@ class MainActivity : Activity() {
             hintLabel,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
         )
+        // vc184：「当前蓝牙」行 —— 与默认通道行同款灰字、不加亮不变色。
+        btModeLabel = label(btModeText(config), 12, Ui.MUTED).apply { setPadding(0, dip(2), 0, 0) }
+        card.addView(
+            btModeLabel,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+        )
         return card
     }
 
@@ -1050,6 +1058,13 @@ class MainActivity : Activity() {
         "p2p" -> "默认通道：Wi-Fi Direct。车机自建点对点组，iPhone 加入后自动建立 CarPlay。"
         "usb" -> "默认通道：USB 连接。数据线直连，当 iPhone 提示时允许 CarPlay。"
         else -> "默认通道：车机热点。手机连上车机热点后自动建立 CarPlay。"
+    }
+
+    /** vc184：主页状态卡底部「当前蓝牙」文案 —— 选外置蓝牙时附自定义名称，选车机蓝牙则不显示名称段。 */
+    private fun btModeText(config: LiteConfig): String = if (config.usbBtDongle) {
+        "当前蓝牙：外置蓝牙　蓝牙名称：${config.usbBtDongleName}"
+    } else {
+        "当前蓝牙：车机蓝牙"
     }
 
     /**

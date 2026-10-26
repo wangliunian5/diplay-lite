@@ -36,6 +36,7 @@ class WiredMdnsResponder(
     @Volatile private var currentTxt: Map<String, String>? = null
     private var inlineSeen = 0
     private var replySeen = 0
+    private var unmatchedSeen = 0
 
     /**
      * vc127（KK 实测）：socket send 到 link-local 目标抛 SocketException（KK sendto
@@ -269,9 +270,12 @@ class WiredMdnsResponder(
             worker.isDaemon = true
             worker.start()
             thread = worker
+            // vc187：这里原本打的是 servicePort（AirPlay 端口 7100），与 mDNS 组播组实际
+            // 端口 5353 无关，排障时极易被误读成「应答器占着 7100 抢了 AirPlay 的口」。
+            // 改成打真实的 mDNS 监听端口。
             onDiagnostic(
                 "wired mdns responder joined ${MDNS_GROUP_V6}%$scopeId if=${netIf.name} " +
-                    "port=$servicePort",
+                    "mdnsPort=$SOCKET_PORT airPlayPort=$servicePort",
             )
             true
         } catch (error: Exception) {
@@ -355,7 +359,19 @@ class WiredMdnsResponder(
                 if (matchedService == null) matchedService = "host"
             }
         }
-        val service = matchedService ?: return // 未命中=沉默（Legacy 同款）
+        val service = matchedService ?: run {
+            // vc187（t3 实测）：v1.2.20 两条日志都是「查询 69~72 次、应答 0 次」，
+            // 而成功与失败的建链轮次里查询量一致 ⇒ 沉默本身不是建链失败判别因素，
+            // 但「收了却不答」长期无据可查。把问到的名字记下来（节流），
+            // 下一轮据此判断该放行应答还是该继续沉默。
+            if (unmatchedSeen++ < 8 || unmatchedSeen % 24 == 0) {
+                onDiagnostic(
+                    "wired mdns query unmatched #$unmatchedSeen qnames=" +
+                        echoed.joinToString(",") { (labels, _) -> labels.joinToString(".") },
+                )
+            }
+            return
+        }
         // 先编答案段拿记录数，再拼完整包：头(id/flags/qd/an/ns/ar)→问题→答案
         val answerBuf = java.io.ByteArrayOutputStream(512)
         var answers = 0
