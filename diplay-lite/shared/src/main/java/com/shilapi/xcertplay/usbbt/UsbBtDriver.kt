@@ -1,6 +1,7 @@
 package com.shilapi.xcertplay.usbbt
 
 import android.content.Context
+import android.content.res.AssetManager
 import android.hardware.usb.UsbConstants
 import android.os.Build
 import android.hardware.usb.UsbDevice
@@ -42,6 +43,9 @@ internal class UsbBtDriver private constructor(
     private val listener: Listener,
     /** vc186：诊断出口（接 CarPlayController.debugLog → LiteLog 上云）。默认丢弃。 */
     private val onDiagnostic: (String) -> Unit = {},
+    /** vc190：固件下载按芯片身份选固件，需记住 dongle 的 USB VID/PID。 */
+    private val vendorId: Int,
+    private val productId: Int,
 ) : Closeable {
     /** 驱动事件出口（host 在 C5 实现；B 批探活用 [NO_OP]）。 */
     interface Listener {
@@ -204,7 +208,10 @@ internal class UsbBtDriver private constructor(
                     " aclIn=${aclIn?.let { "0x${hexOf(it.address)}(mps=${it.maxPacketSize})" } ?: "none"}" +
                     " aclOut=${aclOut?.let { "0x${hexOf(it.address)}(mps=${it.maxPacketSize})" } ?: "none"}",
             )
-            return UsbBtDriver(connection, iface, events, aclIn, aclOut, listener, onDiagnostic)
+            return UsbBtDriver(
+                connection, iface, events, aclIn, aclOut, listener, onDiagnostic,
+                device.vendorId, device.productId,
+            )
         }
 
         /** 描述符字节 → 两位十六进制（诊断用）。 */
@@ -390,6 +397,41 @@ internal class UsbBtDriver private constructor(
         hciCommand(HciCommands.RESET) ?: return null
         val params = hciCommand(HciCommands.READ_BD_ADDR) ?: return null
         return HciReturnParameters.bdAddrOfReadBdAddr(params)
+    }
+
+    /**
+     * vc190（CM390 / Realtek ROM 模式 dongle）：打开后、host 初始化前按芯片身份下载固件。
+     * 仅对 Realtek/Broadcom 等 ROM 模式芯片生效；CSR8510 等固件片内芯片走
+     * [UsbBtFirmwareLoader.LoadResult.NoFirmwareNeeded] 空过，现有路径不受影响。
+     * 失败/缺失不抛异常——交由后续 host 初始化给出明确诊断（如 BD_ADDR 全零）。
+     */
+    fun loadFirmware(assetManager: AssetManager): UsbBtFirmwareLoader.LoadResult {
+        val loader = UsbBtFirmwareLoader(
+            command = { opcode, params, timeout -> hciToFirmwareResult(opcode, params, timeout.toLong()) },
+            assets = assetManager,
+        )
+        return runCatching { loader.loadForDevice(vendorId, productId) }
+            .getOrDefault(UsbBtFirmwareLoader.LoadResult.Failed("firmware loader crashed"))
+            .also { onDiagnostic("usbbt: firmware load $it (vid=0x${vendorId.toString(16)} pid=0x${productId.toString(16)})") }
+    }
+
+    /** 把本仓 [hciCommand]（剥掉 status 字节）桥接成固件加载器期望的「含 status 完整 reply」。 */
+    private fun hciToFirmwareResult(
+        opcode: Int,
+        params: ByteArray,
+        timeoutMs: Long,
+    ): UsbBtFirmwareLoader.HciResult<ByteArray> = try {
+        val ret = hciCommand(opcode, params, timeoutMs)
+        if (ret == null) {
+            UsbBtFirmwareLoader.HciResult.Failed("no reply / timeout")
+        } else {
+            // hciCommand 已剥掉 status 字节；固件代码要求 reply[0]==0，这里补回 0 状态字节。
+            UsbBtFirmwareLoader.HciResult.Ok(byteArrayOf(0) + ret)
+        }
+    } catch (e: HciStatusException) {
+        UsbBtFirmwareLoader.HciResult.Failed("status 0x%02x".format(e.status))
+    } catch (e: Throwable) {
+        UsbBtFirmwareLoader.HciResult.Failed(e.message ?: e.javaClass.simpleName)
     }
 
     /** ACL bulk OUT 单写（writeLock 串行化）；失败返回 false。[pbFlag]：0x2 起点/0x1 续传。 */

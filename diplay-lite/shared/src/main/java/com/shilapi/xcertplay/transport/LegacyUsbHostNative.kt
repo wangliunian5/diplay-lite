@@ -32,4 +32,18 @@ internal object LegacyUsbHostNative {
     /** vc103l（T3）：USBDEVFS_RELEASEINTERFACE 释放本 fd 的 usbfs claim——
      *  KK proc_setconfig 在有 usbfs claim 时拒绝切配置（EBUSY=16 实测）。 */
     external fun releaseInterface(fileDescriptor: Int, interfaceNumber: Int): Int
+
+    /** vc189（T3）：直接走 USBDEVFS_CONTROL ioctl 下发 CarPlay 厂商配置请求（0x52），
+     *  失败时原样返回内核 errno（Android 框架 controlTransfer 把它吞成不透明 -1）。
+     *  约定：返回 >=0 = 实际传输字节数；返回 <0 = -(errno)。 */
+    external fun controlTransferErrno(
+        fileDescriptor: Int,
+        requestType: Int,
+        request: Int,
+        value: Int,
+        index: Int,
+        data: ByteArray,
+        length: Int,
+        timeoutMs: Int,
+    ): Int
 }

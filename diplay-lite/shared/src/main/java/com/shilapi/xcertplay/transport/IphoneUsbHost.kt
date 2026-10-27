@@ -156,24 +156,117 @@ class IphoneUsbHost(
     ) {
         executor.execute {
             callback(runTransition(device) { connection ->
-                val response = ByteArray(VENDOR_RESPONSE_LENGTH)
-                val transferred = connection.controlTransfer(
-                    USB_VENDOR_DEVICE_IN,
-                    CARPLAY_CONFIGURATION_REQUEST,
-                    0,
-                    CARPLAY_CONFIGURATION_INDEX,
-                    response,
-                    response.size,
-                    CONTROL_TRANSFER_TIMEOUT_MILLIS,
-                )
-                if (transferred != response.size) {
+                // vc188 探测①：发 0x52 前先 dump USB 设备描述符要素（含 bcdDevice）。
+                // 关键价值：若会话随后死在 usb/config（早于 iAP2 机型交换，model=/ios= 全缺失），
+                // 仍可凭此反推 iPhone 机型与 iOS 版本 → 才能验证「是否低 iOS 版本差异导致」。
+                report("wired probe usb: " + describeRawUsb(connection))
+                var lastTransferred = -1
+                var lastErrno = 0
+                var responseByte = 0
+                // vc189：优先走 native usbfs（直接 ioctl USBDEVFS_CONTROL）下发 0x52，失败返回
+                // -errno，可区分 ENODEV(陈旧实例)/EPIPE(设备拒绝)/ETIMEDOUT(线缆)/EBUSY(claim)——
+                // 框架 controlTransfer 把 errno 吞成不透明 -1，正是 222631/070240 卡死点。
+                val useNative = LegacyUsbHostNative.available
+                val fd = if (useNative) runCatching { connection.fileDescriptor }.getOrDefault(-1) else -1
+                for (attempt in 0 until CARPLAY_CONFIG_MAX_ATTEMPTS) {
+                    val response = ByteArray(VENDOR_RESPONSE_LENGTH)
+                    val nativeR = if (useNative && fd >= 0) {
+                        runCatching {
+                            LegacyUsbHostNative.controlTransferErrno(
+                                fd, USB_VENDOR_DEVICE_IN, CARPLAY_CONFIGURATION_REQUEST,
+                                0, CARPLAY_CONFIGURATION_INDEX, response, response.size,
+                                CONTROL_TRANSFER_TIMEOUT_MILLIS,
+                            )
+                        }.getOrElse { -1 }
+                    } else {
+                        connection.controlTransfer(
+                            USB_VENDOR_DEVICE_IN, CARPLAY_CONFIGURATION_REQUEST,
+                            0, CARPLAY_CONFIGURATION_INDEX, response, response.size,
+                            CONTROL_TRANSFER_TIMEOUT_MILLIS,
+                        )
+                    }
+                    lastTransferred = if (nativeR >= 0) nativeR else -1
+                    lastErrno = if (nativeR < 0) -nativeR else 0
+                    if (lastTransferred == response.size) {
+                        responseByte = response[0].toInt() and 0xff
+                        // vc188 错误分级：区分「已配置拒绝」(0x6) 与「接受切换」(0x0)。
+                        report(
+                            "wired CarPlay vendor request 0x52 response=0x" +
+                                responseByte.toString(16) +
+                                " (0x6=already configured; 0x0=accepted)" +
+                                if (useNative && fd >= 0) " [native usbfs]" else " [framework]"
+                        )
+                        break
+                    }
+                    report(
+                        "wired 0x52 attempt ${attempt + 1}/$CARPLAY_CONFIG_MAX_ATTEMPTS " +
+                            "transferred=$lastTransferred" +
+                            if (lastErrno != 0) " errno=${lastErrno}(${errnoName(lastErrno)})" else "" +
+                            " (timeout=${CONTROL_TRANSFER_TIMEOUT_MILLIS}ms)" +
+                            if (useNative && fd >= 0) " [native usbfs]" else " [framework]"
+                    )
+                    if (attempt < CARPLAY_CONFIG_MAX_ATTEMPTS - 1) {
+                        Thread.sleep(CARPLAY_CONFIG_RETRY_DELAY_MILLIS.toLong())
+                    }
+                }
+                if (lastTransferred != VENDOR_RESPONSE_LENGTH) {
                     throw IphoneUsbException.Protocol(
-                        "CarPlay configuration request transferred $transferred of ${response.size} bytes",
+                        "CarPlay configuration request transferred $lastTransferred of " +
+                            "$VENDOR_RESPONSE_LENGTH bytes" +
+                            if (lastErrno != 0) " (errno=${lastErrno} ${errnoName(lastErrno)})" else ""
                     )
                 }
-                TransitionResult.ReenumerationRequested(response[0].toInt() and 0xff)
+                TransitionResult.ReenumerationRequested(responseByte)
             })
         }
+    }
+
+    /**
+     * vc188 探测①：把 iPhone 的 USB 设备描述符要素打成一行日志。
+     *
+     * 为什么需要：222631 的失败发生在 `STEP usb/config`，**早于** iAP2 identification，
+     * 所以日志里 `model=` / `ios=` 全是空的，无法判断是不是 SE/iOS15 特有。
+     * USB 设备描述符在 discovered 阶段就能读到，其中 **bcdDevice 通常编码 iOS 版本**
+     * （高字节≈主版本，如 0x0F=15 / 0x10=16），可在不建链的情况下反推 iOS 版本。
+     *
+     * ⚠️ bcdDevice→iOS 版本是**经验映射，非 Apple 公开承诺**；本次先落原始值，
+     * 后续拿一台已知 iOS 版本的 iPhone 建链成功后再校准映射关系。
+     */
+    private fun describeRawUsb(connection: UsbDeviceConnection): String {
+        val raw = runCatching { connection.rawDescriptors }.getOrNull()
+        if (raw == null || raw.size < 18) {
+            return "rawDescriptors=unavailable(len=${raw?.size ?: -1})"
+        }
+        val vid = ((raw[9].toInt() and 0xff) shl 8) or (raw[8].toInt() and 0xff)
+        val pid = ((raw[11].toInt() and 0xff) shl 8) or (raw[10].toInt() and 0xff)
+        val bcdDevice = ((raw[13].toInt() and 0xff) shl 8) or (raw[12].toInt() and 0xff)
+        // vc188：getSerial() 是 API21+ 方法。API≤19（t3=19 / at8317=17 / C8815=16）上直接调用
+        // 会抛 NoSuchMethodError —— runCatching 虽能兜住不至于崩溃，但每次都会生成一条
+        // Throwable（污染日志、干扰外测判读），且 serial 恒为 "-" 使探测失去意义，故显式守卫。
+        // 老设备改由 bcdDevice 反推 iOS 版本，serial 留空即可。
+        val serial = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            runCatching { connection.serial }.getOrNull()
+        } else {
+            null
+        }
+        return "vid=0x${vid.toString(16)} pid=0x${pid.toString(16)} " +
+            "bcdDevice=0x${"%04x".format(bcdDevice)} " +
+            "(guess iosMajor=0x${((bcdDevice shr 8) and 0xff).toString(16)} " +
+            "iosMinor=0x${(bcdDevice and 0xff).toString(16)}) " +
+            "serial=${serial ?: "-"}"
+    }
+
+    /** vc189：把 Linux errno 数字映射为可读名（标准 Linux 值，arm/x86 一致），
+     *  便于外测日志二分 0x52 失败根因。 */
+    private fun errnoName(errno: Int): String = when (errno) {
+        19 -> "ENODEV"      // fd 指向内核已拆设备=陈旧实例/死 fd（KK 重枚举竞态）
+        32 -> "EPIPE"       // 设备在线但 STALL 拒绝=USB 态卡死
+        110 -> "ETIMEDOUT"  // 设备不 ACK=线缆/供电不足
+        16 -> "EBUSY"       // 接口被占用=claim 时序问题
+        22 -> "EINVAL"      // 参数非法
+        5 -> "EIO"          // 内核 I/O 错误
+        12 -> "ENOMEM"      // 内存不足
+        else -> "errno($errno)"
     }
 
     /**
@@ -493,6 +586,20 @@ class IphoneUsbHost(
         private const val CONVERGE_SETTLE_MILLIS = 300L
         private const val CONVERGE_TIMEOUT_MILLIS = 5000L
         private const val CONTROL_TRANSFER_TIMEOUT_MILLIS = 1_000
+
+        /**
+         * vc188：0x52（CarPlay 模式切换）厂商请求在本 attempt 内的尝试次数与退避。
+         *
+         * 依据：222631 六轮连接的 0x52 都在 **~4ms** 内返回 -1（远小于 1s 超时），
+         * 说明不是「iPhone 响应慢/超时」，而是**立即失败**——典型是连到了
+         * deviceList 里残留的**陈旧实例**（KK 上旧实例会残留 1~3s）导致句柄不可用
+         * （ENODEV/EPIPE）。加短 settle 重试可覆盖首次 open 与重枚举的竞态。
+         *
+         * ⚠️ 这是**防御性增强，不是确诊修复**：若 iPhone 侧 USB 态真的卡死，重试无效，
+         * 仍需外测换线 / 重启 iPhone。日志会区分「全败」与「重试后成功」以便二分。
+         */
+        private const val CARPLAY_CONFIG_MAX_ATTEMPTS = 3
+        private const val CARPLAY_CONFIG_RETRY_DELAY_MILLIS = 400
 
         // 1.0.2：USBMUX 会话打开的落定等待与重试——重枚举 attach 后立即
         // setConfiguration/claim 在 MIUI 上会失败（claim 返回 false）。

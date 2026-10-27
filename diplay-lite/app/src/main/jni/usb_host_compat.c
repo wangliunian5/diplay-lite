@@ -192,3 +192,44 @@ Java_com_shilapi_xcertplay_transport_LegacyUsbHostNative_setConfiguration(
     return result;
 #endif
 }
+
+/* controlTransferErrno: vc189（T3）——直接走 USBDEVFS_CONTROL ioctl 下发 CarPlay
+ * 厂商配置请求（0x52），失败时原样返回内核 errno。Android 框架 controlTransfer()
+ * 把 errno 吞成不透明 -1，无法区分 ENODEV(陈旧实例)/EPIPE(设备拒绝)/ETIMEDOUT(线缆)/EBUSY(claim)。
+ * 约定：返回 >=0 = 实际传输字节数；返回 <0 = -(errno)。纯 C、API19 目标、无 libc++。 */
+JNIEXPORT jint JNICALL
+Java_com_shilapi_xcertplay_transport_LegacyUsbHostNative_controlTransferErrno(
+        JNIEnv *env, jobject self,
+        jint file_descriptor, jint request_type, jint request,
+        jint value, jint index, jbyteArray data, jint length, jint timeout_ms) {
+    (void) self;
+
+    if (file_descriptor < 0 || length < 0 || timeout_ms < 0) return -EINVAL;
+
+    jbyte *buf = NULL;
+    if (length > 0) {
+        if (data == NULL) return -EINVAL;
+        buf = (*env)->GetByteArrayElements(env, data, NULL);
+        if (buf == NULL) return -ENOMEM;
+    }
+
+    struct usbdevfs_ctrltransfer ctrl;
+    memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.bRequestType = (unsigned char) request_type;
+    ctrl.bRequest = (unsigned char) request;
+    ctrl.wValue = (unsigned short) value;
+    ctrl.wIndex = (unsigned short) index;
+    ctrl.wLength = (unsigned short) length;
+    ctrl.timeout = (unsigned int) timeout_ms;
+    ctrl.data = buf;
+
+    int ret = ioctl(file_descriptor, USBDEVFS_CONTROL, &ctrl);
+    int saved_errno = errno;
+
+    if (buf != NULL) {
+        (*env)->ReleaseByteArrayElements(env, data, buf, JNI_ABORT);
+    }
+
+    if (ret < 0) return -((saved_errno != 0) ? saved_errno : EIO);
+    return ret;
+}

@@ -109,6 +109,13 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
                 driver = UsbBtDriver.open(context, dongle, forward, diagSink)
                     ?: fail("打开 dongle 失败：设备刚重枚举或打开被拒")
                 status("已打开 dongle（${UsbBtSession.deviceLabel(dongle)}）")
+                // vc190：Realtek/Broadcom ROM 模式 dongle（如 CM390 / RTL8761BUV）必须先灌固件，
+                // 否则后续 HCI 初始化只能读到全零 BD_ADDR。host 初始化前在此完成固件下载；
+                // CSR8510 等固件片内芯片走 NoFirmwareNeeded 空过，无回归。失败不阻断建链
+                // （host 初始化会给出明确诊断）。
+                val fw = driver.loadFirmware(context.assets)
+                status("固件加载：$fw")
+                diagSink("usbbt: firmware load result=$fw")
                 host = UsbBtHost(identity, driver, { msg -> Log.i(TAG, msg) }).also {
                     it.onStatus = { text -> status(text) }
                     it.onReady = { ready.countDown() }

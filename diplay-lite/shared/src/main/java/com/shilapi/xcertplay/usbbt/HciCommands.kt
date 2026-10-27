@@ -41,6 +41,10 @@ internal object HciCommands {
     const val READ_BUFFER_SIZE: Int = 0x1005 // opcode(4, 5)
     const val READ_BD_ADDR: Int = 0x1009
 
+    // ── 厂商命令（OGF=0x3F，仅外置 dongle 固件下载用，见 UsbBtFirmwareLoader）────
+    const val DOWNLOAD_REALTEK_FIRMWARE: Int = 0xfc20 // opcode(0x3F, 0x0020) Realtek 固件分段下载
+    const val DOWNLOAD_BROADCOM_MINIDRIVER: Int = 0xfc2e // opcode(0x3F, 0x002E) Broadcom 下载 minidriver
+
     fun opcode(ogf: Int, ocf: Int): Int = (ogf shl 10) or ocf
 
     /** 构造一条完整 HCI 命令包（含 3 字节头）。 */

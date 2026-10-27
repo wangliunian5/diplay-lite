@@ -21,8 +21,8 @@ android {
         // 覆盖；出包时改错一处即打错版本，已移除。
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
-        versionCode = 187
-        val versionPatch = 22
+        versionCode = 189
+        val versionPatch = 24
         versionName = "1.2.$versionPatch.dongle"
     }
 
@@ -130,10 +130,16 @@ tasks.register("injectRuntimeIdentity") {
             )
             return@doLast
         }
-        val present = runtimeIdentityFiles.filter { File(srcDir, it).isFile }
+        // vc188：vc187 的守卫只判 isFile（文件是否存在），但 File.isFile 对
+        // 0 字节文件同样返回 true ⇒ 空文件能过检并被 copyTo 拷进 assets，
+        // 运行时 readBounded() 必然抛 "Local identity file is empty"。
+        // 这正是 220020 的失效形态——守卫恰好漏掉了它本该拦住的那一种情况。
+        val present = runtimeIdentityFiles.filter {
+            File(srcDir, it).let { file -> file.isFile && file.length() > 0 }
+        }
         if (present.size != runtimeIdentityFiles.size) {
             throw GradleException(
-                "身份资产不完整：$srcDir 中应有 $runtimeIdentityFiles，实得 $present"
+                "身份资产不完整或为空：$srcDir 中应有 $runtimeIdentityFiles（且非空），实得 $present"
             )
         }
         dstDir.mkdirs()
@@ -142,8 +148,40 @@ tasks.register("injectRuntimeIdentity") {
     }
 }
 
+// vc190：外置 USB 蓝牙固件（Realtek 等 blob，linux-firmware 再分发许可）。
+// 与 offline-mfi 同策略：源文件放私有目录 auth/usbbt_fw（被 .gitignore 排除，永不入公开仓），
+// 构建期注入 app/src/main/assets/usbbt_fw（该目录同样 gitignore），缺失则告警纯源码构建。
+val usbFirmwareDir = System.getenv("DIPLAY_USB_FIRMWARE_DIR")?.takeIf { it.isNotBlank() }
+    ?: rootProject.file("../auth/usbbt_fw").absolutePath
+val usbFirmwareTarget = file("src/main/assets/usbbt_fw")
+
+tasks.register("injectUsbbtFirmware") {
+    group = "build"
+    description = "Copy external Realtek/Broadcom USB Bluetooth firmware into app assets (never committed)"
+    val srcDir = File(usbFirmwareDir)
+    val dstDir = usbFirmwareTarget
+    doLast {
+        if (!srcDir.isDirectory) {
+            logger.warn(
+                "未找到 USB 蓝牙固件目录 $srcDir —— 将产出不带固件的 APK（纯源码构建语义）。" +
+                    "需支持 Realtek/Broadcom ROM 模式 dongle（如 CM390）请把固件放入该目录，" +
+                    "或设置环境变量 DIPLAY_USB_FIRMWARE_DIR（来源见 FIRMWARE.md）。"
+            )
+            return@doLast
+        }
+        // auth/usbbt_fw 为本仓受控私有源，整体递归拷贝（含 rtl_bt/ + manifest.json + LICENCE + README）。
+        dstDir.mkdirs()
+        srcDir.walkTopDown().filter { it.isFile }.forEach { f ->
+            val rel = f.relativeTo(srcDir).path
+            File(dstDir, rel).parentFile?.mkdirs()
+            f.copyTo(File(dstDir, rel), overwrite = true)
+        }
+        logger.lifecycle("已注入 USB 蓝牙固件（来源：$srcDir → $dstDir）")
+    }
+}
+
 tasks.named("preBuild").configure {
-    dependsOn("injectRuntimeIdentity")
+    dependsOn("injectRuntimeIdentity", "injectUsbbtFirmware")
 }
 
 // vc154（⑦ CI 化构建 task）：一键「签名 release 构建 + APK 归档」。
