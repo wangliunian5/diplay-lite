@@ -21,8 +21,8 @@ android {
         // 覆盖；出包时改错一处即打错版本，已移除。
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
-        versionCode = 189
-        val versionPatch = 24
+        versionCode = 190
+        val versionPatch = 25
         versionName = "1.2.$versionPatch.dongle"
     }
 

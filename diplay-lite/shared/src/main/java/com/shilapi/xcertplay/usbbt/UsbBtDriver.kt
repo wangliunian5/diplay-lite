@@ -107,6 +107,10 @@ internal class UsbBtDriver private constructor(
                     " nativeAvailable=${LegacyUsbHostNative.available} api=${Build.VERSION.SDK_INT}",
             )
             // vc183：sunxi KK 描述符半解析 —— 先 RESET 强制重枚举（0/19 都表示重置完成、节点失效）。
+            // vc190fix：RESET 后内核完全重枚举，原 fd 失效且设备会短暂从总线消失/重现，内核重建
+            // 「非默认端点表」需要时间。若同步立即 openDevice+claim，拿到的端点表残缺 → 控制端点0
+            // 可用(故固件下载成功)但 bulk/interrupt 端点 ENOENT=-1（t3 实测：首灌/二次跳过重灌均复现）。
+            // 必须先 close 旧连接，循环等待重枚举完成（同 VID/PID 兜底 deviceName 随重枚举变化）再重开。
             if (kkNative) {
                 val resetErrno = try {
                     LegacyUsbHostNative.portReset(connection.fileDescriptor)
@@ -119,7 +123,25 @@ internal class UsbBtDriver private constructor(
                         connection.close()
                     } catch (_: Throwable) {
                     }
-                    connection = usb.openDevice(device) ?: return null
+                    var reopened: UsbDeviceConnection? = null
+                    var attempt = 0
+                    while (attempt < 40 && reopened == null) {
+                        reopened = tryOpenDongle(usb, device)
+                        if (reopened == null) {
+                            try {
+                                Thread.sleep(100)
+                            } catch (_: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                            }
+                            attempt++
+                        }
+                    }
+                    if (reopened == null) {
+                        onDiagnostic("usbbt: reopen after portReset failed after $attempt attempts")
+                        return null
+                    }
+                    connection = reopened
+                    onDiagnostic("usbbt: reopened after portReset (attempts=$attempt)")
                 }
             }
             // vc186 P1：照搬有线 NcmUsbBridge vc103n/vc103o「配置舞」——当年 T3 无 root 跑通的关键
@@ -190,6 +212,16 @@ internal class UsbBtDriver private constructor(
                 onDiagnostic(
                     "usbbt: post-claim forceClaim(${iface.id}) errno=$forceErrno" +
                         " (KK claim ok != kernel btusb detached)",
+                )
+            }
+            // vc190fix：KK usbfs 端点激活 —— claim 后须显式 SET_INTERFACE(alt=0) 让内核同步 ep 表，
+            // 否则 HCI 接口 bulk/interrupt 端点处于 disable 态 ⇒ bulkTransfer ENOENT=-1（t3 实测）。
+            // 照搬 NcmUsbBridge 的 KK 兼容法：L+ 先 framework，退化走 native USBDEVFS_SETINTERFACE。
+            if (kkNative) {
+                val setIfErrno = applySetInterface(connection, iface)
+                onDiagnostic(
+                    "usbbt: setInterface(${iface.id},0) errno=$setIfErrno" +
+                        " (KK ep-table sync; native unavailable=-1)",
                 )
             }
             // 批量端点按形态识别（无则置 null：个别 dongle ACL 面挂在别的接口）
@@ -305,6 +337,33 @@ internal class UsbBtDriver private constructor(
                 connection.controlTransfer(0x80, 8, 0, 0, buf, 1, 1000)
             }.getOrDefault(-1)
             return if (n > 0) buf[0].toInt() and 0xff else -1
+        }
+
+        /** vc190fix：portReset 后按原 device 或同 VID/PID 在列设备重开连接（兜底 deviceName 随重枚举变化）。 */
+        private fun tryOpenDongle(usb: UsbManager, device: UsbDevice): UsbDeviceConnection? {
+            runCatching { usb.openDevice(device) }.getOrNull()?.let { return it }
+            for (cand in usb.deviceList.values) {
+                if (cand.vendorId == device.vendorId && cand.productId == device.productId) {
+                    runCatching { usb.openDevice(cand) }.getOrNull()?.let { return it }
+                }
+            }
+            return null
+        }
+
+        /** vc190fix：KK 兼容 setInterface —— L+ 优先 framework，退化走 native USBDEVFS_SETINTERFACE。返回 errno（0=成功，native 不可用时 -1）。 */
+        private fun applySetInterface(connection: UsbDeviceConnection, iface: UsbInterface): Int {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP &&
+                runCatching { connection.setInterface(iface) }.getOrDefault(false)
+            ) {
+                return 0
+            }
+            return if (LegacyUsbHostNative.available) {
+                runCatching {
+                    LegacyUsbHostNative.setInterface(connection.fileDescriptor, iface.id, 0)
+                }.getOrDefault(-1)
+            } else {
+                -1
+            }
         }
 
         private fun findEvents(iface: UsbInterface): UsbEndpoint {
