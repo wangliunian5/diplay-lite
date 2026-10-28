@@ -49,11 +49,34 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
         /**
          * usbbt 建链入口（开关开启时由 CarPlayController 调用，工作线程）。
          * 成功返回跑在 iAP2 RFCOMM DLC 上的流；任何一步失败抛带状态文本的异常。
+         *
+         * vc192：若 [UsbBtStandby] 正在常驻广播（外置蓝牙选中后 App 一起来就拉活 dongle），
+         * 这里不再自己开 dongle（会二次 claim 冲突），而是直接取它交出来的那条流。
+         * 常驻广播是 legacy 0.3.1 的既有行为：dongle 一直以我们的广播名可发现，iPhone 主动回连。
          */
         fun open(
             context: Context,
             name: String,
             onDiagnostic: (String) -> Unit = {},
+        ): BlockingDuplexByteStream {
+            if (UsbBtStandby.isRunning) {
+                status("等待常驻广播交出 iPhone 链路…")
+                return UsbBtStandby.awaitStream(UsbBtStandby.HANDOFF_WAIT_MILLIS)
+                    ?: fail("常驻广播未在 ${UsbBtStandby.HANDOFF_WAIT_MILLIS / 1000}s 内交出 iPhone 链路（${UsbBtStandby.describe()}）")
+            }
+            return openDirect(context, name, onDiagnostic, LINK_TIMEOUT_MILLIS)
+        }
+
+        /**
+         * 真正「自己开 dongle 并等 iPhone」的建链实现（[open] 与 [UsbBtStandby] 共用）。
+         * [linkTimeoutMillis] 为初始化完成后等 iPhone 回连的总窗口：一次性连接用 [LINK_TIMEOUT_MILLIS]，
+         * 常驻广播用长窗口（尽量少反复重开 dongle）。
+         */
+        internal fun openDirect(
+            context: Context,
+            name: String,
+            onDiagnostic: (String) -> Unit = {},
+            linkTimeoutMillis: Long = LINK_TIMEOUT_MILLIS,
         ): BlockingDuplexByteStream {
             // vc186：诊断出口——usbbt 过程日志此前只走 system logcat，而日志上云只带 LiteLog，
             // 导致 vc183~vc185 三份 t3 日志里 usbbt 过程 0 条、根因无法二分。
@@ -127,8 +150,9 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
                 }
                 host.localAddress()?.let { lastBdAddr = it.toString() }
                 // 等 iPhone 回连 → Just-Works 配对 → 加密 → SDP/RFCOMM → DLC
-                status("等待 iPhone 连接（首次需在手机蓝牙设置中配对）…")
-                val deadline = System.currentTimeMillis() + LINK_TIMEOUT_MILLIS
+                // vc192：状态里带上广播名 —— 外测的下一步动作是「去 iPhone 蓝牙列表里选这个名字」。
+                status("广播中「${identity.name}」，等待 iPhone 配对（请在手机蓝牙设置中选择该名称）…")
+                val deadline = System.currentTimeMillis() + linkTimeoutMillis
                 while (true) {
                     when (host.phase) {
                         UsbBtHost.Phase.FAILED -> fail("建链失败：${host.statusText}")
@@ -165,6 +189,17 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
             val dongle = UsbBtSession.findDongle(usb)
                 ?: return "未检测到 USB 蓝牙 dongle（请确认已插入）"
             return "已检测到 dongle（${UsbBtSession.deviceLabel(dongle)}），待连接时探活"
+        }
+
+        /**
+         * vc191：设置页「外置 USB 蓝牙」实时状态块 —— 当前已插入 dongle 的 "vid:pid"
+         * （如 CM390 = "2b89:6275"）；未检测到 / USB 服务不可用返回 null。
+         * 与 [describe] 同走 [UsbBtSession.findDongle]，但只返回裸标识供 UI 自行排版。
+         */
+        fun dongleVidPid(context: Context): String? {
+            val usb = UsbBtSession.manager(context) ?: return null
+            val dongle = UsbBtSession.findDongle(usb) ?: return null
+            return "%04x:%04x".format(dongle.vendorId, dongle.productId)
         }
 
         /** vc186：诊断/状态输出口（open 时按调用方注入；默认仅 system logcat）。 */

@@ -218,10 +218,10 @@ internal class UsbBtDriver private constructor(
             // 否则 HCI 接口 bulk/interrupt 端点处于 disable 态 ⇒ bulkTransfer ENOENT=-1（t3 实测）。
             // 照搬 NcmUsbBridge 的 KK 兼容法：L+ 先 framework，退化走 native USBDEVFS_SETINTERFACE。
             if (kkNative) {
-                val setIfErrno = applySetInterface(connection, iface)
+                val setIfErrno = applySetInterface(connection, iface, onDiagnostic)
                 onDiagnostic(
                     "usbbt: setInterface(${iface.id},0) errno=$setIfErrno" +
-                        " (KK ep-table sync; native unavailable=-1)",
+                        " (KK ep-table sync; see std-request line above)",
                 )
             }
             // 批量端点按形态识别（无则置 null：个别 dongle ACL 面挂在别的接口）
@@ -350,8 +350,35 @@ internal class UsbBtDriver private constructor(
             return null
         }
 
-        /** vc190fix：KK 兼容 setInterface —— L+ 优先 framework，退化走 native USBDEVFS_SETINTERFACE。返回 errno（0=成功，native 不可用时 -1）。 */
-        private fun applySetInterface(connection: UsbDeviceConnection, iface: UsbInterface): Int {
+        /**
+         * vc190fix：KK usbfs 端点激活 —— claim 后须显式 SET_INTERFACE(alt=0) 让内核同步 ep 表，
+         * 否则 HCI 接口 bulk/interrupt 端点处于 disable 态 ⇒ bulkTransfer ENOENT=-1（t3 实测）。
+         * 照搬 NcmUsbBridge 的 KK 兼容法：L+ 先 framework，退化走 native USBDEVFS_SETINTERFACE。
+         *
+         * vc191fix：**B 兜底优先**——先发 SET_INTERFACE 标准设备请求（bmRequestType=0x01,
+         * bRequest=0x0B, wValue=alt=0, wIndex=接口号, wLength=0）强制内核重枚举接口端点。该请求走
+         * 纯 framework [UsbDeviceConnection.controlTransfer]，不依赖 [LegacyUsbHostNative] 的
+         * USBDEVFS_SETINTERFACE ioctl。t3(KK/API19) 实测该 native 调用 `unavailable=-1`、退化
+         * framework [connection.setInterface] 又未真正同步 ep 表 ⇒ bulk 恒 n=-1。B 方案直接发标准
+         * 请求，与 legacy v0.2.98 在 KK 上可连的路径对齐（legacy 即靠标准请求激活端点）。
+         *
+         * @return 0=成功（任一手段让内核 ep 表激活），-1=全部退化路径失败。
+         */
+        private fun applySetInterface(
+            connection: UsbDeviceConnection,
+            iface: UsbInterface,
+            onDiagnostic: (String) -> Unit,
+        ): Int {
+            // vc191 B 兜底：SET_INTERFACE 标准请求（纯 framework，绕过 native unavailable=-1 死穴）。
+            val stdRet = runCatching {
+                connection.controlTransfer(0x01, 0x0B, 0, iface.id, null, 0, 5000)
+            }.getOrDefault(-1)
+            onDiagnostic(
+                "usbbt: setInterface(alt=0) std-request ret=$stdRet" +
+                    " (vc191 B fallback; bmReq=0x01 bReq=0x0B wIndex=${iface.id})",
+            )
+            if (stdRet >= 0) return 0
+            // 退化路径（B 失败时）：L+ framework，再 native；KK 上若 B 失败且 native 也不可用则 -1。
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP &&
                 runCatching { connection.setInterface(iface) }.getOrDefault(false)
             ) {

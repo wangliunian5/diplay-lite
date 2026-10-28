@@ -7,6 +7,8 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.util.Base64
 import android.view.Gravity
@@ -28,6 +30,7 @@ import android.widget.Toast
 import java.io.File
 import com.shilapi.xcertplay.transport.PcapTap
 import com.shilapi.xcertplay.usbbt.UsbBtBootstrapStream
+import com.shilapi.xcertplay.usbbt.UsbBtStandby
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -138,6 +141,17 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var rbBtUsb: RadioButton
     private lateinit var btNameRow: LinearLayout
     private lateinit var inputBtName: EditText
+    // vc191：外置 USB 蓝牙实时状态块（VID/PID、本地 MAC、广播名、运行状态）+ 2s 轮询刷新。
+    // 外测此前「外置蓝牙不显示」只能盲测（vc190 日志零 dongle 痕迹），这里把探测结果常驻上屏。
+    private lateinit var btStatusBlock: LinearLayout
+    private lateinit var tvBtDongleStatus: TextView
+    private val btStatusHandler = Handler(Looper.getMainLooper())
+    private val btStatusTask = object : Runnable {
+        override fun run() {
+            refreshBtDongleStatus()
+            btStatusHandler.postDelayed(this, 2000)
+        }
+    }
     private lateinit var tvVersion: TextView
 
     // loadIntoForm 期间静默：setChecked 会触发监听，避免半加载状态写盘
@@ -148,6 +162,8 @@ class SettingsPage(private val activity: MainActivity) {
         runCatching { persistFromForm() }
         AudioChannelPreview.close()
         AudioChannelPreview.currentActivity = null
+        // vc191：离开设置页停掉 dongle 状态轮询（否则 Handler 一直持有页面常驻）。
+        btStatusHandler.removeCallbacks(btStatusTask)
     }
 
     /** 进入设置页：构建根视图（含悬浮球）并完成表单回显。由 MainActivity.render() 调用。 */
@@ -165,6 +181,9 @@ class SettingsPage(private val activity: MainActivity) {
         loadIntoForm()
         refreshAllDrawables()
         tvVersion.text = "版本 ${activity.readVersionName()}"
+        // vc191：进页先刷一次 dongle 状态，再起 2s 轮询（退页由 cleanup 停表）。
+        refreshBtDongleStatus()
+        btStatusHandler.post(btStatusTask)
         LiteLog.log("ui", "设置页打开")
         return root
     }
@@ -269,6 +288,20 @@ class SettingsPage(private val activity: MainActivity) {
         )
         // vc186：垂直间距对齐 buildValueRow 的 block(top=4, bottom=4)。
         column.addView(btNameRow, block(top = dip(4), bottom = dip(4)))
+        // vc191：外置 USB 蓝牙实时状态块 —— VID/PID、本地 MAC、广播名、运行状态。
+        // 外测此前反馈「外置蓝牙不显示」只能盲测（vc190 日志零 dongle 痕迹），
+        // 这里把 dongle 探测/建链状态常驻上屏，一眼可判 dongle 是否真起来。
+        // 仅选中「外置蓝牙」时显示（与自定义名称行同步，见 updateBtNameRowVisibility）。
+        btStatusBlock = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
+        btStatusBlock.addView(subSectionLabel("外置 USB 蓝牙状态"), block(top = dip(8), bottom = dip(2)))
+        tvBtDongleStatus = TextView(activity).apply {
+            setTextColor(Ui.SUB)
+            textSize = 12f
+            setLineSpacing(dip(2).toFloat(), 1f)
+            text = "读取中…"
+        }
+        btStatusBlock.addView(tvBtDongleStatus, block(top = dip(2)))
+        column.addView(btStatusBlock, block(top = dip(4)))
 
         // ── 画面设置：分辨率自定义百分比 / 分辨率设定 / 横竖屏切换 ──
         column.addView(sectionLabel("画面设置"), block(top = dip(16), bottom = dip(4)))
@@ -1133,9 +1166,52 @@ class SettingsPage(private val activity: MainActivity) {
         return w != saved.manualWidth || h != saved.manualHeight
     }
 
-    /** vc184：仅选中外置蓝牙时显示自定义名称行。 */
+    /** vc184：仅选中外置蓝牙时显示自定义名称行；vc191：同步显示 dongle 实时状态块。 */
     private fun updateBtNameRowVisibility() {
-        btNameRow.visibility = if (rbBtUsb.isChecked) View.VISIBLE else View.GONE
+        val showExternal = rbBtUsb.isChecked
+        btNameRow.visibility = if (showExternal) View.VISIBLE else View.GONE
+        // 单选监听在 buildContent 早期注册，此处可能早于状态块构建 ⇒ 用初始化守卫。
+        if (::btStatusBlock.isInitialized) {
+            btStatusBlock.visibility = if (showExternal) View.VISIBLE else View.GONE
+        }
+    }
+
+    /**
+     * vc191：刷新外置 USB 蓝牙实时状态块。数据来源：
+     * - VID/PID → [UsbBtBootstrapStream.dongleVidPid]（实时枚举，未插入即时反映「未检测到」）；
+     * - 本地 MAC → [UsbBtBootstrapStream.lastBdAddr]（建链初始化 ReadBdAddr 后才有值）；
+     * - 广播名 → 当前 usbBtDongleName（未自定义即默认 DiPlay CarPlay）；
+     * - 状态 → [UsbBtBootstrapStream.describe]（建链逐级状态 / 未连接时的探测结果）。
+     */
+    private fun refreshBtDongleStatus() {
+        if (!::tvBtDongleStatus.isInitialized) return
+        val cfg = LiteConfig.load(activity)
+        val vidPid = runCatching { UsbBtBootstrapStream.dongleVidPid(activity) }.getOrNull()
+        val mac = UsbBtBootstrapStream.lastBdAddr
+        val rawName = cfg.usbBtDongleName
+        val name = if (rawName.isNullOrBlank()) "DiPlay CarPlay" else rawName
+        val state = if (UsbBtStandby.isRunning) {
+            // vc192：常驻广播在跑 ⇒ 优先显示建链逐级状态（初始化 → 广播中 → 等配对），
+            // 尚未跑到时退回保活线程自己的状态，绝不显示「待连接时探活」这种误导文案。
+            UsbBtBootstrapStream.lastStatusText.takeIf { it.isNotBlank() }
+                ?: UsbBtStandby.describe()
+        } else {
+            runCatching { UsbBtBootstrapStream.describe(activity) }.getOrDefault("-")
+        }
+        tvBtDongleStatus.text = buildString {
+            if (vidPid == null) {
+                append("已识别：未检测到 dongle（请确认已插入）")
+            } else {
+                append("已识别：VID:0x").append(vidPid.substringBefore(":"))
+                append(" PID:0x").append(vidPid.substringAfter(":"))
+            }
+            append('\n')
+            append("本地 MAC：").append(mac ?: "-")
+            append('\n')
+            append("广播名：").append(name)
+            append('\n')
+            append("状态：").append(state)
+        }
     }
 
     /** vc184：外置蓝牙自定义名称提交 —— 落盘后重启软件生效（HCI 名写入在 dongle 初始化阶段）。 */

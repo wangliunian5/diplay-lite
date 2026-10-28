@@ -307,6 +307,15 @@ internal class UsbBtHost(
             driver.hciCommand(HciCommands.WRITE_SCAN_ENABLE, byteArrayOf(0), 500)
         } catch (_: Throwable) {
         }
+        // vc192：收尾必须补一次 HCI Reset。Realtek 系 dongle（CM390/RTL8761BUV）灌完固件后
+        // 控制器会回到「已 patch、未改名」态（本地名回落到出厂值，如 CM390）。此前 stop() 只发
+        // Disconnect + ScanEnable(0)，一旦发不出去（bulk 已死/中途失败）dongle 就停在那态继续对外
+        // 可发现 —— 这正是外测「iPhone 蓝牙里看到的是 CM390 而不是我们的广播名」的来源。
+        // legacy 0.3.1 日志里 handoff shutdown 的最后一步也是 `stage=HCI reset`，此处对齐。
+        try {
+            driver.hciCommand(HciCommands.RESET, ByteArray(0), 500)
+        } catch (_: Throwable) {
+        }
         iap2Link.reset()
         driver.close()
         commandThread?.let {

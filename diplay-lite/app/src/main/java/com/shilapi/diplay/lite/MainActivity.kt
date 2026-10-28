@@ -34,6 +34,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.shilapi.xcertplay.media.CarPlayTouchMapper
+import com.shilapi.xcertplay.usbbt.UsbBtStandby
 import com.shilapi.xcertplay.network.WiredVpnService
 import kotlin.math.abs
 
@@ -363,6 +364,7 @@ class MainActivity : Activity() {
         // 1.0.29：设置页可能改过分辨率设定 —— 回主页刷新拉伸模式标志。
         videoStretchMode = LiteConfig.load(this).resolutionMode == "stretch"
         handler.post(refreshTask)
+        syncUsbBtStandby()
         maybeAutoConnect()
         // 1.1.4 系统诊断：新装无检测记录时，主界面就绪后延迟 5 秒触发首启快检（可跳过）。
         Diagnostics.quickCheckIfDue(this)
@@ -436,6 +438,8 @@ class MainActivity : Activity() {
         usbDetachReceiver?.let { runCatching { unregisterReceiver(it) } }
         usbDetachReceiver = null
         LiteVideoBridge.setVideoSizeListener(null)
+        // vc192：退出页面释放 dongle（不留在后台常驻广播；下次进前台 onResume 会重新拉起）。
+        UsbBtStandby.stop()
         detachCurrentPage()
         // vc108：退出时还原车机栏（写回 false），否则车机桌面栏被永久藏住
         setVendorFullScreen(false)
@@ -1598,6 +1602,58 @@ class MainActivity : Activity() {
     private fun disconnect() {
         stopService(Intent(this, LiteSessionService::class.java))
         LiteLog.log("ui", "用户断开")
+    }
+
+    // ---------- vc192：外置 USB 蓝牙常驻广播 ----------
+
+    /**
+     * vc192：选中「外置蓝牙」时把 dongle 拉成常驻广播态（幂等，回前台同步一次）。
+     *
+     * 对齐 legacy 0.3.1 实测流程（2026-10-27 日志）：App 一起来就
+     * `USB Bluetooth enabled: advertising=…`，随后由 iPhone 主动回连；
+     * 我们旧实现只在「点了连接」时才初始化 dongle，因此不点连接时 iPhone 蓝牙列表里
+     * 看到的还是 dongle 出厂名（CM390），而不是设置页里配的广播名。
+     */
+    private fun syncUsbBtStandby() {
+        val config = LiteConfig.load(this)
+        if (!config.usbBtDongle) {
+            UsbBtStandby.stop()
+            return
+        }
+        UsbBtStandby.start(
+            this,
+            config.usbBtDongleName,
+            onDiagnostic = { msg -> LiteLog.log("usbbt", msg) },
+            onLinkReady = { onUsbBtLinkReady() },
+        )
+    }
+
+    /**
+     * 常驻广播已拿到 iPhone 链路、但当前空闲 ⇒ 自动发起一次无线连接，
+     * 免去「先点连接、再等手机回连」的对时序要求（legacy 也是回连即建链）。
+     */
+    private fun onUsbBtLinkReady() {
+        handler.post {
+            if (LiteState.phase != LiteState.Phase.IDLE) return@post
+            if (LiteSessionService.current != null) return@post
+            val config = LiteConfig.load(this)
+            val channel = when (config.activeChannel) {
+                "car", "relay", "p2p" -> config.activeChannel
+                else -> "car"
+            }
+            // 热点凭据没配就只记日志，不弹 toast 骚扰（外测此时应先配好车机热点）。
+            val ready = when (channel) {
+                "car" -> config.ssid.isNotBlank()
+                "relay" -> config.relaySsid.isNotBlank()
+                else -> true
+            }
+            if (!ready) {
+                LiteLog.log("ui", "外置蓝牙：iPhone 已回连，但通道 $channel 凭据未配置，先不自动连接")
+                return@post
+            }
+            LiteLog.log("ui", "外置蓝牙：iPhone 已回连，自动发起无线连接（通道 $channel）")
+            connect(channel, auto = true)
+        }
     }
 
     // ---------- 自动连接 ----------
