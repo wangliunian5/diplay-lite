@@ -1,5 +1,6 @@
 package com.shilapi.diplay.lite
 
+import com.shilapi.xcertplay.root.SuShell
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -121,27 +122,12 @@ internal object WiredUsbForensics {
         LiteLog.log(TAG, "probe stopped")
     }
 
-    private fun suExec(command: String): String = try {
-        val process = ProcessBuilder("su", "-c", command).redirectErrorStream(true).start()
-        val out = StringBuilder()
-        val pump = Thread({
-            runCatching { process.inputStream.bufferedReader().forEachLine { out.appendLine(it) } }
-        }, "usbfx-su-pump").apply { isDaemon = true; start() }
-        var exited = false
-        var waited = 0
-        while (!exited && waited < SU_TIMEOUT_MILLIS) {
-            Thread.sleep(100)
-            waited += 100
-            try {
-                process.exitValue()
-                exited = true
-            } catch (_: IllegalThreadStateException) {
-            }
-        }
-        if (!exited) process.destroy()
-        pump.join(500)
-        out.toString()
-    } catch (_: Exception) {
-        ""
-    }
+    /**
+     * vc199：转调 [SuShell]（全项目唯一 su 实现）。
+     * 本文件原先是「pump 线程 + exitValue 轮询」的成熟写法，也是本次日志里
+     * 成功抓到 450 行 root dmesg 的那条通道；保留语义（stderr 并入 stdout）不变，
+     * 只是不再单独维护一份。
+     */
+    private fun suExec(command: String): String =
+        SuShell.su(command, SU_TIMEOUT_MILLIS, mergeError = true).stdout
 }

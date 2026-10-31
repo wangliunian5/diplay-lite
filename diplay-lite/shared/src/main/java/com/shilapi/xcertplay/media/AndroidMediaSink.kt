@@ -100,6 +100,18 @@ class AndroidMediaSink(
      */
     private val microphoneMuteRestore: (() -> String)? = null,
     /**
+     * vc197：root 直采语音源（兜底）。FE6 上 AudioRecord 这条路已被 13 档矩阵穷尽——
+     * 能读的全零、源 6 全阻塞，而车机自带语音助手正常收音 ⇒ 静音是 AudioFlinger 给
+     * 第三方 record track 加的填充。直读 ALSA 采集节点可绕开该层，代价是必须 root。
+     * 由持 Context 的上层注入（需解压随包二进制 + su 提权）；未注入时零行为变化。
+     */
+    private val rootMicSource: RootMicSource? = null,
+    /**
+     * vc197：实验性 FE6 语音兜底总开关（默认关）。开启后上行改为「采集/发送解耦 +
+     * 静音保活 + root 直采」，关闭时发送路径与历史版本完全一致。
+     */
+    private val keepAliveUplink: Boolean = false,
+    /**
      * 1.1.4（ECARX 媒体中心冒充桥）：CarPlay 媒体流（audioType=media）首包到达时
      * 触发，上层据此通知 EcarxMediaCenterBridge 显式抢占 ONLINE 音源。电话/导航/
      * Siri 流不触发。
@@ -286,7 +298,13 @@ class AndroidMediaSink(
         // API16 适配：ConcurrentHashMap.computeIfAbsent 是 API 24+，改两段式 get + putIfAbsent。
         var uplink = microphoneUplinks[type]
         if (uplink == null) {
-            val created = MicrophoneUplink(config, onAudioDiagnostic, microphoneMuteRestore)
+            val created = MicrophoneUplink(
+                config,
+                onAudioDiagnostic,
+                microphoneMuteRestore,
+                rootMicSource,
+                keepAliveUplink,
+            )
             val raced = microphoneUplinks.putIfAbsent(type, created)
             uplink = raced ?: created
         }
@@ -1189,7 +1207,16 @@ private class AudioRenderer(
     /** M6d：调本轨的播放音量（1.0 = 原音量）。导航播报时把音乐压到 duck 值。 */
     fun setPlaybackVolume(factor: Float) {
         val current = track ?: return
-        runCatching { current.setVolume(factor.coerceIn(0f, 1f)) }
+        val volume = factor.coerceIn(0f, 1f)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            runCatching { current.setVolume(volume) }
+        } else {
+            // API16~20：`AudioTrack#setVolume` 是 **API 21+**，直接调会抛 NoSuchMethodError；
+            // 被 runCatching 吞掉后表现为「duck 静默失效」（导航播报压不住音乐）。
+            // 低版本改用 API 1 就有的 setStereoVolume，左右同值，效果等价。
+            @Suppress("DEPRECATION")
+            runCatching { current.setStereoVolume(volume, volume) }
+        }
     }
     private val thread = Thread({
         // 音频解码 + 写轨：抬到 AUDIO —— 低于收包（URGENT_AUDIO），但高于视频/系统默认，

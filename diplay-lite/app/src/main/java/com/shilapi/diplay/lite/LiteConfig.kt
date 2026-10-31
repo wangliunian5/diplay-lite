@@ -28,6 +28,11 @@ data class LiteConfig(
     val appliedVideoKey: String = "",
     // M6e：强制用软件解码视频（默认关）。给"厂商硬解异常"的机型兜底，也用于二分定位。
     val softwareVideoDecoder: Boolean = false,
+    // vc197：**实验性** FE6 语音兜底（默认关，仅 FE6 机型可见且生效）。
+    // AudioRecord 在 FE6（AK7738）上被 AudioFlinger 灌静音——车机自带语音助手正常收音，
+    // 说明音频在，只是不给第三方 record track。打开后：上行采集/发送解耦（静音保活，防 iPhone
+    // 2s 拆流）+ 有 root 时直读 ALSA 采集节点绕开该层。非 FE6 机型忽略此开关。
+    val rootMicFallback: Boolean = false,
     // M6k-UI：横竖屏模式。land=强制横屏 / portrait=强制竖屏 / auto=跟随传感器。
     val orientationMode: String = "auto",
     // M6k-UI：音视频路径。full=全 CarPlay（音频+视频）/ bt_audio=蓝牙出音频、CarPlay 只出视频。
@@ -194,6 +199,7 @@ data class LiteConfig(
                     .coerceIn(MIN_DUCK_PERCENT, MAX_DUCK_PERCENT),
                 appliedVideoKey = prefs.getString("applied_video_key", "").orEmpty(),
                 softwareVideoDecoder = prefs.getBoolean("software_video_decoder", false),
+                rootMicFallback = prefs.getBoolean("root_mic_fallback", false),
                 orientationMode = prefs.getString("orientation_mode", "auto") ?: "auto",
                 avPathMode = prefs.getString("av_path_mode", "full") ?: "full",
                 btAudioInfoVariant = prefs.getString("bt_audio_info_variant", "no_audio") ?: "no_audio",
@@ -249,6 +255,7 @@ data class LiteConfig(
                 .putBoolean("speaker_for_calls", config.speakerForCalls)
                 .putInt("nav_duck_percent", config.navDuckPercent)
                 .putBoolean("software_video_decoder", config.softwareVideoDecoder)
+                .putBoolean("root_mic_fallback", config.rootMicFallback)
                 .putString("orientation_mode", config.orientationMode)
                 .putString("av_path_mode", config.avPathMode)
                 .putString("bt_audio_info_variant", config.btAudioInfoVariant)

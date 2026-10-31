@@ -3047,7 +3047,12 @@ class CarPlayController(
             // getAlternateSetting 是 API 24+（at8317 实测 API17 崩），诊断行低版本打 0。
             // 1.0.19：补 control/data 接口类——真 NCM 应为 control=2(CDC) data=10(CDC-Data)，
             // 用于识别 ROM 拓扑误配。1.1.4：补 avoid 组与候选选择线索。
-            "ncm attempt#$attempt config=${configuration?.id} kernelAligned=${function.kernelAligned} " +
+            // API16：`configuration` 来自 IphoneCarPlayConfiguration.find()，该函数在 SDK<21
+            // 已提前返回 null，`?.id` 本身不会执行；这里把版本条件显式写出来，既让 lint 可证，
+            // 也避免将来 configuration 从别处来非 null 值时在旧机崩。
+            "ncm attempt#$attempt config=${
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) configuration?.id else null
+            } kernelAligned=${function.kernelAligned} " +
                 "control=${function.control.id}/${if (Build.VERSION.SDK_INT >= 24) function.control.alternateSetting else 0}" +
                 " class=${function.control.interfaceClass}" +
                 " data=${function.data.id}/${if (Build.VERSION.SDK_INT >= 24) function.data.alternateSetting else 0}" +

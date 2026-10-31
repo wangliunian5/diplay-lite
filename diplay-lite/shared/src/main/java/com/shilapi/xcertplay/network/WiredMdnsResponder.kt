@@ -228,7 +228,11 @@ class WiredMdnsResponder(
         check(running.compareAndSet(false, true)) { "wired mdns responder already started" }
         return try {
             val netIf = findInterface() ?: throw IllegalStateException("no iface for $bindAddress")
-            scopeId = netIf.index
+            // API16：`NetworkInterface#getIndex()` 是 **API 19+**，低版本抛 `NoSuchMethodError`。
+            // 🔴 该异常是 **Error**，下面的 `catch (error: Exception)` 兜不住，会直接把调用线程
+            // 打崩（有线 AirPlay 在 API16~18 上整体不可用）。API<19 没有接口索引，
+            // scopeId 保持 0 ⇒ 后续 `scopeId > 0` 的判断自然走「无 scope」路径。
+            scopeId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) netIf.index else 0
             // vc111（KK 实测）：MulticastSocket(port) 双栈默认 bind 在 KK sunxi 内核报
             // BindException EINVAL；改为未绑定构造 + 显式按 fallback 链 bind：
             // IPv6 通配 :: → IPv4/双栈通配 → tun 地址本身。

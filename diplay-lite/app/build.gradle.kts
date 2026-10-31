@@ -21,9 +21,9 @@ android {
         // 覆盖；出包时改错一处即打错版本，已移除。
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
-        versionCode = 192
-        val versionPatch = 27
-        versionName = "1.2.$versionPatch.dongle"
+        versionCode = 199
+        val versionPatch = 31
+        versionName = "1.2.$versionPatch.fe6su"
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties
@@ -37,6 +37,9 @@ android {
         buildConfigField("String", "GITEE_LOG_TOKEN", "\"${localProps.getProperty("GITEE_LOG_TOKEN") ?: ""}\"")
         // vc77 定案：有线 NCM 守护恒关（vc76 guard-off 裁决通过，无 root 正式支持）。
         buildConfigField("boolean", "WIRED_NCM_GUARD_ENABLED", "false")
+        // vc193：FE6 root 语音通路取证开关。**只在本诊断包为 true**；正式 dongle 包
+        // 必须置 false（层 B/C 全部入口由它包住，避免给普通用户暴露 root 写操作）。
+        buildConfigField("boolean", "FE6_ROOT_PROBE", "true")
     }
 
     buildFeatures {
@@ -74,10 +77,13 @@ android {
 
     buildTypes {
         release {
-            // 正式包：混淆 + 资源压缩开启（1.0.28-中继test 实验包曾临时关闭；
-            // [BT-PROBE] 临时关闭已随 1.0.29 正式包恢复）。
-            isMinifyEnabled = true
-            isShrinkResources = true
+            // vc198：按用户长期决策**关闭混淆与资源压缩**（此前多次强调「不做混淆、不做加密加固」）。
+            // 关掉之后 dex 里能直接查到 Fe6Device / MicrophoneUplink 等原类名，排障与验收都不必
+            // 再靠字符串字面量绕；代价是包体积变大（R8 之前砍掉的那部分会回来）。
+            // ⚠️ proguard-rules.pro 仍然保留且 proguardFiles 不删：将来若重新开启，native keep 规则
+            // （xcertplay / LegacyUsbHostNative / BouncyCastle / JmDNS）必须在位，否则 NoSuchMethodError。
+            isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -95,6 +101,11 @@ android {
         // M1（A4）：app lint 全量扫描 shared 依赖源码，NewApi 兜底。
         // 此前未开启时 shared 里的 API 21+ 调用（如 AudioAttributes）完全不在扫描范围。
         checkDependencies = true
+        // vc200：API16 兼容门禁。minSdk=16 下任何「高版本才有的平台 API」都升为 error 级别
+        // （只提高报告严重度，不阻断构建——abortOnError 仍为 false）。
+        // 出包前核 `app/build/reports/lint-results-release.xml` 里 NewApi 计数应为 0。
+        // 依据：工程文档/审查-20261031-API16兼容性全量审查.md
+        error += "NewApi"
     }
 }
 
@@ -180,8 +191,38 @@ tasks.register("injectUsbbtFirmware") {
     }
 }
 
+// vc193：root PCM 直采二进制（diplay-pcmcap，源码与产物同在 auth/tinycap，被 .gitignore
+// 排除，永不入公开仓）。用途：绕开 AudioFlinger/AudioPolicy 由 root 直接开
+// /dev/snd/pcmC?D?c，回答「车机物理麦克风到底能不能采到非零 PCM」——App 侧 AudioRecord
+// 被 HAL/策略卡住时，这是唯一能分开「设备没音」与「框架不给音」的实验。
+// 缺失时告警并产出不带该产物的 APK（纯源码构建语义）；层 C 的 R1 档届时落 SKIP。
+val pcmCapDir = System.getenv("DIPLAY_PCMCAP_DIR")?.takeIf { it.isNotBlank() }
+    ?: rootProject.file("../auth/tinycap/bin").absolutePath
+val pcmCapTarget = file("src/main/assets/tinycap")
+
+tasks.register("injectTinycap") {
+    group = "build"
+    description = "Copy external diplay-pcmcap binaries (root PCM capture) into app assets (never committed)"
+    val srcDir = File(pcmCapDir)
+    val dstDir = pcmCapTarget
+    doLast {
+        if (!srcDir.isDirectory) {
+            logger.warn(
+                "未找到 PCM 直采二进制目录 $srcDir —— 产出不带 R1 root 直采档的诊断包（layer C R1=SKIP）。" +
+                    "需要该能力请先执行 auth/tinycap/build.sh，或设置 DIPLAY_PCMCAP_DIR。"
+            )
+            return@doLast
+        }
+        dstDir.mkdirs()
+        srcDir.listFiles()?.filter { it.isFile }?.forEach { f ->
+            f.copyTo(File(dstDir, f.name), overwrite = true)
+        }
+        logger.lifecycle("已注入 PCM 直采二进制（来源：$srcDir → $dstDir）")
+    }
+}
+
 tasks.named("preBuild").configure {
-    dependsOn("injectRuntimeIdentity", "injectUsbbtFirmware")
+    dependsOn("injectRuntimeIdentity", "injectUsbbtFirmware", "injectTinycap")
 }
 
 // vc154（⑦ CI 化构建 task）：一键「签名 release 构建 + APK 归档」。

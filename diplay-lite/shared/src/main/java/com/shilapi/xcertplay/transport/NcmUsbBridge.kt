@@ -1,5 +1,6 @@
 package com.shilapi.xcertplay.transport
 
+import android.annotation.TargetApi
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
@@ -411,6 +412,9 @@ class NcmUsbBridge internal constructor(
         return transferred
     }
 
+    /** API 26+：`UsbRequest#queue(ByteBuffer)` / `requestWait(timeout)` 都是 API 26 才有。
+     *  调用点由 [asyncRead]（`SDK_INT >= O`）保证。 */
+    @TargetApi(26)
     private fun readChunkAsync(timeoutMillis: Long): Int? {
         var queueFailed = false
         val request = try {

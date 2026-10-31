@@ -1,5 +1,6 @@
 package com.shilapi.xcertplay.transport
 
+import android.annotation.TargetApi
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -723,6 +724,9 @@ class Iap2UsbSession internal constructor(
         return buffer.copyOf(transferred)
     }
 
+    /** API 26+：`UsbRequest#queue(ByteBuffer)` / `requestWait(timeout)` 都是 API 26 才有。
+     *  唯一调用点已由 `SDK_INT >= O && !asyncReadBroken` 保护；注解把契约写明。 */
+    @TargetApi(26)
     private fun readAsync(timeoutMillis: Long): ByteArray? {
         val request = UsbRequest()
         var initialized = false
@@ -793,6 +797,8 @@ class Iap2UsbSession internal constructor(
         if (closed) throw IphoneUsbException.DeviceUnavailable("USBMUX session is closed")
     }
 
+    /** API 26+：`UsbRequest#cancel()` + `requestWait(timeout)` 均为 API 26 才有。 */
+    @TargetApi(26)
     private fun drainCancelledRead(request: UsbRequest) {
         if (!request.cancel()) {
             throw failSession("Android could not cancel timed out USBMUX read request")

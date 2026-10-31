@@ -44,7 +44,11 @@ object BondedDevicesResolver {
 
         if (adapterEntries.isEmpty()) {
             val rootEntries = resolveViaRootConfig(log)
-            rootEntries.forEach { merged.putIfAbsent(it.address, it) }
+            // API16：`Map.putIfAbsent` 是 Java 8 默认方法，Android 只有 **API 24+** 才有——
+            // API16~23 上抛 `NoSuchMethodError`（Error，`catch (Exception)` 兜不住）。
+            // 走这条分支的前提正是「适配器一个配对设备都没有」，即老车机 / 新装首次运行，
+            // 命中概率不低。用等价的 containsKey 判断代替。
+            rootEntries.forEach { if (!merged.containsKey(it.address)) merged[it.address] = it }
             log("bonded resolve: root-config=${rootEntries.size} devices (merged=${merged.size})")
         }
         return merged.values.toList()

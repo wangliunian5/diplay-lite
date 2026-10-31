@@ -16,7 +16,10 @@ import android.view.Display
  *   - 普通逻辑副屏 → overlay/独立窗口形态候选（需确认可见性与权限，实车验证）
  * 附加 dumpsys display 尽力取证（无 DUMP 权限的 ROM 失败属预期，失败只记一行）。
  *
- * API 护栏：getDisplays/getName/getRealSize/state/isValid 均 API 17+，低于 17 记日志跳过。
+ * API 护栏：getDisplays/getName/getRealSize 均 API 17+，低于 17 记日志跳过。
+ * ⚠️ `Display#getState()` 是 **API 20+**（不是 17）——API17~19 上直调会抛 NoSuchMethodError，
+ * 这里靠 runCatching（捕 Throwable）吞成 -1，属**既定降级**：低版本副屏只报 id/name/尺寸，
+ * 不报 state。别把它当「读不到状态」的业务结论。
  */
 internal object ClusterDisplayProbe {
 
@@ -44,7 +47,13 @@ internal object ClusterDisplayProbe {
                 for (d in displays) {
                     val size = Point().also { runCatching { d.getRealSize(it) } }
                     val name = runCatching { d.name?.toString() }.getOrNull()
-                    val state = runCatching { d.state }.getOrDefault(-1)
+                    // getState 是 **API 20+**；API17~19 直接记 -1，不走异常路径
+                    // （否则 NoSuchMethodError 被 runCatching 吞掉，会和「真读不到状态」混淆）。
+                    val state = if (Build.VERSION.SDK_INT >= 20) {
+                        runCatching { d.state }.getOrDefault(-1)
+                    } else {
+                        -1
+                    }
                     val presentation = d.flags and Display.FLAG_PRESENTATION != 0
                     val primary = d.displayId == Display.DEFAULT_DISPLAY
                     LiteLog.log(

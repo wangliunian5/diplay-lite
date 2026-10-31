@@ -1,5 +1,6 @@
 package com.shilapi.diplay.lite
 
+import android.annotation.TargetApi
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
@@ -244,6 +245,9 @@ internal object LiteSteeringKeys {
 
     // ---------- MediaSession / 音频焦点（API21+） ----------
 
+    /** `MediaSession` / `MediaSession.Callback` 是 API 21+；函数首行已判 `SDK_INT < 21` 直接返回，
+     *  注解声明该契约（API16 上这些类根本不会被解析）。 */
+    @TargetApi(21)
     private fun startMediaSessionLocked() {
         if (Build.VERSION.SDK_INT < 21 || session != null) return
         val context = appContext ?: return
@@ -299,6 +303,9 @@ internal object LiteSteeringKeys {
         LiteLog.log(TAG, "媒体键会话已建立 focusGranted=$focusHeld")
     }
 
+    /** 只操作 `session` 字段（`MediaSession?`）。API16 上该字段恒 null（startMediaSessionLocked
+     *  已提前 return），`session?.` 不会解析到 21+ 的类方法；注解声明该前提。 */
+    @TargetApi(21)
     private fun releaseMediaSessionLocked() {
         try {
             session?.isActive = false

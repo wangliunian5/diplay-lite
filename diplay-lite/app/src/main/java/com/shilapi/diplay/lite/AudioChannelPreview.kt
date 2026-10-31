@@ -1,5 +1,6 @@
 package com.shilapi.diplay.lite
 
+import android.annotation.TargetApi
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
@@ -249,7 +250,11 @@ object AudioChannelPreview {
         }
     }
 
-    /** API 23+：usage 路由建轨（媒体/导航各用各的 usage），与 AndroidMediaSink 同路径。 */
+    /** API 23+：usage 路由建轨（媒体/导航各用各的 usage），与 AndroidMediaSink 同路径。
+     *  `AudioTrack.Builder` / `AudioFormat.Builder` / `AudioAttributes.Builder` 全是 API 21~23，
+     *  唯一调用点已由 `Build.VERSION.SDK_INT >= M` 分支保护；注解把这个契约写下来，
+     *  免得将来别处误调（lint NewApi 也能因此不再误报）。 */
+    @TargetApi(23)
     private fun buildUsageTrack(
         media: Boolean,
         sampleRate: Int,

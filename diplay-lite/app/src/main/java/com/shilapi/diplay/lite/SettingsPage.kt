@@ -125,6 +125,11 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var cbBootWifi: CheckBox
     private lateinit var cbAutoConnect: CheckBox
     private lateinit var cbSoftDecode: CheckBox
+    // vc197：实验性 FE6 语音兜底。**只在 FE6 车型上创建**，其他机型为 null（不显示、不生效）。
+    private var cbFe6Voice: CheckBox? = null
+    // vc198：root 授权与自检的状态显示（只在 FE6 创建）。
+    private var tvRootAuthStatus: TextView? = null
+    private var rootSelfTestRunning = false
     // vc157：帧率四档单选（25/30/40/60），替代原「限制 30 帧」复选框。
     private lateinit var rgFps: WrapRadioGroup
     private lateinit var rbFps25: RadioButton
@@ -145,6 +150,10 @@ class SettingsPage(private val activity: MainActivity) {
     // 外测此前「外置蓝牙不显示」只能盲测（vc190 日志零 dongle 痕迹），这里把探测结果常驻上屏。
     private lateinit var btStatusBlock: LinearLayout
     private lateinit var tvBtDongleStatus: TextView
+    // vc193（FE6 语音通路体检）：状态显示 + 写操作授权勾选。仅 BuildConfig.FE6_ROOT_PROBE
+    // 为 true 的诊断包才创建（正式包这两个字段永不初始化，相关代码全部有 isInitialized 守卫）。
+    private lateinit var tvVoiceProbeStatus: TextView
+    private lateinit var cbVoiceProbeWrite: CheckBox
     private val btStatusHandler = Handler(Looper.getMainLooper())
     private val btStatusTask = object : Runnable {
         override fun run() {
@@ -562,6 +571,14 @@ class SettingsPage(private val activity: MainActivity) {
         cbBootWifi = checkbox("开机自启WIFI")
         cbAutoConnect = checkbox("启动后自动连接")
         cbSoftDecode = checkbox("强制软解")
+        // vc197：实验性开关，只在 FE6 出现。功能=上行采集/发送解耦（静音保活，防 iPhone 因
+        // 收不到音频包而 2 秒拆流）+ 有 root 时直读 ALSA 采集节点绕开 AudioFlinger 的静音填充。
+        // 对普通车机只有风险没有收益，所以既不显示也不生效。
+        cbFe6Voice = if (Fe6Device.isFe6()) {
+            checkbox("实验性：FE6 语音兜底（需 root，改后需重新连接）")
+        } else {
+            null
+        }
         cbSpeaker = checkbox("通话声音走媒体音量")
         // 1.1.2（EU5 双向无声）：Siri/助手语音走媒体通道——ASSISTANT/NAVIGATION usage 在
         // PATEO 等老 HAL 上静音，勾选后改走媒体音量（媒体通道已实测出声）。
@@ -587,6 +604,104 @@ class SettingsPage(private val activity: MainActivity) {
         column.addView(entryRow("系统诊断（蓝牙/WiFi/热点/USB）") {
             Diagnostics.run(activity) { showGiteeUploadDialog() }
         }, block(top = dip(8), bottom = dip(8)))
+
+        // ── vc197：FE6 车型测试（实验功能 + 语音通路体检）────────────────────
+        // 统一挂在「FE6 车型测试」小标题下，**只在 FE6 机型出现**，子项三块：
+        //  ① 实验性语音兜底开关：上行采集/发送解耦（静音保活，防 iPhone 2s 拆流）+
+        //     有 root 时直读 ALSA 采集节点绕开 AudioFlinger 的静音填充
+        //  ② 一键体检：root 语音流路径取证（B1-B5）+ AudioRecord 矩阵（L0-L12，含 24000Hz
+        //     与 stereo 档）+ root 直采（R1a/R1b/R1c）+ R2/R3，约 4~6 分钟
+        //  ③ 只做拓扑侦察：仅 B1-B5，约 8s，先确认 root 与「谁占着麦克风」
+        // R2（停占用进程）/ R3（解 mic 静音）是写操作，需下面的授权勾选，默认不勾；
+        // R3 测完自动回滚，改动前后值全量写报告。结果只进日志与外部私有目录，不上传。
+        if (Fe6Device.isFe6()) {
+            column.addView(sectionLabel("FE6 车型测试"), block(top = dip(14), bottom = dip(4)))
+            column.addView(
+                TextView(activity).apply {
+                    text = "这台车机的语音上行被 AudioFlinger 灌静音（车机自带语音助手正常收音），" +
+                        "下面是针对性实验项。\n" +
+                        "①【授权并自检 root】先点这个：会请求 root 权限并当场试采 1 秒，" +
+                        "直接告诉你能不能拿到真音。**必须在连 CarPlay 之前点**——投屏全屏时" +
+                        "授权框可能弹不出来；\n" +
+                        "②【语音兜底】改发送架构 + root 直采，勾选后需重新连接才生效；\n" +
+                        "③【一键体检】先断开 CarPlay 再点，4~6 分钟，过程中【请对着车机连续说话】；\n" +
+                        "④ 结果都写入运行日志。"
+                    setTextColor(Ui.SUB)
+                    textSize = 11f
+                    setLineSpacing(dip(2).toFloat(), 1f)
+                },
+                block(bottom = dip(6)),
+            )
+            // ① vc198：root 授权与自检（子项之首，且必须在建链之前）
+            column.addView(
+                Button(activity).apply {
+                    text = "① 授权并自检 root"
+                    textSize = 12f
+                    minHeight = dip(34)
+                    setAllCaps(false)
+                    background = Ui.pillSolid(activity, Ui.PRIMARY)
+                    setTextColor(Ui.PRIMARY_ON)
+                    setPadding(dip(14), dip(5), dip(14), dip(5))
+                    setOnClickListener { startRootSelfTest() }
+                },
+                block(top = dip(2), bottom = dip(4)),
+            )
+            tvRootAuthStatus = TextView(activity).apply {
+                setTextColor(Ui.SUB)
+                textSize = 12f
+                setLineSpacing(dip(2).toFloat(), 1f)
+                text = "root：尚未自检"
+            }
+            tvRootAuthStatus?.let { column.addView(it, block(bottom = dip(8))) }
+            // ② 实验性兜底开关
+            cbFe6Voice?.let { box ->
+                column.addView(box, block(top = dip(2), bottom = dip(8)))
+            }
+            // ② / ③ 体检与拓扑侦察
+            tvVoiceProbeStatus = TextView(activity).apply {
+                setTextColor(Ui.SUB)
+                textSize = 12f
+                setLineSpacing(dip(2).toFloat(), 1f)
+                text = "尚未体检"
+            }
+            column.addView(tvVoiceProbeStatus, block(top = dip(2), bottom = dip(6)))
+            cbVoiceProbeWrite = checkbox("允许修改车机音频设置（停占用进程 / 解 mic 静音，测完自动还原）")
+            column.addView(cbVoiceProbeWrite, block(bottom = dip(4)))
+            val voiceProbeRow = LinearLayout(activity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(
+                    Button(activity).apply {
+                        text = "一键体检"
+                        textSize = 12f
+                        minHeight = dip(34)
+                        setAllCaps(false)
+                        background = Ui.pillSolid(activity, Ui.PRIMARY)
+                        setTextColor(Ui.PRIMARY_ON)
+                        setPadding(dip(14), dip(5), dip(14), dip(5))
+                        setOnClickListener { startVoiceProbe(full = true) }
+                    },
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ).apply { rightMargin = dip(10) },
+                )
+                addView(
+                    Button(activity).apply {
+                        text = "只做拓扑侦察"
+                        textSize = 12f
+                        minHeight = dip(34)
+                        setAllCaps(false)
+                        setOnClickListener { startVoiceProbe(full = false) }
+                    },
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ),
+                )
+            }
+            column.addView(voiceProbeRow, block(top = dip(2), bottom = dip(8)))
+        }
 
         // 运行日志：预览（对话框）+ 导出（文件快照）+ Gitee 上传配置/上传（M6k25）
         val logRow = LinearLayout(activity).apply {
@@ -1044,6 +1159,7 @@ class SettingsPage(private val activity: MainActivity) {
         cbBootWifi.isChecked = config.bootAutoWifi
         cbAutoConnect.isChecked = config.autoConnect
         cbSoftDecode.isChecked = config.softwareVideoDecoder
+        cbFe6Voice?.isChecked = config.rootMicFallback
         // vc157：帧率四档回显（load 已过网格校验，else 兜底 30）。
         when (config.videoFps) {
             25 -> rbFps25.isChecked = true
@@ -1132,6 +1248,8 @@ class SettingsPage(private val activity: MainActivity) {
                 audioPrebuffer = cbPrebuffer.isChecked,
                 usbBtDongle = rbBtUsb.isChecked,
                 softwareVideoDecoder = cbSoftDecode.isChecked,
+                // vc197：非 FE6 机型根本不创建该控件，保存时恒 false（保持老行为）。
+                rootMicFallback = cbFe6Voice?.isChecked ?: false,
                 orientationMode = currentOrientationMode(),
                 avPathMode = if (rbAvBt.isChecked) "bt_audio" else "full",
                 mediaAudioStream = mediaAudioStreamValue,
@@ -1183,6 +1301,73 @@ class SettingsPage(private val activity: MainActivity) {
      * - 广播名 → 当前 usbBtDongleName（未自定义即默认 DiPlay CarPlay）；
      * - 状态 → [UsbBtBootstrapStream.describe]（建链逐级状态 / 未连接时的探测结果）。
      */
+    /**
+     * vc193：启动语音通路体检。跑在独立线程（体检内部有 su 调用与 3s×7 档采集，
+     * 绝不能占 UI 线程）；进度只通过 Fe6VoiceProbe 的 volatile 状态回读，UI 侧统一 render。
+     */
+    /**
+     * vc198：root 授权 + 自检。后台线程跑（su 可能要等授权框、试采三档各 1.2s）。
+     *
+     * 这是 vc197 失败教训的直接对策：vc197 在 CarPlay 会话里由采集线程调 su，
+     * 31ms 就返回「未授权」。而同一台车 vc193/194/195 在设置页点按钮时都能拿到
+     * `uid=0` ⇒ 差别在**调用时机（前台可见性）与命令写法**。所以把授权独立成按钮、
+     * 前移到建链之前，并把「授权 → 部署 → 试采 1 秒」三步结果全打在屏上。
+     */
+    private fun startRootSelfTest() {
+        if (rootSelfTestRunning) {
+            toast("自检进行中，请稍候")
+            return
+        }
+        rootSelfTestRunning = true
+        tvRootAuthStatus?.text = "自检中…若弹出 root 授权框请点「允许」" +
+            "（没有任何弹框 = 已授权过，或系统根本没有 su）"
+        Thread({
+            val report = try {
+                Fe6RootMicSource(activity) { LiteLog.log("media", it) }.selfTest()
+            } catch (error: Throwable) {
+                "自检异常：${error.javaClass.simpleName}: ${error.message}"
+            }
+            LiteLog.log("media", "FE6 root 自检结果：\n$report")
+            activity.runOnUiThread {
+                rootSelfTestRunning = false
+                tvRootAuthStatus?.text = report
+            }
+        }, "fe6-root-selftest").apply { isDaemon = true }.start()
+    }
+
+    private fun startVoiceProbe(full: Boolean) {
+        if (Fe6VoiceProbe.running) {
+            toast("体检进行中，请稍候")
+            return
+        }
+        val allowWrite = ::cbVoiceProbeWrite.isInitialized && cbVoiceProbeWrite.isChecked
+        val update: (String) -> Unit = {
+            activity.runOnUiThread { renderVoiceProbe() }
+        }
+        renderVoiceProbe()
+        Thread({
+            if (full) {
+                Fe6VoiceProbe.runFullScan(activity, allowWrite, update)
+            } else {
+                Fe6VoiceProbe.runTopologyOnly(activity, update)
+            }
+        }, "micprobe-ui").apply { isDaemon = true }.start()
+    }
+
+    private fun renderVoiceProbe() {
+        if (!::tvVoiceProbeStatus.isInitialized) return
+        tvVoiceProbeStatus.text = buildString {
+            if (Fe6VoiceProbe.running) {
+                append("进行中：").append(Fe6VoiceProbe.progress.ifBlank { "准备中…" })
+            } else {
+                append("结论：").append(Fe6VoiceProbe.lastConclusion)
+            }
+            append("\nroot：").append(Fe6VoiceProbe.lastSuState)
+            val body = Fe6VoiceProbe.summary
+            if (body.isNotBlank() && body != "尚未体检") append('\n').append(body)
+        }
+    }
+
     private fun refreshBtDongleStatus() {
         if (!::tvBtDongleStatus.isInitialized) return
         val cfg = LiteConfig.load(activity)

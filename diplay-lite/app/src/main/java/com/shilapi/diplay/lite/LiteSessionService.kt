@@ -129,6 +129,34 @@ class LiteSessionService : Service() {
     private var mediaEngine: CarPlayMediaEngine? = null
     /** 1.1.4：ECARX 媒体中心冒充桥（非 ECARX 车机内部静默禁用，零开销）。 */
     private var ecarxBridge: EcarxMediaCenterBridge? = null
+    // vc197：root 直采源实例（su 授权与二进制部署只做一次，故在 service 级缓存）。
+    private var rootMicFallbackSource: Fe6RootMicSource? = null
+
+    /**
+     * vc197：实验性 FE6 语音兜底是否生效 —— **机型必须命中 FE6，且用户在设置页勾选**。
+     *
+     * 非 FE6 机型一律 false：上行发送路径与历史版本逐字节一致（读到就发、不补静音帧、
+     * 不碰 root），避免把为 FE6 做的架构改动带到正常车机上。
+     *
+     * 注意：这是建流时读一次的开关，改动后需**断开重连**才生效。
+     */
+    private fun fe6VoiceFallbackActive(): Boolean {
+        if (!Fe6Device.isFe6()) return false
+        return runCatching { LiteConfig.load(this).rootMicFallback }.getOrDefault(false)
+    }
+
+    private fun activeRootMicSource(): Fe6RootMicSource? {
+        if (!fe6VoiceFallbackActive()) return null
+        rootMicFallbackSource?.let { return it }
+        return Fe6RootMicSource(this) { LiteLog.log("media", it) }.also { created ->
+            rootMicFallbackSource = created
+            LiteLog.log(
+                "media",
+                "fe6 voice fallback ON: model=${Fe6Device.describe()} " +
+                    "keepAlive=true rootCapture=lazy",
+            )
+        }
+    }
 
     private val sessionListener = object : AirPlaySessionListener {
         override fun onSessionActive(session: AirPlaySession) {
@@ -396,6 +424,10 @@ class LiteSessionService : Service() {
                     "clean"
                 }
             },
+            // vc197：实验性 FE6 语音兜底。**仅 FE6 机型 + 用户勾选**才生效，其余机型两者皆空。
+            // 一次性落诊断，外测日志里能直接确认机型判对没判对、开关是否真的打开。
+            rootMicSource = activeRootMicSource(),
+            keepAliveUplink = fe6VoiceFallbackActive(),
             // 1.1.4：CarPlay 媒体流首包 → ECARX 桥显式抢源。
             onMediaPlaybackStarted = { bridge.onCarPlayMediaStarted() },
             // 1.1.6(vc76)：媒体断供看门狗（音视频双静默 20s）→ 编排层整代回收。

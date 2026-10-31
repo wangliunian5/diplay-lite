@@ -398,13 +398,19 @@ class RelayClientManager(
     private fun probeTcpPort(gateway: InetAddress): Int {
         for (port in GATEWAY_TCP_PROBE_PORTS) {
             if (closed) return 0
+            // API16：Kotlin 的 `Socket().use { }` 依赖 `Closeable` 接口，而 `java.net.Socket`
+            // 只在 **API 19+** 才实现 Closeable ⇒ API16~18 抛 ClassCastException。虽被下面的
+            // catch 兜住不崩，但 probe 恒失败 = 「禁 ping vs 真隔离」在旧车机上永久判不出来。
+            // 改用 try/finally 显式关，语义不变且全版本可用。
+            var socket: Socket? = null
             try {
-                Socket().use { socket ->
-                    socket.connect(InetSocketAddress(gateway, port), TCP_PROBE_TIMEOUT_MILLIS)
-                }
+                socket = Socket()
+                socket.connect(InetSocketAddress(gateway, port), TCP_PROBE_TIMEOUT_MILLIS)
                 return port
             } catch (_: Exception) {
                 // 连接被拒/超时都按不可达计，继续下一个端口
+            } finally {
+                runCatching { socket?.close() }
             }
         }
         return 0

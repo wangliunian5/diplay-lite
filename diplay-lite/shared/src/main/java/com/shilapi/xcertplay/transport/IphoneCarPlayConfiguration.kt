@@ -1,5 +1,6 @@
 package com.shilapi.xcertplay.transport
 
+import android.annotation.TargetApi
 import android.hardware.usb.UsbConfiguration
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
@@ -44,6 +45,10 @@ object IphoneCarPlayConfiguration {
         return chosen
     }
 
+    // 以下接受 UsbConfiguration 参数的函数都是 API 21+（参数类型本身就是 21 才有的类，
+    // API<21 上根本拿不到实参：find() 在 <21 已提前返回 null）。@TargetApi 只是把这个契约
+    // 写明，运行时无任何效果。
+    @TargetApi(21)
     fun describe(configuration: UsbConfiguration): String =
         (0 until configuration.interfaceCount).joinToString(",") { index ->
             describeInterface(configuration.getInterface(index))
@@ -72,6 +77,7 @@ object IphoneCarPlayConfiguration {
             ".${usbInterface.interfaceProtocol.toString(16)}" +
             "x${usbInterface.endpointCount}"
 
+    @TargetApi(21)
     fun usbMuxInterface(configuration: UsbConfiguration): UsbInterface? =
         (0 until configuration.interfaceCount).map(configuration::getInterface).firstOrNull {
             it.interfaceClass == USBMUX_CLASS &&
@@ -119,11 +125,13 @@ object IphoneCarPlayConfiguration {
             usbInterface.interfaceSubclass == USBMUX_SUBCLASS &&
             usbInterface.interfaceProtocol == USBMUX_PROTOCOL
 
+    @TargetApi(21)
     private fun hasCdcNcm(configuration: UsbConfiguration): Boolean =
         (0 until configuration.interfaceCount).map(configuration::getInterface).any {
             it.interfaceClass == NCM_CONTROL_CLASS && it.interfaceSubclass == NCM_CONTROL_SUBCLASS
         }
 
+    @TargetApi(21)
     private fun hasAppleEthernet(configuration: UsbConfiguration): Boolean =
         (0 until configuration.interfaceCount).map(configuration::getInterface).any {
             it.interfaceClass == APPLE_ETHERNET_CLASS &&

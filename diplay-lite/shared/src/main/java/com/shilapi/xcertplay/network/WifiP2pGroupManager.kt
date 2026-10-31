@@ -12,6 +12,7 @@ package com.shilapi.xcertplay.network
 // 裁掉上游独有依赖：P2pHotspotConflict（依赖上游 WirelessStartupException 分类体系）。
 
 import android.Manifest
+import android.annotation.TargetApi
 import android.content.Context
 import android.content.pm.PackageManager
 import android.location.LocationManager
@@ -186,7 +187,13 @@ class WifiP2pGroupManager(
                     ensureStartActive(attempt)
                     if (remainingNanos(deadlineNanos) == 0L) throw IOException("Wi-Fi Direct startup timed out")
                     if (legacyChannels) requestLegacyOperatingChannel(attempt, p2pChannel, selection)
-                    val config = if (legacyChannels || selection.mode == P2pCreationMode.SYSTEM_DEFAULT) null else {
+                    // API29：WifiP2pConfig.Builder 及 setNetworkName/setGroupOperatingBand/
+                    // setGroupOperatingFrequency 全是 29+。`legacyChannels` 已蕴含 SDK<29，
+                    // 这里把版本条件显式写进同一个 if，让 lint 也能证明——行为不变。
+                    val config = if (
+                        legacyChannels || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+                        selection.mode == P2pCreationMode.SYSTEM_DEFAULT
+                    ) null else {
                         P2pConfigBuildDiagnostics.build(Build.VERSION.SDK_INT, selection, diagnostic) {
                             val builder = WifiP2pConfig.Builder()
                                 .setNetworkName(credentials.ssid)
@@ -224,7 +231,12 @@ class WifiP2pGroupManager(
                             p2pManager.createGroup(p2pChannel, createActionListener(attempt, request))
                         } else {
                             // vc156：API29+ 三参重载，仅 SDK>=29 分支执行。
-                            p2pManager.createGroup(p2pChannel, config, createActionListener(attempt, request))
+                            // 外层显式判 SDK>=Q，让 lint 也能证明（legacyChannels 已等价）。
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                p2pManager.createGroup(p2pChannel, config, createActionListener(attempt, request))
+                            } else {
+                                p2pManager.createGroup(p2pChannel, createActionListener(attempt, request))
+                            }
                         }
                         awaitGroupCreated(attempt, request, deadlineNanos, timeoutMillis)
                     } catch (failure: P2pCreateRejected) {
@@ -481,6 +493,7 @@ class WifiP2pGroupManager(
 
     // vc156：本函数仅在 legacyChannels=false（SDK>=29）分支执行；SDK34 前向兼容 API36 的
     // WifiP2pConfig.Builder/重载均已在编译目标内。
+    @TargetApi(29)
     private fun awaitUsableGroup(
         attempt: StartAttempt,
         channel: WifiP2pManager.Channel,
@@ -708,7 +721,11 @@ class WifiP2pGroupManager(
         val networkInterface = networkInterface(interfaceName) ?: return null
         val address = HotspotAddressPolicy.select(Collections.list(networkInterface.inetAddresses))
             ?: return null
-        if (address !is Inet6Address || address.scopeId == networkInterface.index) return address
+        // API16：`NetworkInterface#getIndex()` 是 API 19+，且 `NoSuchMethodError` 是 Error，
+        // runCatching 之外也会直接崩。低版本没有接口索引 ⇒ 原地址直接返回（无 scope 绑定）。
+        if (address !is Inet6Address) return address
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) return address
+        if (address.scopeId == networkInterface.index) return address
         return runCatching { Inet6Address.getByAddress(null, address.address, networkInterface) }
             .getOrDefault(address)
     }
@@ -740,14 +757,28 @@ class WifiP2pGroupManager(
     @Suppress("DEPRECATION")
     private fun readStation(): Station = runCatching {
         val info = wifiManager()?.connectionInfo
-        Station(info?.supplicantState, info?.frequency?.takeIf { it > 0 })
+        // API16：`WifiInfo#getFrequency()` 是 API 21+（抛 NoSuchMethodError，被 runCatching 吞成
+        // Station(null,null) ⇒ 频道对齐在旧机永久失效）。这里显式降级，让「旧机没有频率信息」
+        // 成为可读的既定行为而不是异常路径。
+        val reportedFrequency = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            info?.frequency?.takeIf { it > 0 }
+        } else {
+            null
+        }
+        Station(info?.supplicantState, reportedFrequency)
     }.getOrDefault(Station(null, null))
 
     /** Returns false only when Wi-Fi is on and reports no 5 GHz band; it also reads false while Wi-Fi is off. */
     private fun checkPrerequisites(station: Station): Boolean {
         val wifi = wifiManager()
-        // vc156：is5GHzBandSupported 为 API21+，API16-20 直读 NoSuchMethodError —— runCatching 兜住读 null。
-        val fiveGhzSupported = runCatching { wifi?.is5GHzBandSupported }.getOrNull()
+        // vc156：is5GHzBandSupported 为 API21+，API16-20 直读 NoSuchMethodError。
+        // vc200：原来的纯 runCatching 写法会把 NoSuchMethodError 伪装成「读不到」，
+        // 现改为显式版本判断——同语义，但异常不再被当成业务结论。
+        val fiveGhzSupported = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            runCatching { wifi?.is5GHzBandSupported }.getOrNull()
+        } else {
+            null
+        }
         val wifiEnabled = runCatching { wifi?.isWifiEnabled }.getOrNull()
         val locationEnabled = runCatching {
             appContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager

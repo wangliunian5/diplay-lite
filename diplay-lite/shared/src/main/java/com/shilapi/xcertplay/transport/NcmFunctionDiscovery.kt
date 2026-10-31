@@ -1,5 +1,6 @@
 package com.shilapi.xcertplay.transport
 
+import android.annotation.TargetApi
 import android.hardware.usb.UsbConfiguration
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
@@ -296,6 +297,8 @@ object NcmFunctionDiscovery {
         }
     }
 
+    /** UsbConfiguration 是 API 21+，API<21 分支（findLegacy）不会进到这里。 */
+    @TargetApi(21)
     private fun interfaces(configuration: UsbConfiguration): List<UsbInterface> =
         (0 until configuration.interfaceCount).map(configuration::getInterface)
 
