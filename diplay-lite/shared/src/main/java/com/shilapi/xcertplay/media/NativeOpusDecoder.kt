@@ -20,7 +20,7 @@ internal class NativeOpusDecoder private constructor(
     private val sampleRate: Int,
     private val channels: Int,
 ) : Closeable {
-    private var closed = false
+    @Volatile private var closed = false
 
     val available: Boolean get() = !closed && handle != 0L
 

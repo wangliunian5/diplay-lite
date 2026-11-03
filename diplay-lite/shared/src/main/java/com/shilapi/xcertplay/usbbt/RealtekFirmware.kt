@@ -155,7 +155,9 @@ internal object RealtekFirmware {
     fun fragments(image: ByteArray): Sequence<ByteArray> {
         require(image.isNotEmpty() && image.size <= 1_048_576) { "invalid download image size" }
         return sequence {
-            val last = image.size / FRAGMENT_SIZE
+            // 末片必须携带有效载荷：size 恰为 FRAGMENT_SIZE 整数倍时 size/FRAGMENT_SIZE 会多算一片
+            // 零长度结束片，控制器拒收该片的 ack 会误判整次下载失败（上游 btrtl 无此行为）。
+            val last = (image.size - 1) / FRAGMENT_SIZE
             var wireIndex = 0
             for (part in 0..last) {
                 val offset = part * FRAGMENT_SIZE

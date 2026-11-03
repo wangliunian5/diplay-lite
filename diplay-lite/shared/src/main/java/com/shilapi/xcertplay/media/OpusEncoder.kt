@@ -44,15 +44,21 @@ internal class OpusEncoder(bitrate: Int) : OpusFrameEncoder {
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_BYTES)
             }
-            MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS).also {
-                it.configure(
+            val created = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS)
+            try {
+                created.configure(
                     format,
                     null,
                     null,
                     MediaCodec.CONFIGURE_FLAG_ENCODE,
                 )
-                it.start()
+                created.start()
                 Log.i(TAG, "Opus microphone encoder started bitrate=$bitrate")
+                created
+            } catch (error: Exception) {
+                // configure/start 失败时已创建的 codec 必须释放，否则泄漏 native 组件
+                runCatching { created.release() }
+                throw error
             }
         } catch (error: Exception) {
             Log.w(TAG, "Opus microphone encoder unavailable", error)

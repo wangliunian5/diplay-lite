@@ -67,6 +67,12 @@ class Fe6RootMicSource(
     /** 所有 su 子进程，release() 时统一收尸（su 被 kill 不等于它的子进程会死）。 */
     private val children = ArrayList<Process>()
 
+    /**
+     * vc200：**加锁**。预热线程（上行建立即调）与 fallback 线程（看门狗触发）会并发进来；
+     * 不加锁两边会各起一次 `su -c id` + 一次 `cp/chmod`，白多烧 730ms —— 恰恰是这段窗口
+     * 最缺的东西。加锁后后来者直接等结果。
+     */
+    @Synchronized
     override fun isAvailable(): Boolean {
         availability?.let { return it }
         val rootOk = probeRoot()
@@ -83,6 +89,7 @@ class Fe6RootMicSource(
     }
 
     /** 授权结果变化后（设置页点了授权按钮）强制重探。 */
+    @Synchronized
     fun invalidate() {
         availability = null
         suBinary = null
@@ -102,6 +109,7 @@ class Fe6RootMicSource(
         }
         val deadline = SystemClock.elapsedRealtime() + PROBE_TOTAL_MILLIS
         var silentFallback: RootMicStream? = null
+        var silentFallbackSpec: IntArray? = null
         for (spec in candidates) {
             if (SystemClock.elapsedRealtime() > deadline) {
                 diagnostics("root mic: 探测总时长用尽，停止试开")
@@ -111,7 +119,20 @@ class Fe6RootMicSource(
             val device = spec[1]
             val rate = spec[2]
             val channels = spec[3]
-            val probe = tryOpen(card, device, rate, channels) ?: continue
+            var probe = tryOpen(card, device, rate, channels)
+            if (probe == null && silentFallbackSpec != null &&
+                silentFallbackSpec!![0] == card && silentFallbackSpec!![1] == device
+            ) {
+                // ALSA 采集子设备是单消费者：「可读但全零」的兜底流还占着同一节点时，
+                // 同节点后续档位必然 EBUSY —— 48k/1ch（历史唯一出过真音的参数）就永远轮不到。
+                // 放掉兜底重试一次；重试再失败则该档按打不开处理（兜底已丢，后面档位还有新兜底机会）。
+                diagnostics("root mic: card$card/d$device 被全零兜底占用，放掉兜底重试本档")
+                silentFallback?.close()
+                silentFallback = null
+                silentFallbackSpec = null
+                probe = tryOpen(card, device, rate, channels)
+            }
+            if (probe == null) continue
             if (probe.peak > 0) {
                 diagnostics(
                     "root mic: 命中 card$card/d$device ${rate}Hz/${channels}ch " +
@@ -124,7 +145,12 @@ class Fe6RootMicSource(
                 "root mic: card$card/d$device ${rate}Hz/${channels}ch 可读但全零" +
                     "（${probe.bytes}B），继续试下一档",
             )
-            if (silentFallback == null) silentFallback = probe.stream else probe.stream.close()
+            if (silentFallback == null) {
+                silentFallback = probe.stream
+                silentFallbackSpec = spec
+            } else {
+                probe.stream.close()
+            }
         }
         if (silentFallback != null) {
             diagnostics("root mic: 没有一档出数，接受「可读但全零」的节点（不比 AudioRecord 差）")

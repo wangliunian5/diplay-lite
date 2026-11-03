@@ -23,6 +23,26 @@ import java.util.concurrent.TimeUnit
 class WiredVpnService : VpnService() {
     override fun onBind(intent: Intent?): IBinder? = super.onBind(intent)
 
+    /**
+     * vc200：「有没有残留」的活体判据之一。
+     *
+     * 本 Service 每次 onStartCommand 末尾就 stopSelf，所以实例在世通常只有毫秒级；
+     * 但「startService 后系统迟迟不投递 onStartCommand」「上次实例正在销毁」这两种
+     * 竞态下，实例确实会在世 —— 那正是要清的对象，故计入残留。
+     *
+     * 注意：[onDestroy] 只翻标志，**绝不 close(established)** —— fd 的所有权在交付后
+     * 已转给 Ipv6NcmBridge，在这里关掉会把正在跑的会话数据面掐断。
+     */
+    override fun onCreate() {
+        super.onCreate()
+        synchronized(lock) { serviceAlive = true }
+    }
+
+    override fun onDestroy() {
+        synchronized(lock) { serviceAlive = false }
+        super.onDestroy()
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val linkLocal = intent?.getStringExtra(EXTRA_LINK_LOCAL) ?: DEFAULT_LINK_LOCAL
         // vc180：失败原因必须留痕。此前 establish 的失败只 Log.w 到 logcat，而日志上云
@@ -49,13 +69,46 @@ class WiredVpnService : VpnService() {
             } catch (error: Throwable) {
                 Log.w(TAG, "wired vpn allowFamily unavailable: ${error.message}")
             }
-            val fd = builder.establish()
+            var fd = builder.establish()
             if (fd == null) {
                 // vc180：AOSP 4.x 的 Vpn.establish 在「未 prepared（mPackage 非本包）」或
                 // 「调用 UID 与 mPackage 的 UID 不一致」时直接 return null，不抛异常。
                 // 必须与抛异常分开记录，否则只能看到一个 null（AC822X 同款盲区）。
-                failure =
-                    "establish returned null: VPN is not prepared for this package, or the calling UID does not match"
+                //
+                // vc200「残疾 VPN 重开」：null 有两种成因，先分清楚再决定要不要重试——
+                //  - prepare(this) 仍返回 null（系统认为本包已授权）⇒ 上一次连接的 stub
+                //    没清干净，同参数再 establish 一次（纯毫秒级 JNI 调用、不碰 su，
+                //    主线程安全）；
+                //  - prepare(this) 返回 Intent（授权真的丢了）⇒ 重试无意义，把结论带出去，
+                //    由 MainActivity 走 root appops / 引导页（那里才有 su 与 UI）。
+                val pending = try {
+                    prepare(this)
+                } catch (error: Throwable) {
+                    Log.w(TAG, "wired vpn prepare() recheck threw ${error.javaClass.simpleName}: ${error.message}")
+                    null
+                }
+                if (pending == null) {
+                    fd = try {
+                        builder.establish()
+                    } catch (error: Throwable) {
+                        Log.w(
+                            TAG,
+                            "wired vpn establish retry threw ${error.javaClass.simpleName}: ${error.message}",
+                        )
+                        null
+                    }
+                    if (fd == null) {
+                        failure =
+                            "establish returned null twice while package reports prepared " +
+                                "(stale VPN stub not cleared by the system)"
+                    } else {
+                        Log.i(TAG, "wired vpn establish succeeded on reopen retry")
+                    }
+                } else {
+                    failure =
+                        "establish returned null: VPN is not prepared for this package, " +
+                            "or the calling UID does not match"
+                }
             }
             fd
         } catch (error: Throwable) {
@@ -220,8 +273,24 @@ class WiredVpnService : VpnService() {
     private fun hasMulticastFlag(dev: String): Boolean {
         return try {
             val proc = Runtime.getRuntime().exec(arrayOf("ip", "link", "show", dev))
+            // 与 execWithTimeout 同纪律：轮询 exitValue + 超时 destroy——烂 ROM 上 `ip`
+            // 挂住时裸 waitFor() 会把 fd 交付后的修复线程永久阻塞。
+            var exited = false
+            var waited = 0L
+            while (!exited && waited < 2_000L) {
+                Thread.sleep(100)
+                waited += 100
+                try {
+                    proc.exitValue()
+                    exited = true
+                } catch (_: IllegalThreadStateException) {
+                }
+            }
+            if (!exited) {
+                proc.destroy()
+                return false
+            }
             val out = proc.inputStream.bufferedReader().use { it.readText() }
-            proc.waitFor()
             out.contains("MULTICAST")
         } catch (_: Throwable) {
             false
@@ -258,8 +327,21 @@ class WiredVpnService : VpnService() {
         private val lock = Any()
         private var established: ParcelFileDescriptor? = null
         private var latch = CountDownLatch(0)
+        /** vc200：Service 实例是否在世（`onCreate` 起、`onDestroy` 止）。 */
+        private var serviceAlive = false
         /** vc180：上一次建立失败的原因（异常类型/消息 + TUN 环境体检），成功或未建过为 null。 */
         private var lastFailure: String? = null
+
+        /**
+         * vc200：**是否真有需要清理的残留**。
+         *
+         * 判据只有两条：①存量 TUN fd 未关（上次异常退出没走 teardown）；②Service 实例在世。
+         *
+         * 为什么要这个判据：旧版 `ensureCleanVpnState()` 无条件 `stopService()`，而低 API /
+         * EMUI ROM 上 `stopService` 紧跟 `startService` 有被合并/丢弃的先例 —— 无残留时
+         * 那次 `stopService` 纯属白冒风险。绝大多数连接前两条判据皆为 false，整段清理可跳过。
+         */
+        fun hasResidual(): Boolean = synchronized(lock) { established != null || serviceAlive }
 
         /** vc180：取上一次失败原因（供控制器写进 LiteLog 与用户可见文案）。 */
         fun lastFailure(): String? = synchronized(lock) { lastFailure }

@@ -80,6 +80,16 @@ class CarPlayRuntimeConfig(
     val usbBtDongle: Boolean = false,
     // vc184：外置蓝牙自定义名称（写进 HCI 本地名称，iPhone 蓝牙列表显示）。
     val usbBtDongleName: String = "DiPlay CarPlay",
+    // vc202（竞品逆向对照）：handoff 完成判据加「已鉴权 AirPlay 帧」兜底——handoffRequested
+    // 已置位且本代已渲染出帧（解密成功=已鉴权）即按 degraded 完成上报，不再死等
+    // type-130 隧道/45s 看门狗；隧道继续在后台建立，就绪后升级收尾（关蓝牙引导）。
+    // false = 回退 vc201 行为（仅等隧道）。默认 true。
+    val wirelessEarlyHandoffOnFrame: Boolean = true,
+    // vc202（竞品逆向对照）：车机热点（MANUAL/MANUAL_IPV4）启动前，本机 STA 若关联在
+    // 2.4G 则主动断开，让热点自由落 5G（2.4G 拥挤是慢入网族主因）。仅车机热点路径启用；
+    // RELAY（本机就是中继 client，断开=自断）与 WIFI_P2P 一律跳过。失败只记日志不阻断。
+    // 默认 true；false = 完全不动 STA。
+    val wirelessStaKickFor5g: Boolean = true,
 ) {
     init {
         require(hostMac.size == 6) { "hostMac must be 6 bytes" }

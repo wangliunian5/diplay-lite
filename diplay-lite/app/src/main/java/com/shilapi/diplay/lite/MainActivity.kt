@@ -1246,6 +1246,14 @@ class MainActivity : Activity() {
                 startSession(config, key, "relay")
             }
             "usb" -> {
+                // vc200：「清残留」从 onCreate 的一次性动作下移到**每次连接入口**。
+                // 原有三处清理（onCreate:ensureCleanVpnState / closeWiredStack / USB 拔出
+                // receiver）里，onCreate 那条在长驻车机上是真空档：Activity 为 singleTask +
+                // configChanges 全覆盖，onCreate 只在进程首启跑一次。于是「上次异常结束、
+                // 没拔线、closeWiredStack 也没走完」的残留 TUN fd 在下次连接前无人复查。
+                // 有会话在跑时不碰（TUN 归当前会话所有）；无残留时 ensureCleanVpnState 内部
+                // 直接跳过，零成本。
+                if (!LiteState.running) ensureCleanVpnState("连接入口")
                 // vc153（K60）：有线连接前的无线互斥——无线会话活跃（真交接/降级态/本代
                 // 曾建立过）时先 stopService 拆无线栈（onDestroy 全拆 controller/AirPlay
                 // 栈/VPN）。vc154：不再用固定 2.5s 延迟——拆栈完成回调驱动（teardown
@@ -1345,18 +1353,22 @@ class MainActivity : Activity() {
                 if (!prepareBroken && consent == null) {
                     // vc111（T3 排查定案）：KK 的 VPN 授权=mPackage 内存态，异常断开
                     // （interfaceRemoved）后残留 → VpnService.prepare 返回 null，系统
-                    // 授权框被跳过。mPackage 无公开 API 可清（无 root 不可清），用户诉求
-                    // 「每次点 USB 连接都要人工确认 VPN」→ prepare 放行时弹自家确认框，
-                    // 点确定才开始 establish，语义与系统授权框一致，100% 可控。
-                    // vc148（无人值守定案）：自动连接路径（auto=true）不弹确认框直接
-                    // establish——prepare 放行即视为已授权（首装首次的系统授权框仍会
-                    // 正常弹，人工授权过一次后启动阶段全自动）；手动路径保留确认框。
-                    if (auto) {
-                        LiteLog.log("ui", "USB 通道：自动连接 prepare 放行，跳过确认框直接建链")
-                        startSession(config, key, "usb")
-                    } else {
-                        showVpnConfirmDialog(config, key)
-                    }
+                    // 授权框被跳过。mPackage 无公开 API 可清（无 root 不可清）。
+                    //
+                    // vc200 定案（删除 app 内「VPN 连接确认」框）：这个框自 vc111 起存在，
+                    // 但**从未承载它声称的职责**——
+                    // ① 「清残留」实际发生在 onCreate / closeWiredStack / USB 拔出三处，
+                    //    而框的「确定」只是 `startSession()`，零清理动作；
+                    // ② establish() 返回 null（mPackage 残留 / UID 不匹配）时，用户点
+                    //    「确定」改变不了 mPackage，照样失败 ⇒ 框是提示，不是解法。
+                    // 实测代价：1.0s + 一次人工点击（22:06:09.986→22:06:11.002）。
+                    // 现在：清理已在连接入口幂等执行（vc200），establish 失败由 Service 侧
+                    // 「prepare 复核 + 同参重开一次」兜住（WiredVpnService），失败还会由
+                    // 控制器整轮重开兜一次。失败文案由 establish 的真实原因分级给出，
+                    // 比一个只会说「是否继续？」的框有信息量。
+                    val mode = if (auto) "自动连接" else "手动连接"
+                    LiteLog.log("ui", "USB 通道：$mode prepare 放行（系统 VPN 授权已存在），直接建链")
+                    startSession(config, key, "usb")
                     return
                 }
                 // prepare 本身异常 → 也尝试 root 兜底后复检。
@@ -1384,27 +1396,8 @@ class MainActivity : Activity() {
     }
 
     /**
-     * vc111：USB 连接的 VPN 每次确认框（KK mPackage 残留场景，系统框被跳过时兜底）。
-     * 点确定才进入 startSession（真正 establish VPN），取消则中止本次连接。
-     */
-    private fun showVpnConfirmDialog(config: LiteConfig, videoKey: String) {
-        LiteLog.log("ui", "USB 通道：系统 VPN 授权被跳过（mPackage 残留），弹 app 内确认框")
-        val dialog = AppDialog.Builder(this)
-            .setTitle("VPN 连接确认")
-            .setMessage("本次 USB 有线连接需要建立 VPN 网络通道，是否继续？")
-            .setPositiveButton("确定") { _, _ ->
-                LiteLog.log("ui", "USB 通道：VPN 确认框点确定，开始建立连接")
-                startSession(config, videoKey, "usb")
-            }
-            .setNegativeButton("取消") { _, _ ->
-                LiteLog.log("ui", "USB 通道：VPN 确认框点取消，中止连接")
-            }
-            .create()
-        dialog.show()
-    }
-
-    /**
      * vc154：VPN 授权失败引导页（场景：无 root + 车机 ROM 缺失/裁剪授权组件）。
+
      * 原两个失败终点只弹 toast 无行动路径，升级为弹窗引导：
      * ① 已 root → 授权后点「重试授权」自动写 appops + 复检建链；
      * ② 无 root → 提示改用无线连接（车机热点/中继），此类车机有线结构性不可用。
@@ -1467,24 +1460,35 @@ class MainActivity : Activity() {
     }
 
     /**
-     * vc148：启动阶段 VPN 状态检测与残留清理（幂等，无 VPN 时为 no-op）。
+     * vc148：VPN 状态检测与残留清理（**幂等**，无残留时为 no-op）。
      * - 存量 TUN fd（上次会话异常退出未关）→ shutdownTun() 关闭；
      * - WiredVpnService 实例残留 → stopService 强制停止；
      * - 系统侧其他 app 的 VPN 不属于本 app 管辖，不触碰（VpnService 无跨 app 清理 API）。
-     * 清理完成后由 maybeAutoConnect 走正常自动连接流程重新 establish。
-     * 全程 try-catch：清理失败仅记录不阻塞启动（establish 自身有失败兜底路径）。
+     *
+     * vc200 两处升级：
+     * ① **判定先行**：先问 `WiredVpnService.hasResidual()`，无残留整段跳过。旧版无条件
+     *    `stopService()`，而低 API / EMUI ROM 上 `stopService` 紧跟 `startService` 有被
+     *    合并/丢弃的先例 —— 没有残留时那次 `stopService` 是白冒风险。
+     * ② **调用点下移**（见 `connect("usb")` 入口）：车机常年不关机，本 Activity 是
+     *    `singleTask` + `configChanges` 全覆盖 ⇒ `onCreate` 只在进程首启执行一次，
+     *    「上次异常结束但没拔线、`closeWiredStack` 也没走完」的残留 TUN fd 在下次连接前
+     *    根本不会被复查。`origin` 参数用于区分调用来源，日志可追溯。
      */
-    private fun ensureCleanVpnState() {
+    private fun ensureCleanVpnState(origin: String = "启动") {
+        if (!WiredVpnService.hasResidual()) {
+            LiteLog.log("ui", "VPN 状态检测[$origin]：无残留（无存量 TUN fd、服务未在世），跳过清理")
+            return
+        }
         try {
             WiredVpnService.shutdownTun()
         } catch (error: Throwable) {
-            LiteLog.log("ui", "VPN 状态检测：TUN 残留清理异常（忽略）${error.message}")
+            LiteLog.log("ui", "VPN 状态检测[$origin]：TUN 残留清理异常（忽略）${error.message}")
         }
         try {
             stopService(Intent(this, WiredVpnService::class.java))
-            LiteLog.log("ui", "VPN 状态检测：无残留 VPN 连接或已强制清理完成")
+            LiteLog.log("ui", "VPN 状态检测[$origin]：检测到残留，已强制清理（TUN fd + 服务）")
         } catch (error: Throwable) {
-            LiteLog.log("ui", "VPN 状态检测：服务残留清理异常（忽略）${error.message}")
+            LiteLog.log("ui", "VPN 状态检测[$origin]：服务残留清理异常（忽略）${error.message}")
         }
     }
 

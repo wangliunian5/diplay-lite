@@ -17,7 +17,7 @@ import java.io.Closeable
 internal class NativeOpusEncoder private constructor(private var handle: Long) :
     OpusFrameEncoder,
     Closeable {
-    private var closed = false
+    @Volatile private var closed = false
 
     override val available: Boolean get() = !closed && handle != 0L
 

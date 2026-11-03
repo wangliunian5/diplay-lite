@@ -321,9 +321,19 @@ class AndroidMediaSink(
             return
         }
         val delay = if (retriesLeft == 2) 800L else 2000L
+        // vc201：cancel(false) 拦不住 in-flight 任务体——已作废的延迟任务若已起跑，
+        // 仍会执行 startMicrophoneUplink 造成孤儿 uplink（一路跑到 sink.close() 才被收）。
+        // 起跑时从未决列表摘除自己：不在列表 / 已被取消 = 已被 STOP/新 SETUP 作废，直接退出。
+        val selfRef = java.util.concurrent.atomic.AtomicReference<java.util.concurrent.ScheduledFuture<*>?>()
         val future = microphoneRetryExecutor.schedule({
+            val pending = microphoneRetryFutures[type]
+            val self = selfRef.get()
+            if (pending == null || self == null || self.isCancelled || !pending.remove(self)) {
+                return@schedule
+            }
             startMicrophoneUplink(type, config, retriesLeft - 1)
         }, delay, TimeUnit.MILLISECONDS)
+        selfRef.set(future)
         microphoneRetryFutures.getOrPut(type) { mutableListOf() }.add(future)
     }
 
@@ -958,7 +968,6 @@ private class VideoDecoder(
         // 改法：只持有最新一个输出缓冲，被更新帧取代的旧帧静默归还（render=false），
         // 等没有新帧时才真正渲染最新帧 —— burst 期间合成量 N→1，撕裂源消失。
         var pendingIndex = -1
-        var pendingEos = false
         fun renderPending(): Boolean {
             if (pendingIndex >= 0) {
                 // 1.1.3 修复（8815 011235 无画面定案②）：**不得按 info.size 过滤**——Surface 输出模式下
@@ -984,7 +993,6 @@ private class VideoDecoder(
                     }
                 }
             }
-            pendingEos = false
             return false
         }
         while (running) {
@@ -1003,7 +1011,6 @@ private class VideoDecoder(
                     // 上一帧被更新帧取代：静默归还，不上合成器。
                     if (pendingIndex >= 0) codec.releaseOutputBuffer(pendingIndex, false)
                     pendingIndex = index
-                    pendingEos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                 }
                 // 负值未知码（防御）：与 TRY_AGAIN 同样必须退出，防忙循环。
                 else -> { renderPending(); return }
@@ -1136,7 +1143,6 @@ private class AudioRenderer(
     // 在本分支无对应物（lite 没有时钟学习/倍速微调），故只需移植丢帧半边。
     // lite AudioFormat 无 rtpClockRate 字段：CarPlay 音频流 RTP 时钟率==采样率，直接用之。
     private val mediaLagGuard = if (format.audioType == "media") MediaPacketLagGuard(format.sampleRate) else null
-    @Volatile private var newestRtpSample = 0
     private var lagRecoveryReports = 0
     @Volatile private var running = true
     @Volatile private var started = false
@@ -1246,7 +1252,6 @@ private class AudioRenderer(
             val previous = lastArrivalNs.getAndSet(now)
             // API16 适配：AtomicLong.accumulateAndGet 是 API 24+，改 CAS 循环。
             if (previous != 0L) updateMaxArrivalGap((now - previous) / 1_000_000L)
-            newestRtpSample = sample
             // vc156（#814）：入队前先做积压检查。短突发原样保全；确认真积压（>1.5s 持续
             // >1.5s）才丢弃队首过期未解码包，让音乐追平到正在播放的位置而不是拿旧包续播。
             val removed = mediaLagGuard?.recover(queue, sample, AudioPacket::sample, now) ?: 0
@@ -1371,11 +1376,17 @@ private class AudioRenderer(
                 null
             } else {
                 report("Audio: creating decoder mime=$mime codec=${format.codec} type=${format.payloadType}")
-                MediaCodec.createDecoderByType(mime).also {
-                    it.configure(mediaFormat, null, null, 0)
-                    it.start()
-                    Log.i(TAG, "audio decoder configured mime=$mime name=${codecName(it)}")
-                    report("Audio: decoder ready mime=$mime name=${codecName(it)} type=${format.payloadType}")
+                val created = MediaCodec.createDecoderByType(mime)
+                try {
+                    created.configure(mediaFormat, null, null, 0)
+                    created.start()
+                    Log.i(TAG, "audio decoder configured mime=$mime name=${codecName(created)}")
+                    report("Audio: decoder ready mime=$mime name=${codecName(created)} type=${format.payloadType}")
+                    created
+                } catch (error: Exception) {
+                    // configure/start 失败时已创建的 codec 必须释放，否则泄漏 native 组件
+                    runCatching { created.release() }
+                    throw error
                 }
             }
         } catch (error: Exception) {

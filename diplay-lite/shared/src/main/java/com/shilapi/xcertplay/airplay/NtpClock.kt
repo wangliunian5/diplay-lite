@@ -48,16 +48,20 @@ class NtpClock(private val log: (String) -> Unit = {}) : Closeable {
     fun listen(): Int {
         check(!running.getAndSet(true)) { "NtpClock is already running" }
         // API16 车机实测：绑 IPv6 通配 [::] 抛异常会让 AirPlay SETUP 返回 500，回退 IPv4 通配
-        val bound = try {
-            DatagramSocket(null).apply {
-                reuseAddress = true
-                bind(InetSocketAddress(InetAddress.getByName("::"), 0))
-            }
-        } catch (error: Exception) {
-            log("listen bind [::] failed: ${error.message}; falling back to 0.0.0.0")
-            DatagramSocket(null).apply {
-                reuseAddress = true
-                bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
+        val bound = run {
+            val candidate = DatagramSocket(null)
+            try {
+                candidate.reuseAddress = true
+                candidate.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+                candidate
+            } catch (error: Exception) {
+                // bind 失败时已构造的 socket fd 必须关闭，否则每会话泄漏一个 fd
+                runCatching { candidate.close() }
+                log("listen bind [::] failed: ${error.message}; falling back to 0.0.0.0")
+                DatagramSocket(null).apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
+                }
             }
         }
         synchronized(socketLock) { socket = bound }

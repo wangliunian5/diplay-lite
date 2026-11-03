@@ -49,6 +49,7 @@ import com.shilapi.xcertplay.network.WirelessHotspotInfo
 import com.shilapi.xcertplay.network.WirelessHotspotManager
 import com.shilapi.xcertplay.network.diagnosticSummary
 import com.shilapi.xcertplay.network.wifiFrequencyMhzToChannel
+import com.shilapi.xcertplay.network.wifiInfoFrequencyMhz
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 import com.shilapi.xcertplay.transport.BluetoothRfcommDuplexStream
 import com.shilapi.xcertplay.transport.Iap2IdentificationConfig
@@ -234,6 +235,13 @@ class CarPlayController(
     private val wirelessActiveReported = AtomicBoolean(false)
 
     /**
+     * vc201：媒体断供回收的「进行中」门禁。sink 层 A/V 双静默回调与 AIRPLAY_STALLED 路径
+     * 可能同帧到达 notifyWirelessMediaStall——判活与拆栈之间无原子化时两线程都过检，
+     * 导致双拆栈 + 双 scheduleWirelessRetry（wirelessRetryCount 双计、退避窗口错乱）。
+     */
+    private val mediaStallRecoveryInFlight = AtomicBoolean(false)
+
+    /**
      * vc151：本代无线会话曾建立过（激活或降级态）。与 [wirelessActiveReported] 分开：
      * 后者在会话 ended 时复位，而 iPhone 偶发强断（无 goodbye TCP RST，K60 热点实测）
      * 后短时间内可能自行重投——此时 handoff watchdog（60s 定时）恰好到期，因 reported
@@ -272,6 +280,10 @@ class CarPlayController(
     // 定位「连上但 iPhone 不进来」卡在 Wi-Fi 段（tcpAccepted=0）还是 RTSP 段（tcpAccepted≥1）。
     private val wirelessAuthenticated = AtomicBoolean(false)
     @Volatile private var wirelessBringUpStartedAtMs = 0L
+    // vc202：degraded 完成时刻锚点——隧道随后若补齐，SESSION_ACTIVE 附 tunnelReadyAfterActiveMs。
+    @Volatile private var wirelessDegradedAtMs = 0L
+    // vc202：handoff 请求时刻锚点——SESSION_ACTIVE 附 handoffMs（请求→完成的纯 handoff 段耗时）。
+    @Volatile private var wirelessHandoffRequestedAtMs = 0L
     @Volatile private var wirelessRestartEpisodeStartedAtMs = 0L
     // M6k11：RFCOMM 连接成功时刻锚点——CSM 打开后 <500ms 被 iPhone 关流（瞬时 EOF）
     // 即归为 IPHONE_ZOMBIE（TS7 实测 3 轮全是 +175ms 秒杀）。
@@ -481,6 +493,7 @@ class CarPlayController(
                 isBluetoothHandoffCommand(type) &&
                 wirelessHandoffRequested.compareAndSet(false, true)
             ) {
+                wirelessHandoffRequestedAtMs = SystemClock.elapsedRealtime()
                 debugLog(
                     "wireless CarPlay Bluetooth handoff requested; " +
                         "waiting for tunnel iAP2 readiness",
@@ -505,6 +518,16 @@ class CarPlayController(
         mainHandler.post {
             if (uiListener === listener) lastReportedStatus?.let(reportStatus)
         }
+    }
+
+    /**
+     * vc201：摘除 UI 回调。controller 由服务持有、生命周期长于 Activity——不摘除时
+     * close() 之后 UI 侧 listener/闭包仍被引用（Activity 泄漏），且 teardown 后的
+     * 状态上报仍会触达已销毁的 UI。调用点全部使用 `?.`，空安全。
+     */
+    fun detachUi() {
+        uiListener = null
+        uiStatusReporter = null
     }
 
     fun isClosed(): Boolean = closed
@@ -688,6 +711,8 @@ class CarPlayController(
             if (closed) return
             closed = true
         }
+        // vc201：先摘除 UI 回调——controller 由服务持有，不摘的话 Activity 闭包随它泄漏。
+        detachUi()
         BydNavigationOutputs.endNow()
         closeBtAudioHandoff()
         closeWiredReceivers()
@@ -802,6 +827,8 @@ class CarPlayController(
         wirelessTunnelReady.set(false)
         wirelessActiveReported.set(false)
         wirelessDegradedActive.set(false)
+        wirelessDegradedAtMs = 0L // vc202：新代清 degraded/ handoff 锚点
+        wirelessHandoffRequestedAtMs = 0L
         wirelessEverActive.set(false) // vc151：新代重置 watchdog 放行依据
         onStatus(CarPlayStatus.StartingHotspot)
         val generation = wirelessGeneration.incrementAndGet()
@@ -1367,6 +1394,7 @@ class CarPlayController(
 
     private fun startWirelessTunnelControl(stream: BlockingDuplexByteStream): Boolean {
         if (closed) return false
+        val generation = wirelessGeneration.get()
         val identification = wirelessIdentification ?: return false
         val endpoint = wirelessAirPlayEndpoint ?: return false
         val mfi = mfiSession?.client ?: return false
@@ -1381,8 +1409,14 @@ class CarPlayController(
             debugLog("Could not open the tunneled iAP2 link", error)
             return false
         }
+        // vc201 代次护栏：openTunnel 期间若发生整代重启/关闭，本流已属上一代——
+        // 此时装进 wirelessTunnelChannel 会落在 teardown 快照（先快照再清字段）之后，
+        // 逃逸本轮关闭，残留 channel 与新代互抢。
+        if (closed || generation != wirelessGeneration.get()) {
+            closeBestEffort("stale tunneled iAP2 link") { channel.close() }
+            return false
+        }
         wirelessTunnelChannel = channel
-        val generation = wirelessGeneration.get()
         debugLog("wireless iAP2 tunnel control starting")
         return try {
             tunnelExecutor.execute {
@@ -1458,6 +1492,22 @@ class CarPlayController(
             override fun onVideoFrameRendered(session: AirPlaySession) {
                 if (isStaleWirelessRun(generation) || activeSession !== session) return
                 wirelessConnectionProof.rendered(generation, session)
+                // vc202（竞品 legacy handoff 对照）：已渲染帧 = 已鉴权 AirPlay 帧到达。
+                // handoff 已请求但隧道未就绪时立即按 degraded 完成，不再死等 45s 看门狗；
+                // 隧道继续在后台建立（onWirelessTunnelReady → maybeCompleteWirelessHandoff
+                // 走升级分支），不丢隧道。开关关闭则回退 vc201 行为。
+                if (
+                    config.wirelessEarlyHandoffOnFrame &&
+                    wirelessHandoffRequested.get() &&
+                    !wirelessTunnelReady.get() &&
+                    !wirelessActiveReported.get() &&
+                    !wirelessDegradedActive.get()
+                ) {
+                    Thread(
+                        { completeWirelessHandoffDegraded(generation, handoffReason = "airplay-frame") },
+                        "xcertplay-wireless-early-handoff",
+                    ).apply { isDaemon = true }.start()
+                }
             }
         }
 
@@ -1661,14 +1711,21 @@ class CarPlayController(
                 if (!wirelessActiveReported.get() && !wirelessDegradedActive.get()) {
                     return@Thread
                 }
-                debugLog("wireless media stall watchdog: A/V silent with session active; recovering")
-                val error = IOException("wireless media stall: no A/V packets while session active")
-                lastWirelessFailureClass = wirelessFailureClass(error)
-                closeWirelessStack(keepHotspotForReuse = true)
-                if (isRetryableWirelessFailure(error)) {
-                    scheduleWirelessRetry(generation, error)
-                } else {
-                    fail(error)
+                // vc201：判活到拆栈必须原子化——双静默回调与 AIRPLAY_STALLED 同帧到达时，
+                // 无 CAS 会双拆栈、双 retry（见 mediaStallRecoveryInFlight 声明处注释）。
+                if (!mediaStallRecoveryInFlight.compareAndSet(false, true)) return@Thread
+                try {
+                    debugLog("wireless media stall watchdog: A/V silent with session active; recovering")
+                    val error = IOException("wireless media stall: no A/V packets while session active")
+                    lastWirelessFailureClass = wirelessFailureClass(error)
+                    closeWirelessStack(keepHotspotForReuse = true)
+                    if (isRetryableWirelessFailure(error)) {
+                        scheduleWirelessRetry(generation, error)
+                    } else {
+                        fail(error)
+                    }
+                } finally {
+                    mediaStallRecoveryInFlight.set(false)
                 }
             },
             "xcertplay-media-stall",
@@ -1710,19 +1767,10 @@ class CarPlayController(
                         //   不再拆栈/失败，保持「蓝牙 iAP2 控制 + Wi-Fi A/V」继续运行，避免可见重连循环。
                         // - 未渲染帧：会话并未真正建立，走作者逻辑拆栈并 fail。
                         if (wirelessConnectionProof.hasRenderedFrame(generation)) {
-                            // M6g：先置位再上报，避免与控制环超时分支竞态。
-                            wirelessDegradedActive.set(true)
-                            wirelessEverActive.set(true) // vc151：降级态同样证明 handoff 完成过
-                            // M6h：会话已经可用（A/V 在跑），自动重试额度重新给满。
-                            val attempt = wirelessRetryCount.getAndSet(0)
-                            wirelessZombieMode = false // M6k11：degraded 收口同样退出僵尸模式
-                            preStreamEofCount = 0 // M6k23：degraded 收口同样清未建流 EOF 计数
-                            logWirelessSessionActive(generation, attempt, degraded = true)
-                            debugLog(
-                                "handoff degraded: keeping Bluetooth iAP2 + Wi-Fi A/V " +
-                                    "(hasRenderedFrame, no type-130 iAP2 tunnel)",
+                            completeWirelessHandoffDegraded(
+                                generation,
+                                handoffReason = "watchdog-timeout",
                             )
-                            onStatus(CarPlayStatus.WirelessActive)
                             return@Thread
                         }
                         // 1.0.13：handoff 超时不再终态失败（MX6DQ 实测弹「画面握手未完成」后
@@ -1746,6 +1794,29 @@ class CarPlayController(
             },
             WIRELESS_HANDOFF_TIMEOUT_MILLIS,
         )
+    }
+
+    /**
+     * degraded 完成 handoff 的共用收口（原 watchdog 内联块抽出，vc202）。
+     * 语义不变：保留蓝牙 iAP2 + Wi-Fi A/V，不补 type-130 隧道；先置位再上报防竞态。
+     * [handoffReason] 落 SESSION_ACTIVE 日志（airplay-frame=已鉴权帧提前判据 /
+     * watchdog-timeout=45s 看门狗兜底），供外测直接区分完成路径与耗时。
+     */
+    private fun completeWirelessHandoffDegraded(generation: Int, handoffReason: String) {
+        // M6g：先置位再上报，避免与控制环超时分支/提前判据并发双发。
+        if (!wirelessDegradedActive.compareAndSet(false, true)) return
+        wirelessEverActive.set(true) // vc151：降级态同样证明 handoff 完成过
+        // M6h：会话已经可用（A/V 在跑），自动重试额度重新给满。
+        val attempt = wirelessRetryCount.getAndSet(0)
+        wirelessZombieMode = false // M6k11：degraded 收口同样退出僵尸模式
+        preStreamEofCount = 0 // M6k23：degraded 收口同样清未建流 EOF 计数
+        wirelessDegradedAtMs = SystemClock.elapsedRealtime()
+        logWirelessSessionActive(generation, attempt, degraded = true, handoffReason = handoffReason)
+        debugLog(
+            "handoff degraded: keeping Bluetooth iAP2 + Wi-Fi A/V " +
+                "(hasRenderedFrame, no type-130 iAP2 tunnel, reason=$handoffReason)",
+        )
+        onStatus(CarPlayStatus.WirelessActive)
     }
 
     /** M6k20：first-TCP 看门狗。触发条件与 handoff 看门狗同代次护栏；TCP 已有连接或已激活则静默过期。 */
@@ -1935,6 +2006,11 @@ class CarPlayController(
                 onDiagnostic = ::debugLog,
             )
         } else {
+            // vc202（竞品 disconnectTwoPointFourStation 对照）：本机 STA 关联在 2.4G 时，
+            // STA+AP 信道并发约束会把车机热点锁在 2.4G 拥挤信道（慢入网族主因之一）。
+            // 车机热点路径（MANUAL/MANUAL_IPV4）启动前主动断开 STA，让热点自由落 5G。
+            // RELAY（本机就是 STA，断开=自断中继）与 WIFI_P2P 不走这里；失败只记日志不阻断。
+            maybeKickTwoPointFourStation()
             ManualHotspotManager(
                 context = appContext,
                 ssid = config.manualHotspotSsid
@@ -2421,18 +2497,84 @@ class CarPlayController(
     }
 
     /** 会话建立收口：SESSION_ACTIVE 一行讲清耗时（重连总耗时从故障纪元起点起算）。 */
-    private fun logWirelessSessionActive(generation: Int, attempt: Int, degraded: Boolean = false) {
+    private fun logWirelessSessionActive(
+        generation: Int,
+        attempt: Int,
+        degraded: Boolean = false,
+        handoffReason: String = if (degraded) "unknown" else "tunnel-ready",
+    ) {
         val now = SystemClock.elapsedRealtime()
         val bringUpMs = wirelessBringUpStartedAtMs.takeIf { it > 0 }?.let { now - it } ?: -1L
+        // vc202：纯 handoff 段耗时（请求→完成），区分慢在 bring-up 还是 handoff 判据。
+        val handoffMs = wirelessHandoffRequestedAtMs.takeIf { it > 0 }?.let { now - it } ?: -1L
         val reconnectTotalMs =
             wirelessRestartEpisodeStartedAtMs.takeIf { it > 0 }?.let { now - it }
         wirelessRestartEpisodeStartedAtMs = 0L
+        // vc202：degraded 先行完成后隧道才就绪时，补记隧道落后已激活的毫秒数（未走 degraded 则省略）。
+        val tunnelReadyAfterActiveMs = if (!degraded && wirelessDegradedAtMs > 0L) {
+            now - wirelessDegradedAtMs
+        } else {
+            null
+        }
+        // vc202：热点频段归一化（H1 验证「踢 2.4G 后是否真走上 5G」直接读这个字段）。
+        val wifiBand = when (lastHotspotInfo?.bandLabel) {
+            "5 GHz" -> "5g"
+            "2.4 GHz" -> "2.4g"
+            else -> "unknown"
+        }
         debugLog(
             "wireless SESSION_ACTIVE gen=$generation attempt=$attempt" +
                 "${if (degraded) " (degraded)" else ""} " +
-                "bringUpMs=$bringUpMs " +
+                "bringUpMs=$bringUpMs handoffMs=$handoffMs handoffReason=$handoffReason " +
+                "wifiBand=$wifiBand " +
+                (tunnelReadyAfterActiveMs?.let { "tunnelReadyAfterActiveMs=$it " } ?: "") +
                 "reconnectTotalMs=${reconnectTotalMs ?: "n/a(first-run)"}",
         )
+    }
+
+    /**
+     * vc202（竞品 disconnectTwoPointFourStation 对照移植）：车机热点启动前踢 2.4G STA。
+     * 判据与护栏：
+     * - 仅由 MANUAL/MANUAL_IPV4 路径调用（调用点在 startWirelessHotspot）；RELAY 场景
+     *   本机就是 STA，断开等于自断中继，绝不能走到这里；
+     * - 开关 config.wirelessStaKickFor5g=false 时完全不动 STA（回退 vc201 行为）；
+     * - 未关联 / 已在 5G / 频段读不出 → staKickSkipped=<reason>，原流程继续；
+     * - 2.4G 关联 → wifi.disconnect()（deprecated 但 API1 起存在，minSdk16 安全）；
+     *   返回值与异常都只落日志，不阻断建链（踢不掉就按 2.4G 原样走）。
+     */
+    @Suppress("DEPRECATION")
+    private fun maybeKickTwoPointFourStation() {
+        if (!config.wirelessStaKickFor5g) {
+            debugLog("staKickSkipped=disabled")
+            return
+        }
+        try {
+            val wifiManager =
+                appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            val info = wifiManager?.connectionInfo
+            if (info == null || info.networkId == -1) {
+                debugLog("staKickSkipped=not-associated")
+                return
+            }
+            val freqMHz = wifiInfoFrequencyMhz(info)
+            when {
+                freqMHz == null -> debugLog("staKickSkipped=freq-unknown ssid=${info.ssid}")
+                freqMHz in 5000..6000 ->
+                    debugLog("staKickSkipped=already-5g freq=${freqMHz}MHz ssid=${info.ssid}")
+                freqMHz in 2400..2500 -> {
+                    debugLog(
+                        "staKick: STA associated on 2.4G (freq=${freqMHz}MHz ssid=${info.ssid}); " +
+                            "disconnecting so the car hotspot can use 5G",
+                    )
+                    val ok = wifiManager.disconnect()
+                    debugLog("staKick disconnect()=$ok")
+                }
+                else -> debugLog("staKickSkipped=band-other freq=${freqMHz}MHz")
+            }
+        } catch (error: Exception) {
+            // 任何 ROM 差异/权限拒绝都不许影响建链。
+            debugLog("staKick failed (non-fatal): ${error.message}")
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -3554,6 +3696,25 @@ class CarPlayController(
     }
 
     /**
+     * vc200：拉起 WiredVpnService 并等 fd —— `request()` → `startService` → `awaitTun` 三步合一。
+     * 抽成函数是为了让「失败后整轮重开一次」复用同一段时序（vc200 新增重开路径），
+     * 不复制粘贴两份。
+     */
+    private fun requestWiredTun(timeoutMillis: Long): ParcelFileDescriptor? {
+        WiredVpnService.request(config.linkLocal)
+        try {
+            appContext.startService(
+                Intent(appContext, WiredVpnService::class.java)
+                    .putExtra(WiredVpnService.EXTRA_LINK_LOCAL, config.linkLocal),
+            )
+        } catch (error: Throwable) {
+            // 4.x 上 startService 一般可用；失败则 awaitTun 超时返回 null 走失败路径。
+            debugLog("wired VPN service start failed: ${error.message}")
+        }
+        return WiredVpnService.awaitTun(timeoutMillis)
+    }
+
+    /**
      * 有线数据面 attach（对应上游 attachVpn，Lite 裁剪为三步）：
      * 1) WiredVpnService 仅承担 establish()（需要系统 VPN 授权），fd 交付给桥；
      * 2) AirPlayTcpServer 绑 NCM 链路本地地址（与无线共用进程内 server，互斥使用）；
@@ -3588,25 +3749,26 @@ class CarPlayController(
         } else {
             debugLog("wired NCM guard disabled (vc76 no-root A/B build)")
         }
-        WiredVpnService.request(config.linkLocal)
-        try {
-            appContext.startService(
-                Intent(appContext, WiredVpnService::class.java)
-                    .putExtra(WiredVpnService.EXTRA_LINK_LOCAL, config.linkLocal),
-            )
-        } catch (error: Throwable) {
-            // 4.x 上 startService 一般可用；失败则 awaitTun 超时返回 null 走失败路径。
-            debugLog("wired VPN service start failed: ${error.message}")
-        }
-        val tun = WiredVpnService.awaitTun(WIRED_VPN_TUN_TIMEOUT_MILLIS)
+        var tun = requestWiredTun(WIRED_VPN_TUN_TIMEOUT_MILLIS)
         if (tun == null) {
-            // vc180：把 establish 的真实失败原因带出来（远程日志此前只有这一句无因的
-            // 「unavailable」，看不到是未授权、内核无 TUN 还是 IPv6 ioctl 失败）。
-            val reason = WiredVpnService.lastFailure()
-            lastWiredAttachFailure = reason
-            debugLog("wired VPN TUN unavailable${reason?.let { ": $it" } ?: ""}")
-            ncm.close()
-            return null
+            // vc200「残疾 VPN 重开」：establish 返回 null 多见于 KK 上 mPackage 残留 /
+            // 上一次连接的 stub 未清。Service 侧已自带「prepare 复核 + 同参重建一次」，
+            // 仍拿不到 fd 时在这里**整轮重开一次**：重新 request + startService，让
+            // onStartCommand 用全新的 Builder 重建（等价用户「拔线再点一次」的效果）。
+            // 只在失败路径触发，健康连接零成本；重开用较短超时，失败场景最多 10s+4s。
+            val firstReason = WiredVpnService.lastFailure()
+            debugLog("wired VPN TUN unavailable${firstReason?.let { ": $it" } ?: ""}; reopening once")
+            tun = requestWiredTun(WIRED_VPN_TUN_REOPEN_TIMEOUT_MILLIS)
+            if (tun == null) {
+                // vc180：把 establish 的真实失败原因带出来（远程日志此前只有这一句无因的
+                // 「unavailable」，看不到是未授权、内核无 TUN 还是 IPv6 ioctl 失败）。
+                val reason = WiredVpnService.lastFailure()
+                lastWiredAttachFailure = reason
+                debugLog("wired VPN TUN unavailable after reopen${reason?.let { ": $it" } ?: ""}")
+                ncm.close()
+                return null
+            }
+            debugLog("wired VPN TUN reopened on retry")
         }
         val server = AirPlayTcpServer()
         when (val result = server.attach(
@@ -4093,6 +4255,9 @@ class CarPlayController(
         private const val IPHONE_WAIT_PROMPT_MILLIS = 10_000L
         private const val MAXIMUM_REENUMERATION_ATTEMPTS = 2
         private const val WIRED_VPN_TUN_TIMEOUT_MILLIS = 10_000L
+        // vc200：establish 失败后整轮重开的等待上限。只在失败路径用，取短值是为了让
+        // 「确定失败」的车机（内核无 TUN 等）不至于把失败场景拖到 10s+10s。
+        private const val WIRED_VPN_TUN_REOPEN_TIMEOUT_MILLIS = 4_000L
         private const val HOTSPOT_START_TIMEOUT_MILLIS = 60_000L
         // vc156（B 级补充路径）：P2P fallback 建组超时（对齐上游 0.2.21 WIFI_P2P_START_TIMEOUT_MILLIS；
         // 信道计划逐项尝试 + 组建 + 接口地址等待，20s 为上游实测值）。

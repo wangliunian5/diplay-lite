@@ -136,6 +136,23 @@ internal class MicrophoneUplink(
     @Volatile private var rootNonZeroSeen = false
     /** 上次发起 root 直采的时刻（`elapsedRealtime`），用于节流重试。 */
     @Volatile private var lastRootAttemptMs = 0L
+    /**
+     * vc200：**预热**。上行一建立就在后台把「su 授权 + 二进制部署」做掉，甚至把 `-W`
+     * 直采流先开好，等 fallback 触发时直接接管。
+     *
+     * 为什么必须预热：vc199 实测 `root fallback #1` 被触发时距离 iPhone `TEARDOWN`
+     * **只剩 419ms**，而 `su 探测 359ms + 部署 371ms = 730ms` —— 光这两步就已经超了，
+     * 结构上不可能成功。把这两步挪到上行建立时刻（t=0），fallback 触发时它们早就完成了。
+     */
+    @Volatile private var prewarmedStream: RootMicStream? = null
+    /** 预热只做一次（每次上行会话）。 */
+    private val preheatStarted = AtomicBoolean(false)
+    /**
+     * 预热线程还在跑（含正在 `open()`）。fallback 触发时若它还没跑完，**必须等它**，
+     * 否则两边各起一个 `-W`：两个采集进程抢同一个 ALSA 节点（`d1` 本来就常年 EBUSY），
+     * 而且白烧一轮 400ms 试探 —— 这段窗口一毫秒都浪费不起。
+     */
+    private val preheatInFlight = AtomicBoolean(false)
 
     // ── vc198：首读指纹（判「真采集」还是「AudioFlinger 静音填充」）─────────────
     // 2026-10-29 剖析 FE6 唯一成功的那次（1.1.3，`peak=2118`）得到两个正交指标：
@@ -164,6 +181,11 @@ internal class MicrophoneUplink(
 
     fun start(): Boolean {
         if (!running.compareAndSet(false, true)) return true
+
+        // vc200：上行一建立就预热 root 兜底（su 授权 + 二进制部署 + 可能的话先开直采流）。
+        // 必须在这里而不是 fallback 触发时：后者只剩 419ms，做不完 730ms 的 su+部署。
+        // 不阻塞本函数——预热在独立线程里跑，AudioRecord 主路径照旧先走。
+        preheatRootSource()
 
         // 上行编码器选择：统一走 OpusEncoderSupport 选择层（移植自上游 0.2.21
         // MicrophoneOpusEncoders，vc156）。本分支（API16）没有 MediaCodec OPUS 编码器，
@@ -1041,6 +1063,85 @@ internal class MicrophoneUplink(
     }
 
     /**
+     * vc200：**root 兜底预热** —— 把「su 授权 + 二进制部署（+ 预开直采流）」从 fallback
+     * 触发时刻提前到**上行建立时刻**。
+     *
+     * 时间线对比（FE6 / vc199 实测）：
+     * ```
+     * 旧：uplink started ──1.4s AudioRecord 判失败──▶ fallback #1（此刻距 TEARDOWN 只剩 419ms）
+     *          └─ 在这里才开始 su 探测 359ms + 部署 371ms = 730ms ⇒ 永远赶不上
+     * 新：uplink started ─┬─ 预热线程：su 359ms + 部署 371ms ≈ 0.73s 完成
+     *                     └─ AudioRecord 主路径照常跑，互不影响
+     *     1.4s fallback 触发时 su/二进制已就绪，可立即 open() 接管
+     * ```
+     *
+     * 只在 FE6 兜底开启时生效（`rootMicSource != null` + `keepAliveUplink`）；非 FE6 机型
+     * 这两个条件都不满足，本函数是空转，不影响既有行为。
+     */
+    private fun preheatRootSource() {
+        val source = rootMicSource ?: return
+        if (!keepAliveUplink) return
+        if (sawNonZeroAudio) return
+        if (!preheatStarted.compareAndSet(false, true)) return
+        preheatInFlight.set(true)
+        diagnostics?.invoke(
+            "Microphone root preheat: 上行已建立即预热（su 授权 + 二进制部署），" +
+                "不再等 fallback 触发（vc199 实测那时只剩 419ms）",
+        )
+        Thread({
+            val startedMs = SystemClock.elapsedRealtime()
+            try {
+                if (!source.isAvailable()) {
+                    diagnostics?.invoke(
+                        "Microphone root preheat: su 不可用或二进制缺失，" +
+                            "本会话不再尝试直采（${SystemClock.elapsedRealtime() - startedMs}ms）",
+                    )
+                    return@Thread
+                }
+                diagnostics?.invoke(
+                    "Microphone root preheat: 授权+部署就绪 ${SystemClock.elapsedRealtime() - startedMs}ms",
+                )
+                // AudioRecord 已经自己出真音 ⇒ 不需要直采，省掉一次 -W（它要抢采集节点）。
+                if (!running.get() || sawNonZeroAudio || rootStream != null) return@Thread
+                val openedMs = SystemClock.elapsedRealtime()
+                val stream = source.open()
+                if (stream == null) {
+                    diagnostics?.invoke(
+                        "Microphone root preheat: 预开直采失败（节点全 EBUSY/无权限，" +
+                            "${SystemClock.elapsedRealtime() - openedMs}ms），fallback 时再试",
+                    )
+                    return@Thread
+                }
+                // 判活与赋值必须在同一监视器内完成（release() 是 @Synchronized）：
+                // 否则 release 恰好落在两行之间时，这条流永远不会再被读走，
+                // `-W` 采集子进程占着 ALSA 节点挂到自身 900s 超时才退。
+                synchronized(this) {
+                    if (!running.get() || sawNonZeroAudio) {
+                        runCatching { stream.close() }
+                        return@Thread
+                    }
+                    prewarmedStream = stream
+                }
+                diagnostics?.invoke(
+                    "Microphone root preheat: 预开就绪 node=${stream.node} " +
+                        "${stream.rate}Hz/${stream.channels}ch " +
+                        "（授权+部署+预开共 ${SystemClock.elapsedRealtime() - startedMs}ms），等 fallback 接管",
+                )
+            } catch (error: Throwable) {
+                diagnostics?.invoke(
+                    "Microphone root preheat error: ${error.javaClass.simpleName}: ${error.message}",
+                )
+            } finally {
+                // 无论成败都要放行 fallback 的等待循环，否则它会被这里卡满整个等待窗口。
+                preheatInFlight.set(false)
+            }
+        }, "carplay-mic-preheat").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    /**
      * vc197：root 直采兜底 —— 「语音可用」的执行者。
      *
      * 触发条件（均为实测过的失败形态）：
@@ -1074,13 +1175,44 @@ internal class MicrophoneUplink(
                 "readBytes=$totalReadBytes) → 试 ALSA 直采绕过 AudioFlinger",
         )
         Thread({
-            var stream: RootMicStream? = null
-            try {
-                if (!source.isAvailable()) {
-                    diagnostics?.invoke("Microphone root fallback skipped: su 不可用或直采二进制缺失")
-                    return@Thread
+            // vc200：预热还在跑就等它一小会儿 —— 否则这里会再起一个 `-W`，两个采集进程
+            // 抢同一个 ALSA 节点（`d1` 常年 EBUSY），而且白烧一轮试探。
+            if (prewarmedStream == null && preheatInFlight.get()) {
+                val waitStart = SystemClock.elapsedRealtime()
+                while (
+                    prewarmedStream == null && preheatInFlight.get() && running.get() &&
+                    SystemClock.elapsedRealtime() - waitStart < PREHEAT_WAIT_MILLIS
+                ) {
+                    try {
+                        Thread.sleep(50L)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
                 }
-                stream = source.open()
+                diagnostics?.invoke(
+                    "Microphone root fallback: 等预热 ${SystemClock.elapsedRealtime() - waitStart}ms " +
+                        (if (prewarmedStream != null) "命中，直接接管" else "未命中，转为现场开"),
+                )
+            }
+            // vc200：预热流优先接管 —— 省掉 su 探测 359ms + 部署 371ms + 试开 400ms 一整套。
+            // vc199 实测 fallback 触发时只剩 419ms，光 su+部署就 730ms，全靠这一手才来得及。
+            val prewarmed = prewarmedStream
+            prewarmedStream = null
+            var stream: RootMicStream? = prewarmed
+            if (prewarmed != null) {
+                diagnostics?.invoke(
+                    "Microphone root fallback: 接管预热流 node=${prewarmed.node} " +
+                        "${prewarmed.rate}Hz/${prewarmed.channels}ch（已省掉 su 探测+部署+试开）",
+                )
+            }
+            try {
+                if (stream == null) {
+                    if (!source.isAvailable()) {
+                        diagnostics?.invoke("Microphone root fallback skipped: su 不可用或直采二进制缺失")
+                        return@Thread
+                    }
+                    stream = source.open()
+                }
                 if (stream == null) {
                     diagnostics?.invoke(
                         "Microphone root fallback failed: 直采节点全打不开" +
@@ -1260,8 +1392,6 @@ internal class MicrophoneUplink(
             return null
         }
         synchronized(triedSources) { triedSources.add(opened.source) }
-        val previousEffects = "aec:${if (echoCanceler != null) "on" else "off"} " +
-            "ns:${if (noiseSuppressor != null) "on" else "off"}"
         // vc178（顺序修正）：原实现先 release 旧 AudioRecord、再赋字段、最后才 startRecording()。
         // startRecording 失败时字段已指向一个**从未启动**的新实例、旧实例又已释放，但本函数
         // return null ⇒ 调用方 `if (rotated != null)` 不成立 ⇒ capture 继续读**已释放**的旧
@@ -1272,16 +1402,20 @@ internal class MicrophoneUplink(
             opened.recorder.startRecording()
         } catch (error: Exception) {
             Log.e(TAG, "microphone heal restart failed", error)
-            // 回滚：释放刚建的实例与刚附加的效果，旧实例原样继续工作（字段未被改写）。
+            // 回滚：attachAudioEffects 第一步（vc178 防泄漏）已把旧实例的 AEC/NS 放掉，
+            // 而字段现指向挂在未启动新实例上的效果。先放掉新效果、释放新实例，
+            // 再给旧实例重挂——否则旧源继续收音但平台回声消除永久丢失，
+            // 与文案 "previous source keeps running" 矛盾。
             releaseEffects()
             try {
                 opened.recorder.release()
             } catch (_: Throwable) {
             }
+            val restoredEffects = attachAudioEffects(old)
             diagnostics?.invoke(
                 "Microphone silent-source heal: rotated source=${opened.source} failed to start: " +
                     "${error.message} — rolled back, previous source keeps running " +
-                    "(previous effects $previousEffects)",
+                    "(effects re-attached: $restoredEffects)",
             )
             return null
         }
@@ -1635,8 +1769,17 @@ internal class MicrophoneUplink(
         val currentRootStream = rootStream
         rootStream = null
         rootActive = false
+        // vc200：预热流可能一直没等到 fallback 触发（Siri 很短 / AudioRecord 自己出音），
+        // 这里必须收掉，否则那个 `-W` 子进程会挂到进程结束、还占着采集节点。
+        val currentPrewarmed = prewarmedStream
+        prewarmedStream = null
         try {
             currentRootStream?.close()
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        try {
+            currentPrewarmed?.close()
         } catch (_: Exception) {
             // Best effort.
         }
@@ -1715,6 +1858,15 @@ internal class MicrophoneUplink(
         const val ROOT_SILENT_WINDOWS = 6
         /** 两次 root 直采尝试的最小间隔（su + ALSA open 本身要 1~2s）。 */
         const val ROOT_RETRY_INTERVAL_MILLIS = 4_000L
+        /**
+         * vc200：fallback 等预热的**上限**。
+         *
+         * 单档探测窗口 400ms × 最多 4 档 = 1.6s，加上 su+部署 ~0.73s 可能到 2.3s；但整个
+         * Siri 上行只活 1.8~3.2s，等太久等于放弃。900ms 是折中：预热线程在 fallback 之前
+         * 就启动了约 1.4s，正常在它触发时已经做完 su+部署、正在 `open()`；等 900ms 拿不到
+         * 就自己开，宁可重复也不空等。
+         */
+        const val PREHEAT_WAIT_MILLIS = 900L
         /** pacer 发送失败最多落几条诊断（防止持续故障刷爆日志）。 */
         const val MAX_PACER_SEND_FAILURES = 3
         /**

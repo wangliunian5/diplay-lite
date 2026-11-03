@@ -307,18 +307,7 @@ class ManualHotspotManager(
             null
         } ?: return null
         if (unquote(connectionInfo.ssid) != expectedSsid) return null
-        // API16 适配：WifiInfo.getFrequency() 公开于 API 21；低版本经反射读取
-        // （字段在 4.x 运行时实际存在，仅未进入公开 SDK，且 4.x 无隐藏 API 限制）。
-        val frequency = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            connectionInfo.frequency
-        } else {
-            try {
-                WifiInfo::class.java.getMethod("getFrequency").invoke(connectionInfo) as? Int
-            } catch (_: Throwable) {
-                null
-            }
-        }
-        return frequency?.takeIf { it > 0 }
+        return wifiInfoFrequencyMhz(connectionInfo)
     }
 
     private fun frequencyFromScanResult(localInterface: LocalHotspotInterface): Int? {
@@ -578,4 +567,23 @@ private fun ManualHotspotSecurity.toIap2Security(): Iap2WirelessSecurity = when 
     ManualHotspotSecurity.WPA2 -> Iap2WirelessSecurity.WPA_WPA2
     ManualHotspotSecurity.WPA3_TRANSITION -> Iap2WirelessSecurity.WPA3_TRANSITION
     ManualHotspotSecurity.WPA3 -> Iap2WirelessSecurity.WPA3_ONLY
+}
+
+/**
+ * vc202：从 WifiInfo 读关联频率（MHz），供 ManualHotspotManager 信道观测与
+ * CarPlayController.maybeKickTwoPointFourStation（staKick 2.4G 判定）共用。
+ * API16 适配：WifiInfo.getFrequency() 公开于 API 21；低版本经反射读取
+ * （字段在 4.x 运行时实际存在，仅未进入公开 SDK，且 4.x 无隐藏 API 限制）。
+ */
+internal fun wifiInfoFrequencyMhz(info: WifiInfo): Int? {
+    val frequency = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+        info.frequency
+    } else {
+        try {
+            WifiInfo::class.java.getMethod("getFrequency").invoke(info) as? Int
+        } catch (_: Throwable) {
+            null
+        }
+    }
+    return frequency?.takeIf { it > 0 }
 }

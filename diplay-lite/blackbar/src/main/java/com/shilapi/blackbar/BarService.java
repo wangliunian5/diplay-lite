@@ -57,7 +57,19 @@ public class BarService extends Service {
                 for (String[] argv : cmds) {
                     try {
                         Process p = new ProcessBuilder("su", "-c", join(argv)).start();
-                        p.waitFor();
+                        // 轮询 exitValue + 超时 destroy（对齐 SuShell 纪律）：su 等授权弹窗时
+                        // 裸 waitFor() 会让 bootfix 线程永久悬挂。
+                        boolean exited = false;
+                        for (int waited = 0; waited < 5000; waited += 100) {
+                            Thread.sleep(100);
+                            try {
+                                p.exitValue();
+                                exited = true;
+                                break;
+                            } catch (IllegalThreadStateException ignored) {
+                            }
+                        }
+                        if (!exited) p.destroy();
                     } catch (Exception ignored) {
                     }
                 }
