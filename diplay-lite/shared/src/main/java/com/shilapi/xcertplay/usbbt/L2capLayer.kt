@@ -14,9 +14,10 @@ import java.io.ByteArrayOutputStream
  * 上游通过 host 闭包取 connections/send 并回写 setPeer；此处改为构造注入：
  * [send] = host 的 ACL 发送；[observer] = host 兴趣点（对端用了哪个 PSM）。
  *
- * 与上游的两处偏差（反编译常量复用疑似错位，按标准 L2CAP 布局落，见交付说明）：
- * - CONFIG_RESPONSE：通道按 destCid@2 查、result 取 @6（上游反编译为 @0/@4）；
+ * 与上游的偏差（反编译常量复用疑似错位，按标准 L2CAP 布局落，见交付说明）：
  * - DISCONNECT_RESPONSE：通道按 destCid@0 查（上游反编译为 @2）。
+ * （vc218 修正：CONFIG_RESPONSE 恢复按 DCID@0 查通道 —— @2 是 SCID（对端 CID），
+ * 按它查永远 miss，曾导致 config 应答被丢、SDP 静默；此前误标为"上游错位"。）
  */
 internal class L2capLayer(
     private val services: Map<Int, L2capService>,
@@ -45,6 +46,8 @@ internal class L2capLayer(
         var remoteMtu = 672
         var localConfigured = false
         var remoteConfigured = false
+        /** vc219：config 协商重试次数（对端回 unacceptable/unknown-options 时按 hint 重发）。 */
+        var configRetries = 0
         var service: L2capService? = null
         var handler: L2capChannelHandler? = null
 
@@ -104,6 +107,8 @@ internal class L2capLayer(
             return
         }
         outgoing[key(handle, cid)] = Outgoing(handle, psm, service, onFailed)
+        // vc212：SDP 静默取证——connect 请求/应答打点，定位「正在查询 iAP2 服务…」后无下文卡在哪段
+        Log.i(UsbBtSession.TAG, "l2cap: connect req handle=0x%03x psm=0x%02x cid=%d".format(handle, psm, cid))
         sendSignal(handle, HciCommands.le16(psm) + HciCommands.le16(cid), SIGNAL_CONNECTION_REQUEST)
     }
 
@@ -188,13 +193,17 @@ internal class L2capLayer(
                 val result = le16(data, 4)
                 val k = key(handle, scid)
                 val pending = outgoing[k] ?: return
+                // vc212：SDP 静默取证
+                Log.i(UsbBtSession.TAG, "l2cap: connect rsp psm=0x%02x result=%d".format(pending.psm, result))
                 when (result) {
                     0 -> {
                         outgoing.remove(k)
                         val channel = Channel(handle, pending.psm, scid, destCid)
                         channel.service = pending.service
                         channels[k] = channel
-                        sendSignal(handle, HciCommands.le16(destCid) + HciCommands.le16(0), SIGNAL_CONFIG_REQUEST)
+                        // vc219：CONFIG_REQUEST 显式携带 MTU=672 选项（实测 iPhone 对空选项
+                        // config 回非零 result；显式 MTU 是常规做法且与默认 MTU 一致，无副作用）
+                        sendSignal(handle, HciCommands.le16(destCid) + HciCommands.le16(0) + MTU_OPTION_672, SIGNAL_CONFIG_REQUEST)
                     }
                     1 -> Unit // pending：等对端下一条 response
                     else -> {
@@ -271,15 +280,41 @@ internal class L2capLayer(
             }
             SIGNAL_CONFIG_RESPONSE -> {
                 if (data.size < 8) return
-                // 标准 L2CAP：Source CID@0 / Dest CID@2 / Flags@4 / Result@6；按 Dest CID 查本地通道
-                val destCid = le16(data, 2)
-                val result = le16(data, 6)
+                // 标准 L2CAP CONFIG_RESPONSE：DCID@0 / SCID@2 / Flags@4 / Result@6。
+                // vc218 修复：DCID@0 才是「收到此应答的本机端点」= 我们的 localCid，channels 按它查。
+                // 之前按 @2（SCID=对端 CID）查 → 永远 miss → localConfigured 永不置位 →
+                // maybeOpened 不触发 → SDP 查询发不出去 → iPhone 等 25s 断开（实测 0x13）。
+                val destCid = le16(data, 0)
+                var result = le16(data, 6)
+                var optionsOff = 8
+                // vc220：实测 iPhone 侧 CONFIG_RESPONSE 无 Flags 字段（raw=4100000000000102a002：
+                // DCID=65 + SCID=0 + @4 Result=0x0000 + @6 起 MTU echo）。标准解析 @6 会得到
+                // 0x0201 非法值 → 回落无-Flags 布局按 @4 重解。
+                if (result > 5 && data.size >= 6) {
+                    val alt = le16(data, 4)
+                    if (alt <= 5) {
+                        Log.i(UsbBtSession.TAG, "l2cap: config rsp 无 Flags 布局，按 @4 重解 result=$alt")
+                        result = alt
+                        optionsOff = 6
+                    }
+                }
                 channels[key(handle, destCid)]?.let { channel ->
-                    if (result == 0) {
-                        channel.localConfigured = true
-                        maybeOpened(channel)
-                    } else {
-                        channel.close()
+                    // vc219：原始 payload 打点（result 解析是否错位的最后证据）
+                    Log.i(UsbBtSession.TAG, "l2cap: config rsp cid=%d result=%d raw=%s".format(destCid, result, data.toHex()))
+                    when {
+                        result == 0 -> {
+                            channel.localConfigured = true
+                            maybeOpened(channel)
+                        }
+                        (result == 1 || result == 3) && channel.configRetries < 2 -> {
+                            // unacceptable/unknown options：对端在 options 段给了可接受值 hint，
+                            // 按规范采纳 hint 重发 CONFIG_REQUEST（最多 2 次，防死循环）
+                            channel.configRetries++
+                            val hints = if (data.size > optionsOff) data.copyOfRange(optionsOff, data.size) else MTU_OPTION_672
+                            Log.i(UsbBtSession.TAG, "l2cap: config rsp result=$result，采纳 hint 重发（第 ${channel.configRetries} 次）")
+                            sendSignal(handle, HciCommands.le16(channel.remoteCid) + HciCommands.le16(0) + hints, SIGNAL_CONFIG_REQUEST)
+                        }
+                        else -> channel.close()
                     }
                 }
             }
@@ -345,6 +380,9 @@ internal class L2capLayer(
         reply(handle, SIGNAL_COMMAND_REJECT, HciCommands.le16(0), id)
     }
 
+    /** vc219：config 取证用 hex dump。 */
+    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+
     private fun le16(b: ByteArray, off: Int): Int =
         (b[off].toInt() and 0xff) or ((b[off + 1].toInt() and 0xff) shl 8)
 
@@ -369,5 +407,8 @@ internal class L2capLayer(
         private const val SIGNAL_ECHO_RESPONSE = 9
         private const val SIGNAL_INFORMATION_REQUEST = 10
         private const val SIGNAL_INFORMATION_RESPONSE = 11
+
+        /** vc219：MTU 配置选项（type=1, len=2, value=672/0x02A0），CONFIG_REQUEST 显式携带。 */
+        private val MTU_OPTION_672 = byteArrayOf(1, 2, 0xA0.toByte(), 0x02)
     }
 }

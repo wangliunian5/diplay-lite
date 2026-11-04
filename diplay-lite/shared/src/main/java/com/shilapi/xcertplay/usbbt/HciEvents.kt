@@ -153,6 +153,27 @@ internal sealed class HciEvent {
         override val code get() = 0x36
     }
 
+    /** 0x01：Inquiry 完成（一轮发现结束）。params: status(1)。 */
+    data class InquiryComplete(val status: Int) : HciEvent() {
+        override val code get() = 0x01
+    }
+
+    /** inquiry 发现的一台设备（cod=class of device 24bit；rssi 仅 0x22/0x2F 有；eir 仅 0x2F 有）。 */
+    class InquiryDevice(
+        val addr: BdAddr,
+        val classOfDevice: Int,
+        val rssi: Int?,
+        val eir: ByteArray?,
+    )
+
+    /** vc207：0x02 普通 / 0x22 带 RSSI / 0x2F 扩展（含 EIR）inquiry 结果，统一解析为设备列表。 */
+    data class InquiryResult(
+        val eventCode: Int,
+        val devices: List<InquiryDevice>,
+    ) : HciEvent() {
+        override val code get() = eventCode
+    }
+
     /** 0x13：控制器缓冲区回收计数（流量控制参照，仅日志）。 */
     data class NumberOfCompletedPackets(val params: ByteArray) : HciEvent() {
         override val code get() = 0x13
@@ -174,6 +195,13 @@ internal object HciEvents {
         if (packet.size < 2 + paramLen) return null
         val p = packet.copyOfRange(2, 2 + paramLen)
         return when (code) {
+            0x01 -> if (p.isNotEmpty()) HciEvent.InquiryComplete(p[0].toInt() and 0xff) else null
+            // 0x02：每记录 14B = addr(6) psrm(1) pspm(1) psm(1) cod(3) clock(2)
+            0x02 -> parseInquiryResult(p, eventCode = 0x02, recordLen = 14, codAt = 9, rssiAt = -1, eirAt = -1)
+            // 0x22：每记录 14B = addr(6) psrm(1) reserved(1) cod(3) clock(2) rssi(1)
+            0x22 -> parseInquiryResult(p, eventCode = 0x22, recordLen = 14, codAt = 8, rssiAt = 13, eirAt = -1)
+            // 0x2F：num 恒 1，单记录 254B = addr(6) psrm(1) reserved(1) cod(3) clock(2) rssi(1) eir(240)
+            0x2F -> parseInquiryResult(p, eventCode = 0x2f, recordLen = 254, codAt = 8, rssiAt = 13, eirAt = 14)
             0x03 ->
                 if (p.size >= 11) {
                     HciEvent.ConnectionComplete(
@@ -311,4 +339,38 @@ internal object HciEvents {
 
     private fun le16(b: ByteArray, off: Int): Int =
         (b[off].toInt() and 0xff) or ((b[off + 1].toInt() and 0xff) shl 8)
+
+    /**
+     * vc207：三种 inquiry 结果事件统一解析。rssiAt/eirAt 为记录内偏移（-1=无该字段）。
+     * 记录数与余量不符时截断解析（长度不足返回 null 丢整条，与既有口径一致）。
+     */
+    private fun parseInquiryResult(
+        p: ByteArray,
+        eventCode: Int,
+        recordLen: Int,
+        codAt: Int,
+        rssiAt: Int,
+        eirAt: Int,
+    ): HciEvent.InquiryResult? {
+        if (p.isEmpty()) return null
+        val num = p[0].toInt() and 0xff
+        if (num == 0) return HciEvent.InquiryResult(eventCode, emptyList())
+        if (p.size < 1 + num * recordLen) return null
+        val devices = ArrayList<HciEvent.InquiryDevice>(num)
+        for (i in 0 until num) {
+            val off = 1 + i * recordLen
+            val cod = (p[off + codAt].toInt() and 0xff) or
+                ((p[off + codAt + 1].toInt() and 0xff) shl 8) or
+                ((p[off + codAt + 2].toInt() and 0xff) shl 16)
+            devices.add(
+                HciEvent.InquiryDevice(
+                    addr = BdAddr.of(p, off),
+                    classOfDevice = cod,
+                    rssi = if (rssiAt >= 0) p[off + rssiAt].toInt() else null,
+                    eir = if (eirAt >= 0) p.copyOfRange(off + eirAt, off + eirAt + 240) else null,
+                ),
+            )
+        }
+        return HciEvent.InquiryResult(eventCode, devices)
+    }
 }

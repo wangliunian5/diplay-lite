@@ -11,6 +11,9 @@ package com.shilapi.xcertplay.usbbt
 internal object HciCommands {
     // opcode(ogf, ocf) 现算；const val 不能调函数，落字面量
     const val CREATE_CONNECTION: Int = 0x0405 // opcode(1, 5)
+    const val CREATE_CONNECTION_CANCEL: Int = 0x0408 // opcode(1, 8) —— vc232：对端 incoming 抢占时取消在飞 page
+    const val INQUIRY: Int = 0x0401 // opcode(1, 1) —— vc207：附近设备发现（异步命令，无 CC）
+    const val INQUIRY_CANCEL: Int = 0x0402 // opcode(1, 2) —— vc207：停止发现（有 CC）
     const val DISCONNECT: Int = 0x0406 // opcode(1, 6)
     const val ACCEPT_CONNECTION_REQUEST: Int = 0x0409 // opcode(1, 9)
     const val REJECT_CONNECTION_REQUEST: Int = 0x040a // opcode(1, 10)

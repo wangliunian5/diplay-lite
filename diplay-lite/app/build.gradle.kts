@@ -5,6 +5,14 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// vc202+1（08-路线图 §7.6 条目）：release 签名「静默回落」改「大声失败/醒目告警」。
+// 提到文件作用域，供 android{} 内 signingConfigs 与 ciRelease 任务共用同一份判据，防漂移。
+// 判据语义不变：环境变量 ANDROID_KEYSTORE_PATH 优先；缺省回落 SDK 标准 debug keystore。
+val releaseKeystoreEnvSet = !System.getenv("ANDROID_KEYSTORE_PATH").isNullOrBlank()
+val releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
+    ?: "${System.getProperty("user.home")}${File.separator}.android${File.separator}debug.keystore"
+val releaseKeystoreUsable = releaseKeystorePath.isNotBlank() && File(releaseKeystorePath).exists()
+
 android {
     namespace = "com.shilapi.diplay.lite"
     compileSdk = 34
@@ -21,8 +29,8 @@ android {
         // 覆盖；出包时改错一处即打错版本，已移除。
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
-        versionCode = 202
-        versionName = "1.3.0-vc202"
+        versionCode = 238
+        versionName = "1.3.2-vc238"
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties
@@ -59,10 +67,8 @@ android {
     // docs/BUILD.md 手动打包约定的固化：任何环境 ./gradlew ciRelease 无需记环境变量
     // 直接产出已签名 APK。debug 凭据为 SDK 通用值，无个人路径/机密入仓，开源分支同步
     // 安全；keystore 文件不存在且未配环境变量时保持未签名（纯源码环境语义不变）。
-    val releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
-        ?: "${System.getProperty("user.home")}${File.separator}.android${File.separator}debug.keystore"
-    val releaseKeystoreUsable = releaseKeystorePath.isNotBlank() && File(releaseKeystorePath).exists()
-
+    // vc202+1：路径判据已上移到文件顶部（releaseKeystorePath/releaseKeystoreUsable），
+    // ciRelease 对「keystore 缺失」硬失败、对「回落 debug key」醒目告警，不再静默。
     signingConfigs {
         if (releaseKeystoreUsable) {
             create("release") {
@@ -228,11 +234,32 @@ tasks.named("preBuild").configure {
 // 用法：./gradlew ciRelease（无需任何环境变量，签名走上方固化缺省）。
 // 产物复制到仓库 apks/DiPlay-<versionName>-cluster1-vc<versionCode>.apk（与既有
 // 归档命名一致）；归档目录可用 DIPLAY_APK_ARCHIVE_DIR 覆盖（独立 clone 无上级 apks 时）。
+// vc202+1：签名「静默回落」改「大声失败」——
+//   · keystore 缺失（未设 ANDROID_KEYSTORE_PATH 且缺省 debug.keystore 不存在）→ 硬失败，
+//     不再静默产出未签名包；纯源码编译请改用 assembleRelease（语义不变）；
+//   · 回落 debug key（未设 ANDROID_KEYSTORE_PATH 但 debug.keystore 存在）→ 醒目告警，
+//     这是 docs/BUILD.md 固化的开发约定，不失败；产物名不变（归档命名被 apks/ 历史引用）。
 tasks.register("ciRelease") {
     group = "build"
     description = "Signed release build + archive APK to repo apks/ (vc154 signing-solidified CI task)"
     dependsOn("assembleRelease")
     doLast {
+        if (!releaseKeystoreUsable) {
+            throw GradleException(
+                "ciRelease：缺少签名 keystore，拒绝产出未签名的对外包。\n" +
+                    "  现状：ANDROID_KEYSTORE_PATH 未设置，且缺省 ${releaseKeystorePath} 不存在。\n" +
+                    "  配置方法：设置 ANDROID_KEYSTORE_PATH / ANDROID_KEYSTORE_PASSWORD / " +
+                    "ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD 四个环境变量指向正式密钥；" +
+                    "开发机也可放一份 SDK debug.keystore 到上述缺省路径。\n" +
+                    "  若只是纯源码编译验证（不需要签名），请改用 assembleRelease。"
+            )
+        }
+        if (!releaseKeystoreEnvSet) {
+            println(
+                "⚠️⚠️⚠️ ciRelease：未设置 ANDROID_KEYSTORE_PATH，本包用 SDK debug key 签名" +
+                    "（$releaseKeystorePath）——仅限开发/外测分发，正式发布请配置正式密钥环境变量。 ⚠️⚠️⚠️"
+            )
+        }
         val versionName = android.defaultConfig.versionName as String
         val versionCode = android.defaultConfig.versionCode
         val output = file("build/outputs/apk/release/app-release.apk")

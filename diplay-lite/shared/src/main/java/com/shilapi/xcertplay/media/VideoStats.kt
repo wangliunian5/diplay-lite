@@ -16,6 +16,11 @@ internal class VideoStats(
     private var backlogs = 0
     private var inputStalled = 0
     private var flushes = 0
+    // vc235（VID-234-01 / A0）：渲染侧丢帧**归因**计数——只观测，不参与任何调度/丢弃决策。
+    // superseded = 同一轮 drain 里又有新帧出队，旧 pending 被 releaseOutputBuffer(index,false) 丢弃；
+    // dueGated   = 该上屏时 16ms 门控（RENDER_MIN_INTERVAL_NS）未到期而未上屏（即使没有新帧）。
+    private var superseded = 0
+    private var dueGated = 0
     private var bytes = 0L
     private var maxArrivalGapNs = 0L
     private var touchSamples = 0
@@ -46,6 +51,13 @@ internal class VideoStats(
 
     @Synchronized fun onBacklog() { backlogs++ }
 
+    /** vc235：旧 pending 帧被"新帧到达"取代而丢弃（`releaseOutputBuffer(index, false)`）。 */
+    @Synchronized fun onSuperseded() { superseded++ }
+
+    /** vc235：该上屏时 16ms 门控未到期 → 本次不上屏（不是被新帧取代）。 */
+    @Synchronized fun onDueGated() { dueGated++ }
+
+
     @Synchronized fun onInputStalled() { inputStalled++ }
 
     @Synchronized fun onFlush() { flushes++ }
@@ -71,11 +83,11 @@ internal class VideoStats(
         val heapUsedMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
         val heapMaxMb = runtime.maxMemory() / (1024 * 1024)
         val line = ("video stats$label rx=%.1ffps shown=%.1ffps maxGap=%dms kbps=%d recoveries=%d " +
-            "backlog=%d stalled=%d flush=%d " +
+            "backlog=%d stalled=%d flush=%d superseded=%d dueGated=%d " +
             "heap=%d/%dMB touch2frame avg=%dms max=%dms n=%d touchSendMax=%dms").format(
             rx, shown, maxGapMs,
             (bytes * 8 / 1000 / seconds).toLong(), recoveries,
-            backlogs, inputStalled, flushes,
+            backlogs, inputStalled, flushes, superseded, dueGated,
             heapUsedMb, heapMaxMb,
             touchAvgMs, maxTouchLatencyNs / 1_000_000, touchSamples, TouchLatencyProbe.maxSendNs / 1_000_000,
         ) + " " + (processLoad.sample(now) ?: "cpu=? threads=?")
@@ -83,6 +95,7 @@ internal class VideoStats(
         Log.i(TAG, line)
         windowStartNs = now
         received = 0; rendered = 0; recoveries = 0; backlogs = 0; inputStalled = 0; flushes = 0
+        superseded = 0; dueGated = 0
         bytes = 0; maxArrivalGapNs = 0
         touchSamples = 0; touchLatencySumNs = 0; maxTouchLatencyNs = 0
         return line

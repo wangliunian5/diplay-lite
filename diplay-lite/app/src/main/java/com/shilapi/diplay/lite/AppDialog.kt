@@ -1,6 +1,7 @@
 package com.shilapi.diplay.lite
 
 import android.app.Activity
+import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.KeyEvent
@@ -54,6 +55,12 @@ class AppDialog private constructor(
     private var showing = false
     private var cancelled = false
 
+    /** vc207：内容限高占视口比例（默认 0.7；横屏配对窗放宽到 0.9）。show() 前设置生效。 */
+    internal var maxHeightFraction = 0.7f
+
+    /** vc207：底栏按钮高度 dp（默认 46；横屏 dbar 36）。改完需 renderButtons() 重绘。 */
+    internal var buttonHeightDp = 46
+
     // 单选列表（setSingleChoiceItems）
     internal var singleItems: Array<out String>? = null
     internal var singleChecked = -1
@@ -73,9 +80,15 @@ class AppDialog private constructor(
             positive = if (onClick == null) {
                 ButtonSpec(text) { it.dismiss() }
             } else {
-                ButtonSpec(text, onClick)
+                ButtonSpec(text, onClick = onClick)
             },
         )
+        renderButtons()
+    }
+
+    /** vc206：运行期整组换按钮（配对窗三态切换；null=移除该侧按钮）。 */
+    internal fun setButtons(negative: ButtonSpec?, positive: ButtonSpec?) {
+        spec = spec.copy(negative = negative, positive = positive)
         renderButtons()
     }
 
@@ -100,7 +113,7 @@ class AppDialog private constructor(
         ).apply { gravity = Gravity.CENTER }
         // 内容区「包内容、限高 70% 视口」——不能写死高度，否则短内容（如退出确认）
         // 会在正文与按钮之间留出一大段空白（K60 实测：固定 70% 高时中间空 ~900px）
-        scroller.maxHeight = (hostH * 0.7f).toInt()
+        scroller.maxHeight = (hostH * maxHeightFraction).toInt()
         scroller.layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -134,6 +147,16 @@ class AppDialog private constructor(
     }
 
     fun isShowing(): Boolean = showing
+
+    /**
+     * vc238：内容滚动区的真实可视高度（show 且至少完成一次布局后有效；0=尚未就绪）。
+     * 供横屏双列按实际视口校正列高，避免依赖 dialog 尚未就绪时的屏幕尺寸估算。
+     */
+    internal fun contentViewportHeight(): Int {
+        if (scroller.height <= 0) return 0
+        val content = scroller.getChildAt(0) ?: return 0
+        return scroller.height - content.paddingTop - content.paddingBottom
+    }
 
     internal fun wire(cancelable: Boolean) {
         overlay.setOnClickListener { if (cancelable) cancel() }
@@ -183,10 +206,10 @@ class AppDialog private constructor(
                 })
             }
             buttonBar.addView(
-                pillButton(bs.text) { bs.onClick(this) },
+                pillButton(bs),
                 LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.WRAP_CONTENT,
-                    dp(46),
+                    dp(buttonHeightDp),
                 ),
             )
         }
@@ -194,21 +217,60 @@ class AppDialog private constructor(
 
     private fun dp(v: Int): Int = (v * activity.resources.displayMetrics.density).toInt()
 
-    private fun pillButton(text: String, onClick: () -> Unit): TextView =
+    private fun pillButton(bs: ButtonSpec): TextView =
         TextView(activity).apply {
-            this.text = text
+            text = bs.text
             textSize = 15f
-            setTextColor(Ui.PRIMARY_ON)
             gravity = Gravity.CENTER
             setPadding(dp(18), 0, dp(18), 0)
-            background = GradientDrawable().apply {
-                setColor(Ui.ACCENT)
-                cornerRadius = dp(6).toFloat()
+            when (bs.style) {
+                ButtonSpec.STYLE_LINE -> {
+                    // 设计稿 .dbtn.line：透明底 + ACCENT 描边 + ACCENT 字
+                    setTextColor(Ui.ACCENT)
+                    background = GradientDrawable().apply {
+                        setColor(Color.TRANSPARENT)
+                        cornerRadius = dp(6).toFloat()
+                        setStroke(dp(1), Ui.ACCENT)
+                    }
+                }
+                ButtonSpec.STYLE_GRAY -> {
+                    setTextColor(0xFF7F91AB.toInt())
+                    background = GradientDrawable().apply {
+                        setColor(0x852E3B52.toInt())
+                        cornerRadius = dp(6).toFloat()
+                    }
+                }
+                else -> {
+                    setTextColor(Ui.PRIMARY_ON)
+                    background = GradientDrawable().apply {
+                        setColor(Ui.ACCENT)
+                        cornerRadius = dp(6).toFloat()
+                    }
+                }
             }
-            setOnClickListener { onClick() }
+            isEnabled = bs.enabled
+            if (bs.enabled) {
+                setOnClickListener { bs.onClick(this@AppDialog) }
+            }
         }
 
-    internal data class ButtonSpec(val text: String, val onClick: (AppDialog) -> Unit)
+    internal data class ButtonSpec(
+        val text: String,
+        val style: Int = STYLE_PRIMARY,
+        val enabled: Boolean = true,
+        val onClick: (AppDialog) -> Unit,
+    ) {
+        companion object {
+            /** ACCENT 实心主按钮（原有默认形态）。 */
+            const val STYLE_PRIMARY = 0
+
+            /** vc206：线框次按钮（取消/关闭；设计稿 §03 .dbtn.line）。 */
+            const val STYLE_LINE = 1
+
+            /** vc206：置灰禁用（配对进行中占位；设计稿 .dbtn.gray：底 #2E3B52@52%、字 #7F91AB）。 */
+            const val STYLE_GRAY = 2
+        }
+    }
 
     internal data class Spec(
         val negative: ButtonSpec?,

@@ -9,8 +9,11 @@ import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.Process
 import android.util.Log
+import android.view.Choreographer
 import android.view.Surface
 import com.shilapi.xcertplay.airplay.AudioCodecKind
 import com.shilapi.xcertplay.airplay.AudioFormat
@@ -112,6 +115,11 @@ class AndroidMediaSink(
      */
     private val keepAliveUplink: Boolean = false,
     /**
+     * vc238：麦克风收音增益（dB，0=关闭）。取值回调——每次上行建流现读，设置页调整后
+     * 下一次发声即生效（无需重连）。未注入时恒 0，与历史版本逐字节一致。
+     */
+    private val microphoneGainDb: () -> Int = { 0 },
+    /**
      * 1.1.4（ECARX 媒体中心冒充桥）：CarPlay 媒体流（audioType=media）首包到达时
      * 触发，上层据此通知 EcarxMediaCenterBridge 显式抢占 ONLINE 音源。电话/导航/
      * Siri 流不触发。
@@ -125,7 +133,63 @@ class AndroidMediaSink(
      * 音视频双静默 = 会话实质死亡的媒质层判据（用户暂停音乐只停音频、视频仍在推）。
      */
     private val onMediaStall: (() -> Unit)? = null,
+    /**
+     * vc236（VID-234-01 / A2）：视频渲染改 VSYNC 节拍。false=现状（16ms 时间门控，默认）；
+     * true=每个显示刷新周期最多上屏一帧，避免早到帧被时间门控整帧丢弃。
+     * 重连（重建 sink）后生效。
+     */
+    private val videoVsyncPacing: Boolean = false,
+    /**
+     * vc237（VID-234-01 / A1）：待渲帧不合并。false=现状（与 vc236 等价：后到帧释放旧
+     * pending 帧并计入 superseded）；true=按到达顺序保留待渲帧，每个 VSYNC 序号上屏一帧，
+     * 允许积压（靠既有 backlog/stalled 兜底）。默认 false；重连（重建 sink）后生效。
+     */
+    private val videoNoCoalesce: Boolean = false,
 ) : MediaSink {
+    /**
+     * vc236：VSYNC 节拍器。Choreographer 自 API16 起可用；独立 HandlerThread 上持续
+     * postFrameCallback，对外只暴露「VSYNC 序号」。只用到 API16 的 `getInstance()` 与
+     * `postFrameCallback(FrameCallback)`，不碰 API21+ 重载；启动失败时 seq 保持 0，
+     * 调用方自动回落 16ms 时间门控（安全路径）。
+     */
+    private class VsyncPacer {
+        private val thread = HandlerThread("carplay-vsync")
+        private val handler: Handler
+        @Volatile var seq: Long = 0L
+            private set
+
+        init {
+            thread.start()
+            handler = Handler(thread.looper)
+            handler.post {
+                try {
+                    val choreographer = Choreographer.getInstance()
+                    choreographer.postFrameCallback(object : Choreographer.FrameCallback {
+                        override fun doFrame(frameTimeNanos: Long) {
+                            seq++
+                            choreographer.postFrameCallback(this)
+                        }
+                    })
+                } catch (error: Throwable) {
+                    Log.w("xcertplay-usb", "vsync pacer unavailable: ${error.javaClass.simpleName}")
+                }
+            }
+        }
+
+        fun close() {
+            // quit()（API1）而非 quitSafely（API18）：minSdk 16 硬约束。
+            runCatching { thread.quit() }
+        }
+    }
+
+    private val vsyncPacer: VsyncPacer? = if (videoVsyncPacing) {
+        Log.i("xcertplay-usb", "video vsync pacing: enabled")
+        VsyncPacer()
+    } else null
+    // vc237（A1）：待渲帧不合并模式的启动打点（与 A2 开关独立；便于日志判定三组对照）。
+    init {
+        if (videoNoCoalesce) Log.i("xcertplay-usb", "video no-coalesce: enabled")
+    }
     private val screenStateLock = Any()
     private val activeScreenTypes = mutableSetOf<Int>()
     private val defaultSurface = surface
@@ -304,6 +368,7 @@ class AndroidMediaSink(
                 microphoneMuteRestore,
                 rootMicSource,
                 keepAliveUplink,
+                microphoneGainDb,
             )
             val raced = microphoneUplinks.putIfAbsent(type, created)
             uplink = raced ?: created
@@ -355,6 +420,8 @@ class AndroidMediaSink(
         }
         videoDecoders.values.forEach(VideoDecoder::close)
         videoDecoders.clear()
+        // vc236（A2）：会话结束停掉 VSYNC 节拍线程（未开启时为空操作）。
+        vsyncPacer?.close()
         videoRecoveryHandlers.clear()
         videoDiagnosticHandlers.clear()
         recoveryExecutor.shutdownNow()
@@ -386,6 +453,10 @@ class AndroidMediaSink(
             requestKeyFrame = { requestVideoRecovery(type) },
             report = { videoDiagnosticHandlers[type]?.invoke(it) },
             onOutputSizeChanged = onVideoOutputSizeChanged,
+            // vc236（A2）：VSYNC 序号提供者。0 = 开关关闭或 pacer 未就绪 → 解码器回落 16ms 门控。
+            vsyncPacingSeq = { vsyncPacer?.seq ?: 0L },
+            // vc237（A1）：待渲帧不合并（默认关；关时逐字节等价于 vc236 的合并策略）。
+            noCoalesce = videoNoCoalesce,
         )
         return videoDecoders.putIfAbsent(type, created) ?: created
     }
@@ -472,6 +543,10 @@ private class VideoDecoder(
     private val requestKeyFrame: () -> Unit,
     private val report: (String) -> Unit,
     private val onOutputSizeChanged: ((Int, Int) -> Unit)? = null,
+    /** vc236（A2）：当前 VSYNC 序号（0=未启用/未就绪，回落 16ms 时间门控）。 */
+    private val vsyncPacingSeq: () -> Long = { 0L },
+    /** vc237（A1）：待渲帧不合并（true 时按 VSYNC 逐帧上屏，允许积压）。 */
+    private val noCoalesce: Boolean = false,
 ) : Closeable {
     private val queue = VideoDecodeQueue()
     @Volatile private var running = true
@@ -502,6 +577,11 @@ private class VideoDecoder(
     // 8815 实测绿线仍在。加最小渲染间隔（≈一帧显示周期）：间隔内的帧跳过不上屏，
     // 静态画面由 Surface 保留上一帧显示。仅解码线程访问，无需 volatile。
     private var lastRenderRequestNs = 0L
+    // vc236（A2）：上一次上屏时的 VSYNC 序号（仅解码线程访问）。
+    private var lastRenderVsyncSeq = 0L
+    // vc237（A1）：待渲输出缓冲队列（仅在 noCoalesce=true 时使用；仅解码线程访问）。
+    // 关开关时完全不走这里，合并行为与 vc236 一致。队列长度天然受解码器输出缓冲个数限制。
+    private val pendingOutputs = java.util.ArrayDeque<Int>()
     // M6k：最近一次喂入的帧是不是随机访问帧（IDR）。解码失败时落盘，用于判读"是否从 P 帧续解"。
     @Volatile private var lastFrameKeyFrame = true
     // 1.0.29（AC8227 倒车闪屏）：恢复看门狗计数——关键帧连发无渲染 = control 通道疑似死亡。
@@ -800,6 +880,8 @@ private class VideoDecoder(
             // API16 适配：setOutputSurface 是 API 23+，低版本没有该能力，直接重建解码器。
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 try {
+                    // vc237（A1）：换 surface 前把待渲帧归还旧 surface，避免旧帧渲到新 surface。
+                    discardPendingOutputs(codec)
                     codec.setOutputSurface(surface)
                     Log.i(TAG, "video decoder output surface updated")
                     // 新 surface 上首帧必须来自干净 IDR（旧 surface 的在途帧到新 surface 上就是花屏/绿线）。
@@ -933,6 +1015,8 @@ private class VideoDecoder(
     /** M6k：清空解码器在途帧（不释放组件）。失败则退化为重建，保证下次喂帧前状态一致。 */
     private fun flushDecoder() {
         val codec = decoder ?: return
+        // vc237（A1）：flush 后旧输出索引失效，先把仍在排队的待渲帧归还。
+        discardPendingOutputs(codec)
         try {
             codec.flush()
             stats.onFlush()
@@ -969,17 +1053,63 @@ private class VideoDecoder(
         // 等没有新帧时才真正渲染最新帧 —— burst 期间合成量 N→1，撕裂源消失。
         var pendingIndex = -1
         fun renderPending(): Boolean {
-            if (pendingIndex >= 0) {
+            // vc237（A1）：待渲帧先出队；未到节拍再放回队首。关开关仍走原 pendingIndex，
+            // 合并/丢弃行为与 vc236 逐字节一致。加锁只为防 close/flush 线程并发清队。
+            val index = if (noCoalesce) {
+                synchronized(pendingOutputs) {
+                    if (pendingOutputs.isEmpty()) -1 else pendingOutputs.removeFirst()
+                }
+            } else pendingIndex
+            if (index >= 0) {
                 // 1.1.3 修复（8815 011235 无画面定案②）：**不得按 info.size 过滤**——Surface 输出模式下
                 // 高通 OMX 的输出 BufferInfo.size 恒为 0（数据直送 surface，size 无意义），
                 // 按 size>0 过滤会把每一帧都当"零长度填充"静默丢掉 → shown=0 全黑。
                 // 渲染判据只看 surface、renderHold 与渲染节奏间隔。
                 val nowNs = System.nanoTime()
-                val due = lastRenderRequestNs == 0L || nowNs - lastRenderRequestNs >= RENDER_MIN_INTERVAL_NS
+                // vc236（VID-234-01 / A2）：开关打开且 pacer 已有 VSYNC 序号时，按「每个刷新周期
+                // 最多一帧」放行；pacer 未就绪（seq=0，含线程启动失败）或开关关闭时，一律回落
+                // 16ms 时间门控——低版本/异常走安全路径，行为与 vc235 完全一致。
+                val vsyncSeq = vsyncPacingSeq()
+                val vsyncDriven = vsyncSeq != 0L
+                val due = if (vsyncDriven) {
+                    lastRenderRequestNs == 0L || lastRenderVsyncSeq != vsyncSeq
+                } else {
+                    lastRenderRequestNs == 0L || nowNs - lastRenderRequestNs >= RENDER_MIN_INTERVAL_NS
+                }
                 val render = outputSurface != null && !renderHold && due
-                if (render) lastRenderRequestNs = nowNs
-                codec.releaseOutputBuffer(pendingIndex, render)
-                pendingIndex = -1
+                // vc235（VID-234-01 / A0）：纯观测——门控/VSYNC 判据未放行且 surface 正常、
+                // 非恢复挂起，说明这一帧是被节奏挡掉（不是因为来了新帧）。不参与 render 判定。
+                // vc237（A1）：不合并模式下未放行的帧仍留在队列（延后而非丢弃），不计 dueGated。
+                if (!render && !noCoalesce && outputSurface != null && !renderHold && !due) {
+                    stats.onDueGated()
+                }
+                if (render) {
+                    lastRenderRequestNs = nowNs
+                    if (vsyncDriven) lastRenderVsyncSeq = vsyncSeq
+                }
+                // vc237（A1）：不合并且未到 VSYNC 时**不归还**缓冲——帧放回队首等下一次节拍；
+                // 合并模式与 vc236 完全相同（无论是否渲染都归还缓冲）。
+                if (render || !noCoalesce) {
+                    if (noCoalesce) {
+                        try {
+                            codec.releaseOutputBuffer(index, render)
+                        } catch (_: Exception) {
+                            // close/flush 竞态：组件正在拆除，归还失败按 best effort 处理。
+                        }
+                    } else {
+                        codec.releaseOutputBuffer(index, render)
+                        pendingIndex = -1
+                    }
+                } else if (outputSurface != null && !renderHold) {
+                    synchronized(pendingOutputs) { pendingOutputs.addFirst(index) }
+                } else {
+                    // 无 surface / 恢复挂起：不积压，直接归还，避免解码器输出缓冲被长期占用。
+                    try {
+                        codec.releaseOutputBuffer(index, false)
+                    } catch (_: Exception) {
+                        // Best effort：组件可能正在拆除。
+                    }
+                }
                 if (render) {
                     stats.onRendered()
                     lastRenderNanos = nowNs // vc150：静默渲染看门狗的「上次渲染」基准
@@ -1008,9 +1138,24 @@ private class VideoDecoder(
                     logOutputFormat(codec.outputFormat)
                 }
                 index >= 0 -> {
-                    // 上一帧被更新帧取代：静默归还，不上合成器。
-                    if (pendingIndex >= 0) codec.releaseOutputBuffer(pendingIndex, false)
-                    pendingIndex = index
+                    if (noCoalesce) {
+                        // vc237（A1）：不合并——后到帧不再挤掉待渲帧，按到达顺序入队。
+                        // 恢复挂起期（renderHold，等干净 IDR）不积压旧流帧，直接归还。
+                        if (renderHold) {
+                            codec.releaseOutputBuffer(index, false)
+                        } else {
+                            synchronized(pendingOutputs) { pendingOutputs.addLast(index) }
+                        }
+                    } else {
+                        // 上一帧被更新帧取代：静默归还，不上合成器。
+                        // vc235（VID-234-01 / A0）：只加归因计数——口径=因新帧到达而
+                        // releaseOutputBuffer(pendingIndex, false) 丢弃；不改变合并策略。
+                        if (pendingIndex >= 0) {
+                            codec.releaseOutputBuffer(pendingIndex, false)
+                            stats.onSuperseded()
+                        }
+                        pendingIndex = index
+                    }
                 }
                 // 负值未知码（防御）：与 TRY_AGAIN 同样必须退出，防忙循环。
                 else -> { renderPending(); return }
@@ -1052,11 +1197,32 @@ private class VideoDecoder(
         )
     }
 
+    /**
+     * vc237（A1）：归还所有待渲输出缓冲。flush / 换 surface / 重建之前必须调用，否则被持有
+     * 的缓冲会悬空（flush 后索引失效，或渲到旧 surface）。关开关时队列恒空，零额外开销。
+     * 仅解码线程访问（与 drainOutput 同线程）。
+     */
+    private fun discardPendingOutputs(codec: MediaCodec) {
+        while (true) {
+            val index = synchronized(pendingOutputs) {
+                if (pendingOutputs.isEmpty()) -1 else pendingOutputs.removeFirst()
+            }
+            if (index < 0) return
+            try {
+                codec.releaseOutputBuffer(index, false)
+            } catch (_: Exception) {
+                // Best effort：flush/stop 前后该索引可能已失效。
+            }
+        }
+    }
+
     @Synchronized
     private fun releaseDecoder() {
         val codec = decoder
         decoder = null
         if (codec != null) {
+            // vc237（A1）：重建前归还待渲帧，避免缓冲悬空。
+            discardPendingOutputs(codec)
             try {
                 codec.stop()
             } catch (_: Exception) {

@@ -47,6 +47,15 @@ data class LiteConfig(
     // 开 = 音乐起播/复播水位抬到约 1s，抗 Wi-Fi 断流；关 = 维持 mediaBufferMillis 原阈值
     // （起播更快）。仅媒体流生效，通话/Siri 低延迟流不受影响；重新连接后生效。
     val audioPrebuffer: Boolean = true,
+    // vc236（VID-234-01 / A2）：视频渲染改 VSYNC（Choreographer）节拍。
+    // vc238：A2 升为默认开启且**不再保留开关**（它修的是绿线这类可见缺陷，不该由用户关掉）；
+    // 旧键 video_vsync_pacing 由 migrateVideoRenderDefaults() 一次性清理。
+    // vc237（VID-234-01 / A1）：视频待渲帧不合并（按 VSYNC 逐帧上屏，允许积压）。
+    // vc238：默认改为开；仍保留开关（体验优化区），旧键的 false 由迁移一次性重置为新语义。
+    val videoNoCoalesce: Boolean = true,
+    // vc238：麦克风收音增益（dB）。0=关闭（默认，逐样点零处理，行为与历史版本一致）；
+    // 1~10 = 10^(dB/20) 放大 + 软膝峰值限幅。上下限/默认值集中在下方常量，只改一处即可。
+    val micGainDb: Int = DEFAULT_MIC_GAIN_DB,
     // vc166（外置 USB 蓝牙 dongle 实验第一步）：仅控制设置页探测显示，
     // 不参与任何连接逻辑（协议栈未移植；本开关无实际功能作用）。
     val usbBtDongle: Boolean = false,
@@ -112,6 +121,11 @@ data class LiteConfig(
         // 压低上限放宽到 100：用户可以选择"不压低"（100 = 等于没压）。
         const val MIN_DUCK_PERCENT = 30
         const val MAX_DUCK_PERCENT = 100
+        // vc238：麦克风收音增益（dB）。0 = 关闭（默认，行为与历史版本逐字节一致）；
+        // 1~10 = 10^(dB/20) 放大。上下限与默认值只在这里维护，UI/DSP/持久化统一引用。
+        const val MIN_MIC_GAIN_DB = 0
+        const val MAX_MIC_GAIN_DB = 10
+        const val DEFAULT_MIC_GAIN_DB = 0
 
         // vc184：HCI 本地名称上限（248 字节），超出回落默认名。
         const val MAX_USB_BT_NAME_BYTES = 248
@@ -178,8 +192,64 @@ data class LiteConfig(
         fun activeChannelOf(context: Context): String =
             readActiveChannel(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE))
 
+        /** vc206：只取「外置蓝牙」开关单键，供主页 500ms tick 门槛判定（同 activeChannelOf 的轻量理由）。 */
+        fun usbBtDongleOf(context: Context): Boolean =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("usb_bt_dongle", false)
+
+        /**
+         * vc238：只取「麦克风收音增益」单键。上行采集回调**逐帧**调用（50 次/秒），
+         * 必须走单键轻量读取——不能用 load()（那会构造 40 字段 data class 并读全表）。
+         */
+        fun micGainDbOf(context: Context): Int =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getInt("mic_gain_db", DEFAULT_MIC_GAIN_DB)
+                .coerceIn(MIN_MIC_GAIN_DB, MAX_MIC_GAIN_DB)
+
+        /**
+         * vc238：视频渲染默认值一次性迁移。
+         * A2（VSYNC 节拍）升为默认开且删除开关；A1（帧不合并）默认开、保留开关。
+         * 旧版两个键（vc236/vc237）默认与落盘值都是 false，直接沿用会让老用户升级后
+         * 仍停留在关闭态，且旧 false 并非用户主动选择。这里清掉旧键并打标记；
+         * 此后 A1 开关写入的 video_no_coalesce 即用户真实选择，不再迁移。
+         */
+        private fun migrateVideoRenderDefaults(prefs: SharedPreferences) {
+            if (prefs.getBoolean("video_render_defaults_migrated", false)) return
+            prefs.edit()
+                .remove("video_vsync_pacing")
+                .remove("video_no_coalesce")
+                .putBoolean("video_render_defaults_migrated", true)
+                .commit()
+        }
+
+        /** vc207：配对窗「外置蓝牙设置」三开关 —— 开机自动初始化（默认关）。 */
+        fun usbBtAutoInitOf(context: Context): Boolean =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("usb_bt_auto_init", false)
+
+        fun setUsbBtAutoInit(context: Context, v: Boolean) =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("usb_bt_auto_init", v).apply()
+
+        /** vc207：优先用外置蓝牙广播（默认开；关=iPhone 回连 dongle 后不自动发起连接）。 */
+        fun usbBtPreferExternalOf(context: Context): Boolean =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("usb_bt_prefer_external", true)
+
+        fun setUsbBtPreferExternal(context: Context, v: Boolean) =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("usb_bt_prefer_external", v).apply()
+
+        /** vc207：保持常驻广播（默认开；关=空闲一轮后停广播，省电）。 */
+        fun usbBtKeepStandbyOf(context: Context): Boolean =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("usb_bt_keep_standby", true)
+
+        fun setUsbBtKeepStandby(context: Context, v: Boolean) =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("usb_bt_keep_standby", v).apply()
+
+        /** vc207：配对窗改名落盘（轻量单键写；重启 standby 后生效于广播名）。 */
+        fun setUsbBtDongleName(context: Context, name: String) =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("usb_bt_dongle_name", name).apply()
+
         fun load(context: Context): LiteConfig {
             val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            // vc238：A1/A2 默认值变更的一次性迁移（见 migrateVideoRenderDefaults）。
+            migrateVideoRenderDefaults(prefs)
             return LiteConfig(
                 ssid = prefs.getString("ssid", "").orEmpty(),
                 password = prefs.getString("password", "").orEmpty(),
@@ -206,6 +276,11 @@ data class LiteConfig(
                 mediaBufferMillis = prefs.getInt("media_buffer_millis", 300),
                 // vc156：媒体预缓冲开关（默认开）。
                 audioPrebuffer = prefs.getBoolean("audio_prebuffer", true),
+                // vc238：A1 —— 帧不合并（默认开；旧键已由迁移清理，此后为用户真实选择）。
+                videoNoCoalesce = prefs.getBoolean("video_no_coalesce", true),
+                // vc238：麦克风收音增益（0=关闭，1~10 dB）。
+                micGainDb = prefs.getInt("mic_gain_db", DEFAULT_MIC_GAIN_DB)
+                    .coerceIn(MIN_MIC_GAIN_DB, MAX_MIC_GAIN_DB),
                 // vc166：外置 USB 蓝牙实验开关（仅探测显示）。
                 usbBtDongle = prefs.getBoolean("usb_bt_dongle", false),
                 // vc184：外置蓝牙自定义名称（空/超长回落默认 "DiPlay CarPlay"）。
@@ -261,6 +336,10 @@ data class LiteConfig(
                 .putString("bt_audio_info_variant", config.btAudioInfoVariant)
                 .putInt("media_buffer_millis", config.mediaBufferMillis)
                 .putBoolean("audio_prebuffer", config.audioPrebuffer)
+                // vc238：A1 —— 帧不合并（默认开）。
+                .putBoolean("video_no_coalesce", config.videoNoCoalesce)
+                // vc238：麦克风收音增益（0=关闭，1~10 dB）。
+                .putInt("mic_gain_db", config.micGainDb)
                 .putBoolean("usb_bt_dongle", config.usbBtDongle)
                 .putString("usb_bt_dongle_name", config.usbBtDongleName)
                 .putInt("touch_trim_bottom_permille", config.touchTrimBottomPermille)

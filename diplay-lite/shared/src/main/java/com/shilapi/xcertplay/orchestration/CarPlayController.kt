@@ -939,24 +939,39 @@ class CarPlayController(
             )
             onStatus(CarPlayStatus.WaitingForPairedIphone)
 
-            val adapter = bluetoothAdapter
-                ?: throw IOException("Bluetooth adapter is unavailable")
-            // vc93：双证据源判蓝牙开关（235233 实锤 ECARX 上用户已开蓝牙但
-            // adapter.isEnabled 仍报 false——OEM 适配器代理状态滞后/失灵）。
-            // adapter ∥ Settings.Secure bluetooth_on 任一为开即视为开。
-            if (!isBluetoothEffectivelyEnabled(adapter)) {
-                // 自动补开（对齐中继模式既有约定）：双源都关时 enable + 轮询 ≤8s。
-                // vc94：ensureBluetoothEnabled 返回非空 Boolean，vc93 的 elvis-throw 不可达
-                //（编译器仅警告），补开失败会静默续连——改为显式判 false 才真正抛引导文案。
-                if (!ensureBluetoothEnabled(adapter)) {
-                    throw IOException("Bluetooth is not enabled")
+            // vc212：外置 dongle 路径不碰框架蓝牙（系统蓝牙可关）——跳过 adapter 检查/系统侧
+            // 设备选择；配对在 dongle 侧完成（UsbBtStandby.isUsable），链路经
+            // UsbBtBootstrapStream.open 取回。identification 的 hostBluetoothMac 语义=我方
+            // 蓝牙地址，dongle 路径用 dongle 本机 BD_ADDR。
+            val device = if (config.usbBtDongle) {
+                null
+            } else {
+                val adapter = bluetoothAdapter
+                    ?: throw IOException("Bluetooth adapter is unavailable")
+                // vc93：双证据源判蓝牙开关（235233 实锤 ECARX 上用户已开蓝牙但
+                // adapter.isEnabled 仍报 false——OEM 适配器代理状态滞后/失灵）。
+                // adapter ∥ Settings.Secure bluetooth_on 任一为开即视为开。
+                if (!isBluetoothEffectivelyEnabled(adapter)) {
+                    // 自动补开（对齐中继模式既有约定）：双源都关时 enable + 轮询 ≤8s。
+                    // vc94：ensureBluetoothEnabled 返回非空 Boolean，vc93 的 elvis-throw 不可达
+                    //（编译器仅警告），补开失败会静默续连——改为显式判 false 才真正抛引导文案。
+                    if (!ensureBluetoothEnabled(adapter)) {
+                        throw IOException("Bluetooth is not enabled")
+                    }
                 }
+                selectWirelessBluetoothDevice(adapter)
             }
-            val device = selectWirelessBluetoothDevice(adapter)
-            val hostBluetoothMac = accessoryBluetoothMac(adapter)
+            val hostBluetoothMac = if (config.usbBtDongle) {
+                UsbBtBootstrapStream.lastBdAddr
+                    ?: com.shilapi.xcertplay.usbbt.UsbBtHost.localAddressSnapshot
+                    ?: bluetoothAdapter?.let { accessoryBluetoothMac(it) }
+                    ?: "unknown"
+            } else {
+                bluetoothAdapter?.let { accessoryBluetoothMac(it) } ?: "unknown"
+            }
             debugLog(
-                "wireless selected Bluetooth target name=${device.name ?: "unknown"} " +
-                    "address=${device.address} localBt=$hostBluetoothMac",
+                "wireless selected Bluetooth target name=${device?.name ?: "usb-dongle"} " +
+                    "address=${device?.address ?: "dongle"} localBt=$hostBluetoothMac",
             )
             val wirelessAirPlayConfig = airPlayConfig.copy(
                 deviceId = deviceIdentifier,
@@ -1082,11 +1097,16 @@ class CarPlayController(
             }
 
             onStatus(CarPlayStatus.ConnectingBluetooth)
-            val socket = openWirelessRfcommSocket(device)
+            // vc212：dongle 路径无系统 RFCOMM socket——流由 UsbBtBootstrapStream.open 直接交出。
+            val socket = if (config.usbBtDongle) {
+                null
+            } else {
+                openWirelessRfcommSocket(device!!)
+            }
             wirelessLinkOpenedAtMs = SystemClock.elapsedRealtime()
             // 1.1.3：建链成功= SDP 恢复可见，清掉连续失败计数。
             sdpFailureConsecutiveCount = 0
-            debugLog("wireless RFCOMM connected address=${device.address}")
+            debugLog("wireless RFCOMM connected address=${device?.address ?: "dongle"}")
             if (isStaleWirelessRun(generation)) {
                 closeWirelessStack()
                 return
@@ -1099,7 +1119,7 @@ class CarPlayController(
                 // 否则 usbbt 只有 system logcat，远程拿不到 portReset/forceClaim/errno 证据。
                 UsbBtBootstrapStream.open(context, config.usbBtDongleName) { msg -> debugLog(msg) }
             } else {
-                BluetoothRfcommDuplexStream(socket)
+                BluetoothRfcommDuplexStream(socket!!)
             }.also { bluetoothStream = it }
             // [BT-PROBE] t3 蓝牙兼容实验：每代连接轮换一次握手策略，一轮重试拿满三种模式的现场。
             // mode 0 = 现行（发 Marker，等 iPhone 回 Marker 后协商）

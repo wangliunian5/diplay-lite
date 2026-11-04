@@ -48,20 +48,22 @@ internal sealed class DataElement {
                 is Nil -> out.write(byteArrayOf(0x00))
                 is Bool -> out.write(byteArrayOf(0x28, if (element.value) 1 else 0))
                 is UInt -> {
-                    out.write((1 shl 5) or sizeIndexOf(element.bytes))
+                    out.write((1 shl 3) or sizeIndexOf(element.bytes))
                     writeBigEndian(out, element.bytes, element.value)
                 }
                 is IntElement -> {
-                    out.write((2 shl 5) or sizeIndexOf(element.bytes))
+                    out.write((2 shl 3) or sizeIndexOf(element.bytes))
                     writeBigEndian(out, element.bytes, element.value)
                 }
                 is Uuid -> when (element.bytes) {
                     2, 4 -> {
-                        out.write((3 shl 5) or sizeIndexOf(element.bytes))
+                        out.write((3 shl 3) or sizeIndexOf(element.bytes))
                         writeBigEndian(out, element.bytes, element.uuid.mostSignificantBits ushr 32)
                     }
                     else -> {
-                        out.write((3 shl 5) or 0x1c) // size index 4 = 16 字节
+                        // vc229 修复：SDP 类型字节口径 = (type << 3) | sizeIdx。
+                        // UUID128 的 sizeIdx=4 → 0x18|4 = 0x1C（此前写成 0x64，iPhone 判非法）。
+                        out.write((3 shl 3) or 4)
                         val bb = java.nio.ByteBuffer.allocate(16)
                         bb.putLong(element.uuid.mostSignificantBits)
                         bb.putLong(element.uuid.leastSignificantBits)
@@ -69,19 +71,19 @@ internal sealed class DataElement {
                     }
                 }
                 is Text -> {
-                    out.write((4 shl 5) or sizeIndexForLength(element.value.size))
+                    out.write((4 shl 3) or sizeIndexForLength(element.value.size))
                     writeLength(out, element.value.size)
                     out.write(element.value)
                 }
                 is Sequence -> {
                     val len = encodedSizeOfItems(element.items)
-                    out.write((6 shl 5) or sizeIndexForLength(len))
+                    out.write((6 shl 3) or sizeIndexForLength(len))
                     writeLength(out, len)
                     element.items.forEach { encodeTo(out, it) }
                 }
                 is Alternative -> {
                     val len = encodedSizeOfItems(element.items)
-                    out.write((7 shl 5) or sizeIndexForLength(len))
+                    out.write((7 shl 3) or sizeIndexForLength(len))
                     writeLength(out, len)
                     element.items.forEach { encodeTo(out, it) }
                 }
@@ -103,8 +105,10 @@ internal sealed class DataElement {
         fun decode(bytes: ByteArray, offset: Int): Pair<DataElement, Int> {
             if (offset >= bytes.size) throw SdpMalformed("truncated element header")
             val header = bytes[offset].toInt() and 0xff
-            val type = header ushr 5
-            val sizeIdx = header and 0x1f
+            // vc229：SDP 类型字节 = (type << 3) | sizeIdx。实测 iPhone 的
+            // ServiceSearchRequest 里 Sequence 是 0x35、UUID16 是 0x19，按 <<5 解会抛。
+            val type = header ushr 3
+            val sizeIdx = header and 0x07
             var off = offset + 1
             fun readBE(n: Int): Long {
                 if (off + n > bytes.size) throw SdpMalformed("truncated element body")
@@ -178,21 +182,17 @@ internal sealed class DataElement {
 
         private fun sizeIndexForLength(len: Int): Int = when {
             len < 0 -> throw IllegalArgumentException("negative length")
-            len <= 4 -> len // size index 0..4 = 长度本身（0..4 字节）
+            // vc229：sizeIdx 只有 3 位，聚合/文本一律用显式长度（5=1B、6=2B、7=4B）。
             len <= 0xff -> 5
             len <= 0xffff -> 6
             else -> 7
         }
 
-        /**
-         * 追加的长度字节：size index 0..4 时长度已编码在类型字节里，**不再写长度字节**
-         *（与 [sizeIndexForLength] 及 decode 中 `off += 0` 的口径必须一致）。
-         */
+        /** 追加的长度字节（sizeIdx 5/6/7 各写 1/2/4 字节）。 */
         private fun writeLength(out: ByteArrayOutputStream, len: Int) {
-            when {
-                len <= 4 -> Unit
-                len <= 0xff -> out.write(byteArrayOf(len.toByte()))
-                len <= 0xffff -> out.write(byteArrayOf((len ushr 8).toByte(), len.toByte()))
+            when (sizeIndexForLength(len)) {
+                5 -> out.write(byteArrayOf(len.toByte()))
+                6 -> out.write(byteArrayOf((len ushr 8).toByte(), len.toByte()))
                 else -> out.write(
                     byteArrayOf(
                         (len ushr 24).toByte(),
@@ -226,7 +226,9 @@ internal sealed class DataElement {
         }
 
         private fun lengthOf(sizeIdx: Int, bytes: ByteArray, off: Int): Int = when (sizeIdx) {
-            in 0..4 -> sizeIdx
+            // vc229：0..4 对聚合/文本无「隐式长度」语义（那是整数宽度的编码），按空处理；
+            // 5/6/7 分别读 1/2/4 字节显式长度。
+            in 0..4 -> 0
             5 -> bytes[off].toInt() and 0xff
             6 -> ((bytes[off].toInt() and 0xff) shl 8) or (bytes[off + 1].toInt() and 0xff)
             7 ->

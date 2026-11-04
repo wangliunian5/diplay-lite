@@ -61,6 +61,24 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
         ): BlockingDuplexByteStream {
             if (UsbBtStandby.isRunning) {
                 status("等待常驻广播交出 iPhone 链路…")
+                // vc215：已配对则主动 page 回连（用户指令：配对成功后主动用 dongle 建立 iAP2 链路），
+                // 不再只等 iPhone 自发回连；未配对/发起失败维持原被动等待语义不变。
+                // vc219：实测点连接时 standby 的 host 可能还在初始化（kicked=false）→ 轮询重踢，
+                // 最多等 20s，踢出去为止再进 awaitStream。
+                if (UsbBtHost.pairStateSnapshot == PairState.PAIRED) {
+                    var kicked = UsbBtHost.requestActiveConnect()
+                    val kickDeadline = System.currentTimeMillis() + 20_000L
+                    while (!kicked && System.currentTimeMillis() < kickDeadline && UsbBtStandby.isRunning) {
+                        try {
+                            Thread.sleep(2_000L)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            break
+                        }
+                        kicked = UsbBtHost.requestActiveConnect()
+                    }
+                    diagSink("usbbt: 已配对，主动回连已配对 iPhone（kicked=$kicked）")
+                }
                 return UsbBtStandby.awaitStream(UsbBtStandby.HANDOFF_WAIT_MILLIS)
                     ?: fail("常驻广播未在 ${UsbBtStandby.HANDOFF_WAIT_MILLIS / 1000}s 内交出 iPhone 链路（${UsbBtStandby.describe()}）")
             }
@@ -90,12 +108,13 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
                 name = name.ifBlank { "DiPlay CarPlay" },
                 classOfDevice = 2098184,
                 iap2RfcommChannel = 1,
-                ioCapability = 1, // NoInputNoOutput（Just-Works）
+                ioCapability = 1, // DisplayYesNo（vc212：弹码确认；MITM 由 host 侧 auth=5 携带）
             )
             val usb = UsbBtSession.manager(context) ?: fail("USB 服务不可用")
             val dongle = UsbBtSession.findDongle(usb)
                 ?: fail("未检测到 USB 蓝牙 dongle（请确认已插入）")
             status("已检测到 dongle（${UsbBtSession.deviceLabel(dongle)}）")
+            diagSink("ANCHOR dongle-detected")
             if (!UsbBtSession.hasPermission(context, dongle)) {
                 // vc184（t3 反馈）：原地等系统授权弹窗结果——用户点「允许」后本轮直接继续建链，
                 // 不再要求「允许后重试连接」；ROM 不弹窗/被拒/超时则带明确状态失败。
@@ -128,42 +147,79 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
             var host: UsbBtHost? = null
             var driver: UsbBtDriver? = null
             try {
-                val ready = java.util.concurrent.CountDownLatch(1)
-                driver = UsbBtDriver.open(context, dongle, forward, diagSink)
-                    ?: fail("打开 dongle 失败：设备刚重枚举或打开被拒")
-                status("已打开 dongle（${UsbBtSession.deviceLabel(dongle)}）")
-                // vc190：Realtek/Broadcom ROM 模式 dongle（如 CM390 / RTL8761BUV）必须先灌固件，
-                // 否则后续 HCI 初始化只能读到全零 BD_ADDR。host 初始化前在此完成固件下载；
-                // CSR8510 等固件片内芯片走 NoFirmwareNeeded 空过，无回归。失败不阻断建链
-                // （host 初始化会给出明确诊断）。
-                val fw = driver.loadFirmware(context.assets)
-                status("固件加载：$fw")
-                diagSink("usbbt: firmware load result=$fw")
-                host = UsbBtHost(identity, driver, { msg -> Log.i(TAG, msg) }).also {
-                    it.onStatus = { text -> status(text) }
-                    it.onReady = { ready.countDown() }
-                    hostRef[0] = it
+                // 2026-11-03（K60 CSR8510）：初始化首轮超时（首命令无应答/整轮超时）时，
+                // 一次性 portReset 兜底（每进程一次，见 UsbBtDriver.claimPortResetFallback）；
+                // 复位后重开重试一轮，仍不应答维持超时失败。
+                var retried = false
+                while (true) {
+                    val ready = java.util.concurrent.CountDownLatch(1)
+                    driver = UsbBtDriver.open(context, dongle, forward, diagSink, portResetFirst = retried)
+                        ?: fail("打开 dongle 失败：设备刚重枚举或打开被拒")
+                    status(if (retried) "端口复位完成，重试初始化…" else "已打开 dongle（${UsbBtSession.deviceLabel(dongle)}）")
+                    // vc190：Realtek/Broadcom ROM 模式 dongle（如 CM390 / RTL8761BUV）必须先灌固件，
+                    // 否则后续 HCI 初始化只能读到全零 BD_ADDR。host 初始化前在此完成固件下载；
+                    // CSR8510 等固件片内芯片走 NoFirmwareNeeded 空过，无回归。
+                    // vc233（BT-232-01 姊妹项）：**只有 Failed 中止建链**——此前 Failed 只打日志继续跑，
+                    // 与 FIRMWARE.md:41「上传失败会停止初始化」承诺不符，且会把「固件没灌进去」
+                    // 伪装成「host 初始化超时」误导排查。Uploaded / Skipped(already patched) /
+                    // NoFirmwareNeeded(CSR 片内 ROM) / Skipped(identity 不符) 都是正常跳过，不误杀。
+                    val fw = driver!!.loadFirmware(context.assets)
+                    if (fw is UsbBtFirmwareLoader.LoadResult.Failed) {
+                        fail("固件加载失败：${fw.reason}，不继续初始化")
+                    }
+                    status("固件加载：$fw")
+                    diagSink("usbbt: firmware load result=$fw")
+                    host = UsbBtHost(identity, driver!!, { msg -> Log.i(TAG, msg); diagSink("host: $msg") }).also {
+                        it.onStatus = { text -> status(text) }
+                        it.onReady = { ready.countDown() }
+                        hostRef[0] = it
+                    }
+                    host!!.start()
+                    // vc227：host 每次重建（dongle USB 掉线重枚举 / 端口复位重试）都要把持久化
+                    // link key 灌回内存。缺这步时实测：重建后 sharedLinkKeys 为空 → 主页回落
+                    // 「待配对」、LinkKeyRequest 只能回 Negative → iPhone 侧表现为「连不上」。
+                    UsbBtHost.restorePairing()
+                    if (ready.await(INIT_TIMEOUT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS)) break
+                    if (retried || !UsbBtDriver.claimPortResetFallback()) {
+                        fail(
+                            if (retried) {
+                                "dongle 初始化超时（dongle 不应答，已尝试端口复位）"
+                            } else {
+                                "dongle 初始化超时（${host?.statusText}）"
+                            },
+                        )
+                    }
+                    retried = true
+                    diagSink("usbbt: 初始化首轮超时，执行端口复位兜底（每进程一次）后重试初始化")
+                    try {
+                        host?.stop()
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        driver?.close()
+                    } catch (_: Throwable) {
+                    }
+                    host = null
+                    driver = null
                 }
-                host.start()
-                if (!ready.await(INIT_TIMEOUT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                    fail("dongle 初始化超时（${host.statusText}）")
-                }
-                host.localAddress()?.let { lastBdAddr = it.toString() }
+                val readyHost = host ?: fail("dongle 初始化超时（host 缺失）")
+                diagSink("ANCHOR init-done")
+                readyHost.localAddress()?.let { lastBdAddr = it.toString() }
                 // 等 iPhone 回连 → Just-Works 配对 → 加密 → SDP/RFCOMM → DLC
                 // vc192：状态里带上广播名 —— 外测的下一步动作是「去 iPhone 蓝牙列表里选这个名字」。
                 status("广播中「${identity.name}」，等待 iPhone 配对（请在手机蓝牙设置中选择该名称）…")
                 val deadline = System.currentTimeMillis() + linkTimeoutMillis
                 while (true) {
-                    when (host.phase) {
-                        UsbBtHost.Phase.FAILED -> fail("建链失败：${host.statusText}")
+                    when (readyHost.phase) {
+                        UsbBtHost.Phase.FAILED -> fail("建链失败：${readyHost.statusText}")
                         UsbBtHost.Phase.STOPPED -> fail("dongle 已停止")
                         else -> Unit
                     }
                     val remain = deadline - System.currentTimeMillis()
-                    if (remain <= 0) fail("等待 iPhone 连接超时（${host.statusText}）")
-                    val dlc = host.awaitIap2Dlc(minOf(remain, TAKE_SLICE_MILLIS))
+                    if (remain <= 0) fail("等待 iPhone 连接超时（${readyHost.statusText}）")
+                    val dlc = readyHost.awaitIap2Dlc(minOf(remain, TAKE_SLICE_MILLIS))
                     if (dlc != null) {
-                        return UsbBtRfcommStream(dlc, host)
+                        return UsbBtRfcommStream(dlc, readyHost)
                     }
                 }
             } catch (e: Throwable) {

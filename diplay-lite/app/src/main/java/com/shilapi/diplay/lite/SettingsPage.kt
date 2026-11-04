@@ -5,11 +5,13 @@ import android.app.Dialog
 import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ClipDrawable
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.text.InputType
 import android.util.Base64
 import android.view.Gravity
 import android.view.KeyEvent
@@ -25,6 +27,7 @@ import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
@@ -37,6 +40,9 @@ import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.Timer
+import java.util.TimerTask
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import org.json.JSONObject
@@ -140,27 +146,21 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var cbVoiceMedia: CheckBox
     // vc156（上游 0.2.21 预缓冲移植）：媒体预缓冲开关。
     private lateinit var cbPrebuffer: CheckBox
+    // vc237（A1）：视频待渲帧不合并（按 VSYNC 逐帧上屏）。vc238 起默认开，移至体验优化区。
+    private lateinit var cbNoCoalesce: CheckBox
+    // vc238：麦克风收音增益（0=关闭，1~10 dB）。行内显示当前值，点按弹层用滑块调整。
+    private lateinit var micGainValueText: TextView
+    private var micGainValue = LiteConfig.DEFAULT_MIC_GAIN_DB
     // vc184：外置蓝牙选择（车机蓝牙 / 外置蓝牙）单选 + 自定义名称输入框 + 应用键。
     private lateinit var rgBtSelect: WrapRadioGroup
     private lateinit var rbBtCar: RadioButton
     private lateinit var rbBtUsb: RadioButton
-    private lateinit var btNameRow: LinearLayout
-    private lateinit var inputBtName: EditText
-    // vc191：外置 USB 蓝牙实时状态块（VID/PID、本地 MAC、广播名、运行状态）+ 2s 轮询刷新。
-    // 外测此前「外置蓝牙不显示」只能盲测（vc190 日志零 dongle 痕迹），这里把探测结果常驻上屏。
-    private lateinit var btStatusBlock: LinearLayout
-    private lateinit var tvBtDongleStatus: TextView
+    // vc209：「外置蓝牙自定义名称」输入行与「外置 USB 蓝牙状态」块已迁移至配对窗
+    // （ExternalBtPairingDialog：改名/芯片信息/日志导出一站齐），本页不再重复。
     // vc193（FE6 语音通路体检）：状态显示 + 写操作授权勾选。仅 BuildConfig.FE6_ROOT_PROBE
     // 为 true 的诊断包才创建（正式包这两个字段永不初始化，相关代码全部有 isInitialized 守卫）。
     private lateinit var tvVoiceProbeStatus: TextView
     private lateinit var cbVoiceProbeWrite: CheckBox
-    private val btStatusHandler = Handler(Looper.getMainLooper())
-    private val btStatusTask = object : Runnable {
-        override fun run() {
-            refreshBtDongleStatus()
-            btStatusHandler.postDelayed(this, 2000)
-        }
-    }
     private lateinit var tvVersion: TextView
 
     // loadIntoForm 期间静默：setChecked 会触发监听，避免半加载状态写盘
@@ -171,8 +171,6 @@ class SettingsPage(private val activity: MainActivity) {
         runCatching { persistFromForm() }
         AudioChannelPreview.close()
         AudioChannelPreview.currentActivity = null
-        // vc191：离开设置页停掉 dongle 状态轮询（否则 Handler 一直持有页面常驻）。
-        btStatusHandler.removeCallbacks(btStatusTask)
     }
 
     /** 进入设置页：构建根视图（含悬浮球）并完成表单回显。由 MainActivity.render() 调用。 */
@@ -190,9 +188,6 @@ class SettingsPage(private val activity: MainActivity) {
         loadIntoForm()
         refreshAllDrawables()
         tvVersion.text = "版本 ${activity.readVersionName()}"
-        // vc191：进页先刷一次 dongle 状态，再起 2s 轮询（退页由 cleanup 停表）。
-        refreshBtDongleStatus()
-        btStatusHandler.post(btStatusTask)
         LiteLog.log("ui", "设置页打开")
         return root
     }
@@ -248,69 +243,10 @@ class SettingsPage(private val activity: MainActivity) {
         rgBtSelect.setOnCheckedChangeListener {
             if (isLoading) return@setOnCheckedChangeListener
             refreshRadioDrawables(rgBtSelect)
-            updateBtNameRowVisibility()
             persistFromForm()
         }
         column.addView(rgBtSelect, block(top = dip(6)))
-        // vc184：外置蓝牙自定义名称（仅选中外置蓝牙时显示；展示当前名、可输入、点应用重启生效）。
-        btNameRow = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dip(4), 0, 0)
-        }
-        btNameRow.addView(
-            TextView(activity).apply {
-                text = "外置蓝牙自定义名称"
-                setTextColor(Ui.TEXT)
-                textSize = 13f
-            },
-            // vc186：与 buildValueRow（分辨率自定义）完全同构——标题 weight=1 无 margin，
-            // 输入框 dip(110)+rightMargin10、应用键无 margin，保证 K60 实机两侧完全对齐。
-            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
-        )
-        inputBtName = EditText(activity).apply {
-            background = Ui.fillInput(activity)
-            setHintTextColor(Ui.SUB)
-            setTextColor(Ui.TEXT)
-            hint = "DiPlay CarPlay"
-            textSize = 13f
-            setSingleLine(true)
-            gravity = Gravity.CENTER
-            setPadding(dip(10), dip(7), dip(10), dip(7))
-        }
-        btNameRow.addView(
-            inputBtName,
-            LinearLayout.LayoutParams(dip(110), LinearLayout.LayoutParams.WRAP_CONTENT).apply { rightMargin = dip(10) },
-        )
-        btNameRow.addView(
-            Button(activity).apply {
-                text = "应用"
-                textSize = 12f
-                minHeight = dip(34)
-                setAllCaps(false)
-                background = Ui.pillSolid(activity, Ui.PRIMARY)
-                setTextColor(Ui.PRIMARY_ON)
-                setPadding(dip(14), dip(5), dip(14), dip(5))
-                setOnClickListener { applyBtName() }
-            },
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT),
-        )
-        // vc186：垂直间距对齐 buildValueRow 的 block(top=4, bottom=4)。
-        column.addView(btNameRow, block(top = dip(4), bottom = dip(4)))
-        // vc191：外置 USB 蓝牙实时状态块 —— VID/PID、本地 MAC、广播名、运行状态。
-        // 外测此前反馈「外置蓝牙不显示」只能盲测（vc190 日志零 dongle 痕迹），
-        // 这里把 dongle 探测/建链状态常驻上屏，一眼可判 dongle 是否真起来。
-        // 仅选中「外置蓝牙」时显示（与自定义名称行同步，见 updateBtNameRowVisibility）。
-        btStatusBlock = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-        btStatusBlock.addView(subSectionLabel("外置 USB 蓝牙状态"), block(top = dip(8), bottom = dip(2)))
-        tvBtDongleStatus = TextView(activity).apply {
-            setTextColor(Ui.SUB)
-            textSize = 12f
-            setLineSpacing(dip(2).toFloat(), 1f)
-            text = "读取中…"
-        }
-        btStatusBlock.addView(tvBtDongleStatus, block(top = dip(2)))
-        column.addView(btStatusBlock, block(top = dip(4)))
+        // vc209：自定义名称行 + dongle 状态块已删（迁移至配对窗，见字段区注释）。
 
         // ── 画面设置：分辨率自定义百分比 / 分辨率设定 / 横竖屏切换 ──
         column.addView(sectionLabel("画面设置"), block(top = dip(16), bottom = dip(4)))
@@ -492,6 +428,8 @@ class SettingsPage(private val activity: MainActivity) {
         // 开 = 音乐起播/复播水位抬到约 1s，Wi-Fi 短断流不再卡顿；代价是切歌起播稍慢。
         cbPrebuffer = checkbox("音乐预缓冲（抗Wi-Fi卡顿，起播稍慢）")
         column.addView(cbPrebuffer, block(bottom = dip(4)))
+        // vc238：A2「视频渲染按 VSYNC 节拍」升为默认开启并删除勾选项（它修的是绿线这类
+        // 可见缺陷，不应留给用户关闭）；A1「视频帧不合并」默认开、保留开关，已移至体验优化区。
         // 音视频传输方式（1.1.3：加回小标题；二选一选定后弹窗确认、下次连接生效）
         column.addView(subSectionLabel("音视频传输方式"), block(top = dip(8), bottom = dip(2)))
         val avGroup = RadioGroup(activity).apply { orientation = LinearLayout.HORIZONTAL }
@@ -563,6 +501,10 @@ class SettingsPage(private val activity: MainActivity) {
         // 体验优化（1.1.3 UI 调整：主项 +1dp（15f→16f）；改名统一「开机自启X」句式；
         // Siri/语音提示走媒体音量 从音频设置移入本组）
         column.addView(sectionLabel("体验优化"), block(top = dip(12), bottom = dip(4)))
+        // vc238：A1 从「音频设置」移入本区，紧跟区标题。默认开（旧键的 false 由配置迁移重置），
+        // 仍保留开关便于回退；重新连接后生效。
+        cbNoCoalesce = checkbox("视频帧不合并（实验，重连生效）")
+        column.addView(cbNoCoalesce, block(bottom = dip(4)))
         cbBoot = checkbox("开机自启Diplay Lite")
         // 1.0.11：开机自动开启蓝牙/热点/Wi-Fi（独立于"开机自启"，任一勾选 BootReceiver 即工作；
         // 1.0.29 Wi-Fi 与热点互斥——勾了热点则 Wi-Fi 自启跳过，STA/AP 不能同开）
@@ -593,6 +535,8 @@ class SettingsPage(private val activity: MainActivity) {
         column.addView(cbSoftDecode, block(bottom = dip(2)))
         column.addView(cbSpeaker, block(bottom = dip(2)))
         column.addView(cbVoiceMedia, block(bottom = dip(2)))
+        // vc238：麦克风收音增益行 —— 入口显示当前值，点按弹共用的滑块弹层（横竖屏同一套布局）。
+        column.addView(micGainRow(), block(top = dip(6), bottom = dip(2)))
 
         // M6k23：自定义返回图标页（选图→裁剪→确认保存）。1.1.3：入口行 -3dp（按钮随行号缩小）。
         column.addView(entryRow("自定义返回图标") { activity.setPage("caricon") }, block(top = dip(14)))
@@ -602,7 +546,7 @@ class SettingsPage(private val activity: MainActivity) {
         // 1.1.4：重做为中文检测报告（逐项检测+连接建议矩阵），原始取证数据仅写日志不上屏；
         // 报告页「上传诊断日志」直接接设置页 Gitee 上传通道。
         column.addView(entryRow("系统诊断（蓝牙/WiFi/热点/USB）") {
-            Diagnostics.run(activity) { showGiteeUploadDialog() }
+            Diagnostics.run(activity) { uploadLogToGitee() }
         }, block(top = dip(8), bottom = dip(8)))
 
         // ── vc197：FE6 车型测试（实验功能 + 语音通路体检）────────────────────
@@ -718,7 +662,7 @@ class SettingsPage(private val activity: MainActivity) {
             )
             addView(smallOutlineButton("预览") { showLogPreview() }, sideMargin())
             addView(smallOutlineButton("导出") { exportLog() }, sideMargin())
-            addView(smallOutlineButton("上传") { showGiteeUploadDialog() }.also { giteeUploadButton = it }, sideMargin())
+            addView(smallOutlineButton("上传") { uploadLogToGitee() }.also { giteeUploadButton = it }, sideMargin())
         }
         column.addView(logRow, block(top = dip(14)))
 
@@ -996,6 +940,138 @@ class SettingsPage(private val activity: MainActivity) {
         navStreamValueText.text = "· $navAudioStreamValue"
     }
 
+    /**
+     * vc238：麦克风收音增益入口行 —— 造型与「媒体音频流」行一致（标签 · 当前值 [进入]）。
+     * 整行与按钮都可点；弹层横竖屏共用一套（AppDialog 自带「视口 90% 宽 + 居中」的既有宽度规范，
+     * 不为横屏新增布局文件）。
+     */
+    private fun micGainRow(): View = LinearLayout(activity).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        setOnClickListener { showMicGainDialog() }
+        addView(
+            TextView(activity).apply {
+                text = "麦克风收音增益"
+                setTextColor(Ui.TEXT)
+                textSize = 13f
+            },
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        micGainValueText = TextView(activity).apply {
+            setTextColor(Ui.SUB)
+            textSize = 12f
+            text = micGainLabel(micGainValue)
+        }
+        addView(
+            micGainValueText,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { rightMargin = dip(8) },
+        )
+        addView(
+            Button(activity).apply {
+                text = "进入"
+                textSize = 12f
+                minHeight = dip(34)
+                setAllCaps(false)
+                background = Ui.pillOutline(activity, Ui.OUTLINE)
+                setTextColor(Ui.OUTLINE)
+                setPadding(dip(12), dip(4), dip(12), dip(4))
+                setOnClickListener { showMicGainDialog() }
+            },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+        )
+    }
+
+    private fun micGainLabel(db: Int): String = "· $db dB"
+
+    /**
+     * vc238：麦克风收音增益弹层 —— 滑块（0~10 dB）+ 实时数值 + 保存/取消。
+     * 沿用「媒体音频流」弹层的观感：AppDialog 壳 + Ui 色板；API16 无 tint 接口，
+     * 轨道用 LayerDrawable（BORDER 底 + ACCENT 进度）拼装，滑块为实心 ACCENT 圆点。
+     * 增益在采集回调内逐帧现读，保存即生效（无需重连）；关闭弹层后入口行数值同步刷新。
+     */
+    private fun showMicGainDialog() {
+        var draft = micGainValue
+        val valueText = TextView(activity).apply {
+            text = micGainLabelText(draft)
+            setTextColor(Ui.TEXT)
+            textSize = 16f
+        }
+        val slider = SeekBar(activity).apply {
+            max = LiteConfig.MAX_MIC_GAIN_DB - LiteConfig.MIN_MIC_GAIN_DB
+            progress = draft - LiteConfig.MIN_MIC_GAIN_DB
+            thumbOffset = dip(8)
+            progressDrawable = micGainTrack()
+            thumb = micGainThumb()
+            setPadding(dip(8), dip(8), dip(8), dip(8))
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    draft = LiteConfig.MIN_MIC_GAIN_DB + progress
+                    valueText.text = micGainLabelText(draft)
+                }
+
+                override fun onStartTrackingTouch(bar: SeekBar?) {}
+
+                override fun onStopTrackingTouch(bar: SeekBar?) {}
+            })
+        }
+        val hint = TextView(activity).apply {
+            text = "0 = 关闭（默认，行为与未开启完全一致）。逐样点 10^(dB/20) 放大并做峰值软限幅防削波。" +
+                "采集回调内一次完成，不增加延迟。保存即时生效，无需重连。"
+            setTextColor(Ui.SUB)
+            textSize = 12f
+        }
+        val content = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(valueText, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(
+                slider,
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dip(6) },
+            )
+            addView(
+                hint,
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dip(6) },
+            )
+        }
+        AppDialog.Builder(activity)
+            .setTitle("麦克风收音增益（0~${LiteConfig.MAX_MIC_GAIN_DB} dB）")
+            .setView(content)
+            .setPositiveButton("保存") { _, _ ->
+                micGainValue = draft
+                micGainValueText.text = micGainLabel(micGainValue)
+                persistFromForm()
+            }
+            .setNegativeButton("取消", null)
+            .create()
+            .show()
+    }
+
+    private fun micGainLabelText(db: Int): String = if (db <= 0) "0 dB（关闭）" else "$db dB"
+
+    /** 滑块轨道：BORDER 底 + ACCENT 进度（API16 无 setProgressTintList，用 Drawable 拼装）。 */
+    private fun micGainTrack(): Drawable {
+        val background = GradientDrawable().apply {
+            setColor(Ui.BORDER)
+            cornerRadius = dip(2).toFloat()
+            setSize(dip(200), dip(4))
+        }
+        val progress = GradientDrawable().apply {
+            setColor(Ui.ACCENT)
+            cornerRadius = dip(2).toFloat()
+            setSize(dip(200), dip(4))
+        }
+        val layer = LayerDrawable(
+            arrayOf<Drawable>(background, ClipDrawable(progress, Gravity.LEFT, ClipDrawable.HORIZONTAL)),
+        )
+        layer.setId(1, android.R.id.progress)
+        return layer
+    }
+
+    private fun micGainThumb(): Drawable = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(Ui.ACCENT)
+        setSize(dip(16), dip(16))
+    }
+
     private fun checkbox(text: String): CheckBox = CheckBox(activity).apply {
         this.text = text
         setTextColor(Ui.TEXT)
@@ -1170,15 +1246,17 @@ class SettingsPage(private val activity: MainActivity) {
         cbSpeaker.isChecked = config.speakerForCalls
         cbVoiceMedia.isChecked = config.voiceRoutedToMedia
         cbPrebuffer.isChecked = config.audioPrebuffer
+        // vc238：A1 —— 视频待渲帧不合并（默认开，旧键已由 LiteConfig 迁移重置）。
+        cbNoCoalesce.isChecked = config.videoNoCoalesce
+        // vc238：麦克风收音增益行当前值回显。
+        micGainValue = config.micGainDb
+        micGainValueText.text = micGainLabel(micGainValue)
         // vc184：蓝牙选择单选 + 自定义名称回显（接管原「外置 USB 蓝牙（实验）」开关）。
         rbBtCar.isChecked = !config.usbBtDongle
         rbBtUsb.isChecked = config.usbBtDongle
-        inputBtName.setText(config.usbBtDongleName)
         isLoading = false
         // vc164：按载入后的实际值决定应用按钮显隐（isLoading=false 后才不会被守卫拦掉）
         updateApplyResButton()
-        // vc184：外置蓝牙自定义名称行可见性（仅选中外置蓝牙时显示）
-        updateBtNameRowVisibility()
     }
 
     /**
@@ -1246,6 +1324,10 @@ class SettingsPage(private val activity: MainActivity) {
                 speakerForCalls = cbSpeaker.isChecked,
                 voiceRoutedToMedia = cbVoiceMedia.isChecked,
                 audioPrebuffer = cbPrebuffer.isChecked,
+                // vc238：A1 —— 视频待渲帧不合并（重连生效）。
+                videoNoCoalesce = cbNoCoalesce.isChecked,
+                // vc238：麦克风收音增益（0=关闭，1~10 dB，即时生效）。
+                micGainDb = micGainValue,
                 usbBtDongle = rbBtUsb.isChecked,
                 softwareVideoDecoder = cbSoftDecode.isChecked,
                 // vc197：非 FE6 机型根本不创建该控件，保存时恒 false（保持老行为）。
@@ -1284,23 +1366,9 @@ class SettingsPage(private val activity: MainActivity) {
         return w != saved.manualWidth || h != saved.manualHeight
     }
 
-    /** vc184：仅选中外置蓝牙时显示自定义名称行；vc191：同步显示 dongle 实时状态块。 */
-    private fun updateBtNameRowVisibility() {
-        val showExternal = rbBtUsb.isChecked
-        btNameRow.visibility = if (showExternal) View.VISIBLE else View.GONE
-        // 单选监听在 buildContent 早期注册，此处可能早于状态块构建 ⇒ 用初始化守卫。
-        if (::btStatusBlock.isInitialized) {
-            btStatusBlock.visibility = if (showExternal) View.VISIBLE else View.GONE
-        }
-    }
 
-    /**
-     * vc191：刷新外置 USB 蓝牙实时状态块。数据来源：
-     * - VID/PID → [UsbBtBootstrapStream.dongleVidPid]（实时枚举，未插入即时反映「未检测到」）；
-     * - 本地 MAC → [UsbBtBootstrapStream.lastBdAddr]（建链初始化 ReadBdAddr 后才有值）；
-     * - 广播名 → 当前 usbBtDongleName（未自定义即默认 DiPlay CarPlay）；
-     * - 状态 → [UsbBtBootstrapStream.describe]（建链逐级状态 / 未连接时的探测结果）。
-     */
+
+    // vc209：refreshBtDongleStatus/applyBtName 已随设置页两块外置蓝牙 UI 一并删除（迁移至配对窗）。
     /**
      * vc193：启动语音通路体检。跑在独立线程（体检内部有 su 调用与 3s×7 档采集，
      * 绝不能占 UI 线程）；进度只通过 Fe6VoiceProbe 的 volatile 状态回读，UI 侧统一 render。
@@ -1366,50 +1434,6 @@ class SettingsPage(private val activity: MainActivity) {
             val body = Fe6VoiceProbe.summary
             if (body.isNotBlank() && body != "尚未体检") append('\n').append(body)
         }
-    }
-
-    private fun refreshBtDongleStatus() {
-        if (!::tvBtDongleStatus.isInitialized) return
-        val cfg = LiteConfig.load(activity)
-        val vidPid = runCatching { UsbBtBootstrapStream.dongleVidPid(activity) }.getOrNull()
-        val mac = UsbBtBootstrapStream.lastBdAddr
-        val rawName = cfg.usbBtDongleName
-        val name = if (rawName.isNullOrBlank()) "DiPlay CarPlay" else rawName
-        val state = if (UsbBtStandby.isRunning) {
-            // vc192：常驻广播在跑 ⇒ 优先显示建链逐级状态（初始化 → 广播中 → 等配对），
-            // 尚未跑到时退回保活线程自己的状态，绝不显示「待连接时探活」这种误导文案。
-            UsbBtBootstrapStream.lastStatusText.takeIf { it.isNotBlank() }
-                ?: UsbBtStandby.describe()
-        } else {
-            runCatching { UsbBtBootstrapStream.describe(activity) }.getOrDefault("-")
-        }
-        tvBtDongleStatus.text = buildString {
-            if (vidPid == null) {
-                append("已识别：未检测到 dongle（请确认已插入）")
-            } else {
-                append("已识别：VID:0x").append(vidPid.substringBefore(":"))
-                append(" PID:0x").append(vidPid.substringAfter(":"))
-            }
-            append('\n')
-            append("本地 MAC：").append(mac ?: "-")
-            append('\n')
-            append("广播名：").append(name)
-            append('\n')
-            append("状态：").append(state)
-        }
-    }
-
-    /** vc184：外置蓝牙自定义名称提交 —— 落盘后重启软件生效（HCI 名写入在 dongle 初始化阶段）。 */
-    private fun applyBtName() {
-        if (isLoading) return
-        val raw = inputBtName.text.toString().trim()
-        val name = if (raw.isEmpty() || raw.toByteArray(Charsets.UTF_8).size > LiteConfig.MAX_USB_BT_NAME_BYTES) {
-            "DiPlay CarPlay"
-        } else raw
-        inputBtName.setText(name)
-        val current = LiteConfig.load(activity)
-        LiteConfig.save(activity, current.copy(usbBtDongleName = name))
-        toast("蓝牙名称已保存，重启软件后生效")
     }
 
     private fun updateApplyResButton() {
@@ -1515,61 +1539,8 @@ class SettingsPage(private val activity: MainActivity) {
     private var giteeUploadButton: Button? = null
     @Volatile private var giteeUploading = false
 
-    private fun giteeLabel(text: String): TextView = TextView(activity).apply {
-        this.text = text
-        setTextColor(Ui.SUB)
-        textSize = 12f
-    }
-
-    private fun giteeInput(text: String, password: Boolean): EditText = EditText(activity).apply {
-        background = Ui.fillInput(activity)
-        setHintTextColor(Ui.SUB)
-        setTextColor(Ui.TEXT)
-        textSize = 13f
-        setSingleLine()
-        setPadding(dip(10), dip(8), dip(10), dip(8))
-        if (password) {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        }
-        setText(text)
-    }
-
-    /** 上传弹窗：用户填问题描述（必填）。 */
-    private fun showGiteeUploadDialog() {
-        if (giteeUploading) return
-        val descInput = EditText(activity).apply {
-            background = Ui.fillInput(activity)
-            setHintTextColor(Ui.SUB)
-            setTextColor(Ui.TEXT)
-            textSize = 13f
-            gravity = Gravity.TOP
-            minLines = 3
-            hint = "请描述遇到的问题（必填），例如：连接后闪退 / 画面卡顿…"
-            setPadding(dip(10), dip(8), dip(10), dip(8))
-        }
-        val column = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dip(20), dip(12), dip(20), dip(4))
-            addView(giteeLabel("问题描述（必填，将随日志一起上传）"))
-            addView(descInput, block(top = dip(6)))
-        }
-        AppDialog.Builder(activity)
-            .setTitle("上传运行日志")
-            .setView(column)
-            .setNegativeButton("取消", null)
-            .setPositiveButton("上传") { _, _ ->
-                val desc = descInput.text.toString().trim()
-                if (desc.isEmpty()) {
-                    toast("请先填写问题描述")
-                    return@setPositiveButton
-                }
-                uploadLogToGitee(desc)
-            }
-            .show()
-    }
-
     /** 组装日志文本 → 本地落盘重命名副本 → worker 线程上传 Gitee。 */
-    private fun uploadLogToGitee(desc: String) {
+    private fun uploadLogToGitee() {
         if (giteeUploading) return
         val logFile = LiteLog.currentFile()
         if (logFile == null || !logFile.isFile || logFile.length() == 0L) {
@@ -1588,11 +1559,10 @@ class SettingsPage(private val activity: MainActivity) {
         val fileName =
             "diplay-$stamp-$systemVersion-v$versionName-$safeModel.txt"
                 .replace(Regex("[\\s]+"), "")
-        val maxBytes = 800 * 1024
+        val maxBytes = 512 * 1024
         val raw = logFile.readBytes()
         val logPart = if (raw.size > maxBytes) raw.copyOfRange(raw.size - maxBytes, raw.size) else raw
         val header = buildString {
-            append("问题描述：").append(desc).append("\n\n")
             append("设备：").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n")
             val metrics = android.content.res.Resources.getSystem().displayMetrics
             append("分辨率：").append(metrics.widthPixels).append("x").append(metrics.heightPixels)
@@ -1629,10 +1599,11 @@ class SettingsPage(private val activity: MainActivity) {
                 "上传成功"
             } catch (error: UploadException) {
                 LiteLog.log("log", "Gitee 上传失败：HTTP ${error.code} ${error.sanitized}")
-                "上传失败：网络不通或服务异常（HTTP ${error.code}）。\n已生成「${fileName}」，可在 DiPlayLite 目录获取后手动发送。"
+                val reason = if (error.code == 0) error.sanitized else "网络不通或服务异常（HTTP ${error.code}）"
+                "上传失败：$reason。\n已生成「${fileName}」，本地文件：${localCopy.absolutePath}"
             } catch (error: Exception) {
                 LiteLog.log("log", "Gitee 上传异常：${error.javaClass.simpleName} ${error.message.orEmpty()}")
-                "上传失败：网络不通。\n已生成「${fileName}」，可在 DiPlayLite 目录获取后手动发送。"
+                "上传失败：网络不通。\n已生成「${fileName}」，本地文件：${localCopy.absolutePath}"
             }
             activity.runOnUiThread {
                 giteeUploading = false
@@ -1644,7 +1615,7 @@ class SettingsPage(private val activity: MainActivity) {
 
     private class UploadException(val code: Int, val sanitized: String) : Exception("HTTP $code")
 
-    /** 上传到固定仓库（worker 线程调用）；同名冲突加 -1 后缀重试一次，失败抛 UploadException。 */
+    /** 上传到固定仓库（worker 线程调用）；30s 总时长超时，同名冲突加 -1 后缀重试一次。 */
     private fun uploadLogToGitee(name: String, stamp: String, encoded: String) {
         val owner = "wangliunian"
         val repo = "display--log-collection"
@@ -1653,11 +1624,23 @@ class SettingsPage(private val activity: MainActivity) {
         // 未配置时为空串——下方判空降级为「生成文件后手动发送」路径，不再硬编码进源码。
         val token = BuildConfig.GITEE_LOG_TOKEN
         if (token.isEmpty()) throw UploadException(0, "GITEE_LOG_TOKEN not configured")
+        val timeoutMillis = 30_000L
+        val deadline = System.currentTimeMillis() + timeoutMillis
         var attemptName = name
         var lastCode = 0
         var lastBody = ""
         for (attempt in 0..1) {
-            val (code, body) = postGiteeContents(owner, repo, token, attemptName, stamp, encoded)
+            // 总时长上限覆盖建连、写正文、等响应（write 没有独立超时 API）
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0) throw UploadException(0, "上传超时（30s）")
+            val timedOut = AtomicBoolean(false)
+            val (code, body) = try {
+                postGiteeContents(owner, repo, token, attemptName, stamp, encoded, remaining, timedOut)
+            } catch (error: Exception) {
+                if (timedOut.get()) throw UploadException(0, "上传超时（30s）")
+                throw error
+            }
+            if (timedOut.get()) throw UploadException(0, "上传超时（30s）")
             lastCode = code
             lastBody = body.replace(token, "***").let { if (it.length > 1200) it.substring(0, 1200) + "…" else it }
             if (code in 200..299) {
@@ -1676,7 +1659,11 @@ class SettingsPage(private val activity: MainActivity) {
         throw UploadException(lastCode, lastBody)
     }
 
-    /** POST Gitee contents API（worker 线程调用）：15s 超时，成功 2xx 且响应含 content.path。 */
+    /**
+     * POST Gitee contents API（worker 线程调用）。
+     * [timedOut] 由 watchdog 置位：connect/readTimeout 管不到 `outputStream.write()`，
+     * 慢网下写正文会无限期停在「上传中」；daemon Timer 到点 disconnect() 打断写操作。
+     */
     private fun postGiteeContents(
         owner: String,
         repo: String,
@@ -1684,6 +1671,8 @@ class SettingsPage(private val activity: MainActivity) {
         name: String,
         stamp: String,
         encoded: String,
+        timeoutMs: Long,
+        timedOut: AtomicBoolean,
     ): Pair<Int, String> {
         val url = URL(
             "https://gitee.com/api/v5/repos/$owner/$repo/contents/" + URLEncoder.encode(name, "UTF-8") +
@@ -1695,10 +1684,18 @@ class SettingsPage(private val activity: MainActivity) {
             .put("message", "DiPlay Lite 运行日志 $stamp")
             .toString()
         val connection = url.openConnection() as HttpURLConnection
+        val perCallTimeout = if (timeoutMs > Int.MAX_VALUE) Int.MAX_VALUE else timeoutMs.toInt()
+        val watchdog = Timer(true)
         try {
+            watchdog.schedule(object : TimerTask() {
+                override fun run() {
+                    timedOut.set(true)
+                    runCatching { connection.disconnect() }
+                }
+            }, timeoutMs)
             connection.requestMethod = "POST"
-            connection.connectTimeout = 15_000
-            connection.readTimeout = 15_000
+            connection.connectTimeout = perCallTimeout
+            connection.readTimeout = perCallTimeout
             connection.doOutput = true
             connection.setRequestProperty("Content-Type", "application/json;charset=UTF-8")
             enableTls12OnKitKat(connection)
@@ -1708,6 +1705,7 @@ class SettingsPage(private val activity: MainActivity) {
             val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
             return code to text
         } finally {
+            watchdog.cancel()
             connection.disconnect()
         }
     }

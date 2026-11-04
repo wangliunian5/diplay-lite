@@ -190,6 +190,10 @@ class LiteSessionService : Service() {
 
         override fun onDebugLog(message: String) {
             LiteLog.log("airplay", message)
+            // 日志头段锚点：首帧上屏（当前为固定英文文案，可 grep）。
+            if (message.contains("first frame rendered")) {
+                LiteLog.log("anchor", "ANCHOR first-frame")
+            }
             // vc96（FE-6 断链取证）：wedge/断链事件触发内核级快照（sysfs 设备树 + dmesg 尾部），
             // 回答「谁先动手」（iPhone 侧复位 vs host 端口楔死）。探针未启用（无 root）时 no-op。
             if (message.contains("ncm inbound stalled") || message.contains("wired NCM bridge error")) {
@@ -392,6 +396,11 @@ class LiteSessionService : Service() {
             mediaBufferMillis = config.mediaBufferMillis,
             // vc156（上游 0.2.21 预缓冲移植）：媒体预缓冲开关（默认开，重新连接后生效）。
             audioPrebufferEnabled = config.audioPrebuffer,
+            // vc236（VID-234-01 / A2）：视频渲染 VSYNC 节拍 —— vc238 起默认开启且不再提供
+            // 用户开关（它修的是绿线这类可见缺陷），此处恒 true。
+            videoVsyncPacing = true,
+            // vc237（VID-234-01 / A1）：视频待渲帧不合并（vc238 默认开，可在体验优化区关闭）。
+            videoNoCoalesce = config.videoNoCoalesce,
             mediaStreamOverride = config.mediaAudioStream,
             navStreamOverride = config.navAudioStream,
             // 1.0.16（P0-1）：通话走扬声器时 telephony 下行按 MEDIA（STREAM_MUSIC）路由。
@@ -428,6 +437,9 @@ class LiteSessionService : Service() {
             // 一次性落诊断，外测日志里能直接确认机型判对没判对、开关是否真的打开。
             rootMicSource = activeRootMicSource(),
             keepAliveUplink = fe6VoiceFallbackActive(),
+            // vc238：麦克风收音增益（0=关闭，1~10 dB）。单键轻量读取、采集回调内逐帧现读，
+            // 设置页调整后下一次发声即生效，无需重连。
+            microphoneGainDb = { LiteConfig.micGainDbOf(this) },
             // 1.1.4：CarPlay 媒体流首包 → ECARX 桥显式抢源。
             onMediaPlaybackStarted = { bridge.onCarPlayMediaStarted() },
             // 1.1.6(vc76)：媒体断供看门狗（音视频双静默 20s）→ 编排层整代回收。
@@ -497,6 +509,10 @@ class LiteSessionService : Service() {
                     usbBtDongle = config.usbBtDongle,
                     // vc184：外置蓝牙自定义名称透传（写进 dongle HCI 本地名称）。
                     usbBtDongleName = config.usbBtDongleName,
+                    // vc236（VID-234-01 / A2）：视频渲染 VSYNC 节拍（vc238 起恒开，无用户开关）。
+                    videoVsyncPacing = true,
+                    // vc237（VID-234-01 / A1）：视频待渲帧不合并（vc238 默认开）。
+                    videoNoCoalesce = config.videoNoCoalesce,
                 ),
                 airPlayConfig = AirPlayConfig(
                     // 1.0.17：显示名称可自定义（自定义返回图标页），默认 DiPlay；流向 /info name + Bonjour 服务名。

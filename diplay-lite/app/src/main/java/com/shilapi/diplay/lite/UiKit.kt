@@ -246,6 +246,12 @@ object Ui {
  */
 class ToggleView(context: Context) : View(context) {
 
+    init {
+        // vc208：plain View 默认 clickable=false，performClick 永远不会被框架触发
+        // （配对窗三开关+可被发现开关"点击无反应"的根因）；开关语义自带点击，类级补齐。
+        isClickable = true
+    }
+
     var checked: Boolean = false
         private set
 

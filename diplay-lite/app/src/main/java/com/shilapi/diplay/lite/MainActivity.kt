@@ -119,11 +119,15 @@ class MainActivity : Activity() {
     private lateinit var hintLabel: TextView
     // vc184：主页状态卡底部「当前蓝牙」行（车机蓝牙 / 外置蓝牙 + 名称）。
     private lateinit var btModeLabel: TextView
+    // vc206：外置蓝牙未配对门槛警示行（warnline，设计稿 §04 G1）。
+    private lateinit var pairGateLabel: TextView
 
     private var panelVisible = true
     private var lastActive = false
     // 与设置页同步：记录当前渲染出的默认通道，tick 里比对 LiteConfig.activeChannel
     private var shownActiveChannel: String? = null
+    // vc206：门槛态变化哨兵（灰化/描边只在状态翻转时重建背景，不在 500ms tick 里反复建）。
+    private var shownGateVisual: Boolean? = null
     // vc145（C8815 实测 23:54 定案）：refreshTask 每 500ms 全量重绘，dalvik 低端机
     // 每 tick 主线程 ~11ms 且持续制造分配——状态未变时短路全部 UI 写，降低空闲
     // 主线程负载与 GC 压力（未连接期按钮响应的 app 侧放大器）。
@@ -218,6 +222,7 @@ class MainActivity : Activity() {
         applyOrientationMode(this, LiteConfig.load(this).orientationMode)
         videoStretchMode = LiteConfig.load(this).resolutionMode == "stretch"
         render()
+        installUsbBtPairConfirmHook()
         // 1.0.16（方案四②）：开机自启拉起（BootReceiver 带 EXTRA_AUTOSTART）→ 等待弹窗。
         if (intent?.getBooleanExtra(EXTRA_AUTOSTART, false) == true) {
             beginAutostartWait()
@@ -1021,19 +1026,41 @@ class MainActivity : Activity() {
 
         // M6k24：三键纵排（对齐原版交互）—— 立即连接（常驻，连接中置灰）
         // → 选择 iPhone（常驻，弹热点配置页同款蓝牙选择对话框）→ 断开连接（仅连接中出现）。
+        // vc206：外置蓝牙未配对门槛（设计稿 §04 G1）——保持可点、点击拦截弹引导层；
+        // 视觉灰化在 renderState 按门槛态切换（连接中的置灰仍归 phase 块管）。
         primaryActionButton = button("立即连接", primary = true, height = 50) {
-            connect(LiteConfig.load(this@MainActivity).activeChannel)
+            if (externalBtGateBlocked()) {
+                showExternalBtPairGateDialog()
+            } else {
+                connect(LiteConfig.load(this@MainActivity).activeChannel)
+            }
         }
         card.addView(primaryActionButton, matchButton())
 
+        // vc206：门槛警示行（warnline：WARN 色 12sp，贴主按钮下方，设计稿 §04 G1）。
+        pairGateLabel = label("未配对，请先在弹出窗口完成配对", 12, Ui.WARNING).apply {
+            setPadding(0, dip(8), 0, 0)
+            visibility = View.GONE
+        }
+        card.addView(
+            pairGateLabel,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+        )
+
         pickIphoneButton = button("选择 iPhone", primary = false, height = 46) {
-            SystemSettingsJumps.showIphonePickerDialog(this@MainActivity) { address, name ->
-                LiteConfig.saveBluetoothPick(this@MainActivity, address, name)
-                toast(
-                    if (address.isBlank()) "已清除选择：连接时自动匹配已配对 iPhone"
-                    else "已选择 $name $address",
-                )
-                LiteLog.log("ui", "主页选择 iPhone：address=$address name=$name")
+            // vc206：蓝牙来源=外置 → 整层替换为配对窗（设计稿 §02，三态读 UsbBtStandby 快照）；
+            // 内置 → 原有系统已配对设备列表完全不变。
+            if (LiteConfig.usbBtDongleOf(this@MainActivity)) {
+                ExternalBtPairingDialog.show(this@MainActivity)
+            } else {
+                SystemSettingsJumps.showIphonePickerDialog(this@MainActivity) { address, name ->
+                    LiteConfig.saveBluetoothPick(this@MainActivity, address, name)
+                    toast(
+                        if (address.isBlank()) "已清除选择：连接时自动匹配已配对 iPhone"
+                        else "已选择 $name $address",
+                    )
+                    LiteLog.log("ui", "主页选择 iPhone：address=$address name=$name")
+                }
             }
         }
         card.addView(pickIphoneButton, matchButton(top = 8, height = 46))
@@ -1069,6 +1096,22 @@ class MainActivity : Activity() {
         "当前蓝牙：外置蓝牙　蓝牙名称：${config.usbBtDongleName}"
     } else {
         "当前蓝牙：车机蓝牙"
+    }
+
+    /** vc206：外置蓝牙未配对门槛 —— 外置来源 + 无线通道（USB 直连不经蓝牙，不拦）+ 未配对。 */
+    private fun externalBtGateBlocked(): Boolean =
+        LiteConfig.usbBtDongleOf(this) &&
+            LiteConfig.activeChannelOf(this) != "usb" &&
+            !UsbBtStandby.isUsable
+
+    /** vc206：门槛引导层（设计稿 §04 G1 可选「去配对」跳转；配对窗内完成配对后自动解锁）。 */
+    private fun showExternalBtPairGateDialog() {
+        AppDialog.Builder(this)
+            .setTitle("先完成配对")
+            .setMessage("外置蓝牙还没和 iPhone 配对。点「去配对」打开配对窗口，完成后再回来连接。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("去配对") { _, _ -> ExternalBtPairingDialog.show(this) }
+            .show()
     }
 
     /**
@@ -1546,6 +1589,8 @@ class MainActivity : Activity() {
     }
 
     private fun startSession(config: LiteConfig, videoKey: String, channel: String = "car") {
+        // 日志头段锚点：固定文案、可 grep，供 dongle 日志头尾双保留定位连接起点。
+        LiteLog.log("anchor", "ANCHOR connect-begin")
         LiteConfig.saveAppliedVideoKey(this, videoKey)
         // 记录本轮会话通道：每卡绿点按它判定"哪张卡在连/已连"（UI 层自有键，不动 LiteConfig）。
         getSharedPreferences(SESSION_PREFS, MODE_PRIVATE)
@@ -1618,18 +1663,80 @@ class MainActivity : Activity() {
      * 我们旧实现只在「点了连接」时才初始化 dongle，因此不点连接时 iPhone 蓝牙列表里
      * 看到的还是 dongle 出厂名（CM390），而不是设置页里配的广播名。
      */
-    private fun syncUsbBtStandby() {
+    private fun syncUsbBtStandby(force: Boolean = false) {
         val config = LiteConfig.load(this)
         if (!config.usbBtDongle) {
             UsbBtStandby.stop()
             return
         }
+        // vc207：「开机自动初始化」关 且常驻广播未在跑 → 不自动拉起（省电/防老车机拖慢启动）；
+        // 打开配对窗/去配对会走 force=true 按需启动。已启动时照常推进（改名/开关变更随之生效）。
+        if (!force && !LiteConfig.usbBtAutoInitOf(this) && !UsbBtStandby.isRunning) {
+            return
+        }
+        // vc238：「保持常驻广播」= 外置蓝牙总闸，先按配置恢复进程级可发现标志再拉起循环；
+        // 关闭态下初始化照常（init 末步 scan=2），但不再 inquiry / 不再自动 page。
+        UsbBtStandby.restoreDiscoverable(LiteConfig.usbBtKeepStandbyOf(this))
         UsbBtStandby.start(
             this,
             config.usbBtDongleName,
             onDiagnostic = { msg -> LiteLog.log("usbbt", msg) },
             onLinkReady = { onUsbBtLinkReady() },
+            keepAlive = LiteConfig.usbBtKeepStandbyOf(this),
         )
+    }
+
+    /** vc207：配对窗入口 —— 无论「开机自动初始化」开关如何，确保常驻广播已启动。 */
+    internal fun ensureUsbBtStandby() = syncUsbBtStandby(force = true)
+
+    /**
+     * vc212：SSP 弹码确认（DisplayYesNo + MITM）。dongle 收到 UserConfirmationRequest 时
+     * 由 UsbBtStandby.pairConfirmHandler 回调（host 线程），转主线程弹 6 位数字；
+     * 用户点「确认配对」回确认，「取消」/弹窗销毁回拒绝（host 侧 30s 超时也兜底拒绝）。
+     */
+    private fun installUsbBtPairConfirmHook() {
+        UsbBtStandby.pairConfirmHandler = { addr, digits, answer ->
+            handler.post { showUsbBtPairConfirmDialog(addr, digits, answer) }
+        }
+    }
+
+    private fun showUsbBtPairConfirmDialog(addr: String, digits: String, answer: (Boolean) -> Unit) {
+        if (isFinishing || (Build.VERSION.SDK_INT >= 17 && isDestroyed)) {
+            answer(false)
+            return
+        }
+        var answered = false
+        fun answerOnce(ok: Boolean) {
+            if (!answered) {
+                answered = true
+                answer(ok)
+            }
+        }
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(label("请在 iPhone 与车机屏幕上核对同一组数字：", 14, Ui.TEXT))
+            addView(label(digits, 34, Ui.TEXT, true).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, 48, 0, 48)
+            })
+            addView(label("对端设备：$addr\n仅当 iPhone 上显示的数字与上方完全一致时才点「确认配对」。", 12, Ui.SUB))
+        }
+        AppDialog.Builder(this)
+            .setTitle("蓝牙配对确认")
+            .setView(body)
+            .setNegativeButton("取消") { _, _ -> answerOnce(false) }
+            .setPositiveButton("确认配对") { _, _ -> answerOnce(true) }
+            .setOnDismissListener { answerOnce(false) } // 销毁/超时关闭 = 取消（answerOnce 幂等）
+            .show()
+        LiteLog.log("ui", "外置蓝牙：弹码确认 digits=$digits addr=$addr")
+    }
+
+    /** vc207：配对窗改名落盘 + 重启常驻广播（广播名下一轮初始化生效）。 */
+    internal fun applyUsbBtDongleName(name: String) {
+        LiteConfig.setUsbBtDongleName(this, name)
+        UsbBtStandby.stop()
+        syncUsbBtStandby(force = true)
+        LiteLog.log("ui", "外置蓝牙：广播名已改为「$name」，常驻广播重启生效")
     }
 
     /**
@@ -1637,8 +1744,16 @@ class MainActivity : Activity() {
      * 免去「先点连接、再等手机回连」的对时序要求（legacy 也是回连即建链）。
      */
     private fun onUsbBtLinkReady() {
+        // vc207：「优先用外置蓝牙广播」关 → iPhone 回连 dongle 后不自动发起连接（只记日志）
+        if (!LiteConfig.usbBtPreferExternalOf(this)) {
+            LiteLog.log("ui", "外置蓝牙：iPhone 已回连（「优先用外置蓝牙广播」已关，不自动发起连接）")
+            return
+        }
         handler.post {
-            if (LiteState.phase != LiteState.Phase.IDLE) return@post
+            // vc231：FAILED 是上一轮 teardown 遗留状态（48s watchdog 超时等），
+            // 这时 iPhone 重新连过来（standby publish）也应该触发自动连接。
+            val p = LiteState.phase
+            if (p == LiteState.Phase.CONNECTING || p == LiteState.Phase.ACTIVE) return@post
             if (LiteSessionService.current != null) return@post
             val config = LiteConfig.load(this)
             val channel = when (config.activeChannel) {
@@ -1790,6 +1905,30 @@ class MainActivity : Activity() {
         if (activeChannel != shownActiveChannel) {
             shownActiveChannel = activeChannel
             hintLabel.text = defaultChannelHint(activeChannel)
+        }
+        // vc206：外置蓝牙未配对门槛（设计稿 §04 G1）——主流程灰化 + warnline 警示 +
+        // 「选择 iPhone」ACCENT 描边。USB 直连不经蓝牙，不拦；判据 = UsbBtStandby.isUsable
+        // （常驻广播在跑 且 已配对）。哨兵门控，状态翻转才重建背景。
+        val gateVisual = LiteConfig.usbBtDongleOf(this) && activeChannel != "usb" &&
+            !UsbBtStandby.isUsable && !running
+        if (gateVisual != shownGateVisual) {
+            shownGateVisual = gateVisual
+            pairGateLabel.visibility = if (gateVisual) View.VISIBLE else View.GONE
+            primaryActionButton.setTextColor(if (gateVisual) 0xFF7F91AB.toInt() else Ui.BG)
+            primaryActionButton.background = if (gateVisual) {
+                // 设计稿 §05 禁用主按钮：底 #2E3B52@52%、字 #7F91AB、无高光
+                rounded(0x852E3B52.toInt(), Ui.BORDER)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                RippleDrawable(ColorStateList.valueOf(0x336F9FD9), rounded(Ui.ACCENT, Ui.ACCENT), null)
+            } else {
+                rounded(Ui.ACCENT, Ui.ACCENT)
+            }
+            val pickStroke = if (gateVisual) Ui.ACCENT else Ui.BORDER
+            pickIphoneButton.background = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                RippleDrawable(ColorStateList.valueOf(0x336F9FD9), rounded(Ui.CARD, pickStroke), null)
+            } else {
+                rounded(Ui.CARD, pickStroke)
+            }
         }
     }
 

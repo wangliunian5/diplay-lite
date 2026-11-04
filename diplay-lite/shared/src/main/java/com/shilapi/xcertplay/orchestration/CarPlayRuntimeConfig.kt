@@ -80,6 +80,15 @@ class CarPlayRuntimeConfig(
     val usbBtDongle: Boolean = false,
     // vc184：外置蓝牙自定义名称（写进 HCI 本地名称，iPhone 蓝牙列表显示）。
     val usbBtDongleName: String = "DiPlay CarPlay",
+    // vc236（VID-234-01 / A2）：视频渲染节拍改 VSYNC（Choreographer）驱动。
+    // 默认 false = 现状 16ms 时间门控；true = 每个显示刷新周期最多上屏一帧，
+    // 消除「帧早到被 16ms 门控整帧丢弃」（vc235 实测 dueGated/rx=28.9%）。
+    val videoVsyncPacing: Boolean = false,
+    // vc237（VID-234-01 / A1）：视频待渲帧不再被后到帧取代。
+    // false = 现状（同 vc236：同一轮 drain 内后到帧释放旧 pending 帧，计入 superseded）；
+    // true = pending 帧按到达顺序保留，每个 VSYNC 序号上屏一帧，允许积压（靠既有
+    // backlog/stalled 监控兜底）。默认 false；与 videoVsyncPacing 组合成三组对照。
+    val videoNoCoalesce: Boolean = false,
     // vc202（竞品逆向对照）：handoff 完成判据加「已鉴权 AirPlay 帧」兜底——handoffRequested
     // 已置位且本代已渲染出帧（解密成功=已鉴权）即按 degraded 完成上报，不再死等
     // type-130 隧道/45s 看门狗；隧道继续在后台建立，就绪后升级收尾（关蓝牙引导）。

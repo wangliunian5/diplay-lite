@@ -52,6 +52,16 @@ internal class MicrophoneUplink(
      * 由上层按「机型是 FE6 + 用户勾选」决定是否置真。
      */
     private val keepAliveUplink: Boolean = false,
+    /**
+     * vc238：麦克风收音增益（dB，0 = 关闭）取值回调。由上层（设置页「体验优化」）持久化后注入。
+     *
+     * 用回调而不是快照值：增益在采集回调内**逐帧现读**，设置页调整后下一次发声立即生效
+     * （无需重连）。插入点在 [sendFrame]（采集 PCM 已就绪、编码/打包之前的唯一汇聚点），
+     * 两种发送路径（历史「读到就发」与 pacer 定速发送）都经过这里，因此只放大一次。
+     * 0 dB 时 [applyMicGain] 直接返回，一个样点都不碰 ⇒ 行为与历史版本逐字节一致。
+     * 必须在采集回调内原地完成：不新增线程、不新增缓冲，不引入额外延迟。
+     */
+    private val micGainDb: () -> Int = { 0 },
 ) : Closeable {
     private val running = AtomicBoolean(false)
     private val firstPacketLogged = AtomicBoolean(false)
@@ -1644,7 +1654,46 @@ internal class MicrophoneUplink(
         return peak
     }
 
+    /**
+     * vc238：麦克风收音增益 —— 16 位 PCM 逐样点乘算 + 软膝限幅，**原地**改写 [frame]。
+     *
+     * 增益：`factor = 10^(dB/20)`（1~10 dB ⇒ 1.12~3.16 倍）。
+     * 限幅：|x| ≤ [MIC_GAIN_KNEE] 保持线性（不动小信号）；超过膝点后走
+     * `y = knee + span·over/(over+span)`，斜率在膝点处连续（C¹），渐近逼近满量程
+     * 32767 但**永不硬削平**，避免 10 dB 时产生方波式削波失真。
+     *
+     * 零额外开销约束：单次原地遍历、无新缓冲、无新线程；0 dB 时首行直接返回，
+     * 与未开启增益的版本逐字节一致。
+     */
+    private fun applyMicGain(frame: ByteArray) {
+        val gainDb = micGainDb()
+        if (gainDb <= 0) return
+        // 每帧现算（50 次/秒，Math.pow 开销可忽略）：设置页调整后下一次发声即生效。
+        val factor = Math.pow(10.0, gainDb / 20.0).toFloat()
+        val knee = MIC_GAIN_KNEE
+        val span = FULL_SCALE - knee
+        var i = 0
+        while (i + 1 < frame.size) {
+            val sample = leShort(frame, i).toInt()
+            val scaled = (sample * factor).toInt()
+            val out = if (scaled >= -knee && scaled <= knee) {
+                scaled
+            } else {
+                val magnitude = if (scaled < 0) -scaled else scaled
+                val over = magnitude - knee
+                val limited = knee + span * over / (over + span)
+                if (scaled < 0) -limited else limited
+            }
+            frame[i] = (out and 0xff).toByte()
+            frame[i + 1] = ((out shr 8) and 0xff).toByte()
+            i += 2
+        }
+    }
+
     private fun sendFrame(socket: DatagramSocket, counters: MicrophoneCounters, frame: ByteArray) {
+        // vc238：采集 PCM → 编码之前的唯一汇聚点。两种发送模式（capture 直发 / pacer 定速）
+        // 都走这里，因此增益只应用一次；0 dB 时内部直接返回（零行为变化）。
+        applyMicGain(frame)
         val bodies = if (config.codec == AudioCodecKind.OPUS) {
             // #866 容错（移植自上游 0.2.21 SoftwareOpusEncoder 的 failed() 语义，vc156）：
             // 编码失败（含 JNI/MediaCodec 抛出的 Error）只损当前一帧 20ms，绝不让异常
@@ -1831,6 +1880,16 @@ internal class MicrophoneUplink(
         const val TAG = "xcertplay-usb"
         const val MIN_READ_BYTES = 2_048
         const val CLOSE_JOIN_MILLIS = 500L
+        // ── vc238：麦克风增益限幅 ────────────────────────────────────────────
+        /** PCM16 满量程（正半轴）。 */
+        const val FULL_SCALE = 32767
+        /**
+         * 软膝起点（满量程比例）。0.70 ⇒ 22936：膝点以下逐样点线性放大（不动小信号），
+         * 以上进入 `y = knee + span·over/(over+span)` 的软饱和——渐近 32767 但**永不削平**，
+         * 10 dB 时也不产生方波式削波。想调限幅力度只改这一个数。
+         */
+        const val MIC_GAIN_KNEE_RATIO = 0.70
+        val MIC_GAIN_KNEE = (FULL_SCALE * MIC_GAIN_KNEE_RATIO).toInt()
         // e5t1：连续全零 5s 触发换源。秒级日志窗口本身就是约 1s 粒度，5s 兼顾响应速度
         // 与误触发余量；换源成本=一次 AudioRecord 重建（~百 ms），误触发代价可接受。
         const val SILENT_HEAL_SECONDS = 5

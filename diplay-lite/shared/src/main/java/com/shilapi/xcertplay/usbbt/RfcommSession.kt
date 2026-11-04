@@ -135,12 +135,16 @@ internal class RfcommSession(
                                     "credits=${if (creditBased) "on (peer gives ${pn.credits})" else "off"}",
                             )
                             // 回应答帧：credit-based 时 convergence=14、credits=7
+                            // vc230：MCC 的 C/R 位必须是 0（响应）。上游 onMcc$reply 就是
+                            // `RfcommFrames.mcc(i, false, bArr)`；此前写成 true（命令），
+                            // iPhone 会把我们的 PN 应答当成新的 PN 命令、再回一个 PN 应答，
+                            // 然后双方都等对方发 SABM → DLC 永远不打开（vc229 实测卡在这里）。
                             replies.add(
                                 RfcommFrames.build(
                                     0, RfcommFrames.TYPE_UIH, null, initiator, false,
                                     RfcommFrames.mcc(
                                         MCC_PN,
-                                        true,
+                                        false,
                                         byteArrayOf(
                                             (pn.dlci and 63).toByte(),
                                             (((if (creditBased) 14 else 0) and 15) shl 4).toByte(),
@@ -157,7 +161,7 @@ internal class RfcommSession(
                         }
                     }
                     MCC_MSC -> {
-                        replies.add(RfcommFrames.build(0, RfcommFrames.TYPE_UIH, null, initiator, false, RfcommFrames.mcc(MCC_MSC, true, value)))
+                        replies.add(RfcommFrames.build(0, RfcommFrames.TYPE_UIH, null, initiator, false, RfcommFrames.mcc(MCC_MSC, false, value)))
                         if (value.size >= 2) {
                             val dlci = (value[0].toInt() and 0xff) ushr 2
                             val dlc = dlcs[dlci]
@@ -184,11 +188,11 @@ internal class RfcommSession(
                         } else {
                             value
                         }
-                        replies.add(RfcommFrames.build(0, RfcommFrames.TYPE_UIH, null, initiator, false, RfcommFrames.mcc(MCC_RPN, true, reply)))
+                        replies.add(RfcommFrames.build(0, RfcommFrames.TYPE_UIH, null, initiator, false, RfcommFrames.mcc(MCC_RPN, false, reply)))
                     }
                     MCC_TEST -> {
                         // 上游对 Test 原样回显
-                        replies.add(RfcommFrames.build(0, RfcommFrames.TYPE_UIH, null, initiator, false, RfcommFrames.mcc(MCC_TEST, true, value)))
+                        replies.add(RfcommFrames.build(0, RfcommFrames.TYPE_UIH, null, initiator, false, RfcommFrames.mcc(MCC_TEST, false, value)))
                     }
                     MCC_FCON, MCC_FCOFF -> {
                         val stopped = cmd.type == MCC_FCOFF
@@ -196,9 +200,9 @@ internal class RfcommSession(
                             it.aggregateFlowStopped = stopped
                         }
                         synchronized(lock) { lock.notifyAll() }
-                        replies.add(RfcommFrames.build(0, RfcommFrames.TYPE_UIH, null, initiator, false, RfcommFrames.mcc(cmd.type, true, ByteArray(0))))
+                        replies.add(RfcommFrames.build(0, RfcommFrames.TYPE_UIH, null, initiator, false, RfcommFrames.mcc(cmd.type, false, ByteArray(0))))
                     }
-                    MCC_RLS -> replies.add(RfcommFrames.build(0, RfcommFrames.TYPE_UIH, null, initiator, false, RfcommFrames.mcc(MCC_RLS, true, value)))
+                    MCC_RLS -> replies.add(RfcommFrames.build(0, RfcommFrames.TYPE_UIH, null, initiator, false, RfcommFrames.mcc(MCC_RLS, false, value)))
                     else -> replies.add(nscReply(cmd.type))
                 }
             } else {
@@ -233,7 +237,7 @@ internal class RfcommSession(
     private fun nscReply(unsupportedType: Int): ByteArray =
         RfcommFrames.build(
             0, RfcommFrames.TYPE_UIH, null, initiator, false,
-            RfcommFrames.mcc(MCC_NSC, true, byteArrayOf(((unsupportedType shl 2) or 3).toByte())),
+            RfcommFrames.mcc(MCC_NSC, false, byteArrayOf(((unsupportedType shl 2) or 3).toByte())),
         )
 
     private fun pnOf(value: ByteArray): RfcommFrames.Pn? {

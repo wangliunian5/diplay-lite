@@ -14,6 +14,7 @@ import com.shilapi.xcertplay.transport.LegacyUsbHostNative
 import java.io.Closeable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * vc167（外置 USB 蓝牙 dongle 第 2 步 B 批）/ vc181（外置 USB 蓝牙 C/D 批）：USB 传输层。
@@ -78,6 +79,16 @@ internal class UsbBtDriver private constructor(
         private const val MAX_CONSECUTIVE_TRANSFER_FAILURES = 20
 
         /**
+         * vc205：idle 探测超时。广播空闲期读超时是常态，达阈值后先发一条最省的
+         * ReadLocalVersion 探测；控制器正常应答在 ms 级，1500ms 仅兜底封顶。
+         */
+        private const val IDLE_PROBE_TIMEOUT_MILLIS = 1500L
+
+        /** vc207：即时错误退避——bulkTransfer 立即返回失败（<10ms）时 sleep 50ms 再重试。 */
+        private const val INSTANT_FAIL_ELAPSED_MILLIS = 10L
+        private const val INSTANT_FAIL_BACKOFF_MILLIS = 50L
+
+        /**
          * 打开 dongle 并占用 HCI 接口。
          * - claim 先走 framework（force=false），KK 上还须补 [LegacyUsbHostNative.forceClaim]
          *   踢掉内核 btusb 驱动（KK 的 claimInterface(false) 只抢 usbfs、不摘内核驱动）；
@@ -86,13 +97,16 @@ internal class UsbBtDriver private constructor(
          *   会残缺，事件端点 bulkTransfer 持续 n<0（≥20 次）→ 初始化超时（见 t3 日志
          *   diplay-20261023-225656）。修复照搬有线路径 [NcmUsbBridge] 的 USBDEVFS_RESET：
          *   open 后先 portReset 强制内核完全重枚举，RESET 使原 fd 失效，故 RESET 后必须
-         *   close + 重开连接再 claim。仅在 KK 且 native 可用时做，其他平台内核不受影响。
+         *   close + 重开连接再 claim。KK 常态做；非 KK 仅在 [claimPortResetFallback] 放行
+         *   的一次性兜底（初始化 Reset 不应答，2026-11-03 K60 CSR8510 定性）时经
+         *   `portResetFirst=true` 进入，正常机型路径不受影响。
          */
         fun open(
             context: Context,
             device: UsbDevice,
             listener: Listener = NO_OP,
             onDiagnostic: (String) -> Unit = {},
+            portResetFirst: Boolean = false,
         ): UsbBtDriver? {
             val usb = UsbBtSession.manager(context) as? UsbManager ?: return null
             val iface = UsbBtSession.hciInterface(device) ?: return null
@@ -111,38 +125,12 @@ internal class UsbBtDriver private constructor(
             // 「非默认端点表」需要时间。若同步立即 openDevice+claim，拿到的端点表残缺 → 控制端点0
             // 可用(故固件下载成功)但 bulk/interrupt 端点 ENOENT=-1（t3 实测：首灌/二次跳过重灌均复现）。
             // 必须先 close 旧连接，循环等待重枚举完成（同 VID/PID 兜底 deviceName 随重枚举变化）再重开。
-            if (kkNative) {
-                val resetErrno = try {
-                    LegacyUsbHostNative.portReset(connection.fileDescriptor)
-                } catch (_: Throwable) {
-                    -1
-                }
-                onDiagnostic("usbbt: portReset errno=$resetErrno (0/19=reset done, fd invalidated)")
-                if (resetErrno == 0 || resetErrno == 19) {
-                    try {
-                        connection.close()
-                    } catch (_: Throwable) {
-                    }
-                    var reopened: UsbDeviceConnection? = null
-                    var attempt = 0
-                    while (attempt < 40 && reopened == null) {
-                        reopened = tryOpenDongle(usb, device)
-                        if (reopened == null) {
-                            try {
-                                Thread.sleep(100)
-                            } catch (_: InterruptedException) {
-                                Thread.currentThread().interrupt()
-                            }
-                            attempt++
-                        }
-                    }
-                    if (reopened == null) {
-                        onDiagnostic("usbbt: reopen after portReset failed after $attempt attempts")
-                        return null
-                    }
-                    connection = reopened
-                    onDiagnostic("usbbt: reopened after portReset (attempts=$attempt)")
-                }
+            // 2026-11-03（K60 CSR8510 定性后）：同一序列抽为 portResetAndReopen()，KK 常态走；
+            // 非 KK 仅在调用方显式 portResetFirst=true（初始化 Reset 无应答的一次性兜底）时走。
+            if (kkNative || portResetFirst) {
+                val reopened = portResetAndReopen(usb, device, connection, onDiagnostic)
+                    ?: return null
+                connection = reopened
             }
             // vc186 P1：照搬有线 NcmUsbBridge vc103n/vc103o「配置舞」——当年 T3 无 root 跑通的关键
             // 不是硬 claim，而是「内核活动配置 ≠ framework 缓存布局」⇒ 先用 native SET_CONFIGURATION
@@ -224,6 +212,10 @@ internal class UsbBtDriver private constructor(
                         " (KK ep-table sync; see std-request line above)",
                 )
             }
+            // 调试埋点（2026-11-03 K60 CSR8510 定性，不改行为，全平台只读回读）：
+            // open 后读内核活动配置——1=已 configured；≤0/-99=未配置或回读失败。
+            val activeCfg = runCatching { kernelActiveConfiguration(connection) }.getOrDefault(-99)
+            onDiagnostic("usbbt: post-open activeConfig=$activeCfg（期望 1；-1/-99=回读失败）")
             // 批量端点按形态识别（无则置 null：个别 dongle ACL 面挂在别的接口）
             var aclIn: UsbEndpoint? = null
             var aclOut: UsbEndpoint? = null
@@ -240,10 +232,22 @@ internal class UsbBtDriver private constructor(
                     " aclIn=${aclIn?.let { "0x${hexOf(it.address)}(mps=${it.maxPacketSize})" } ?: "none"}" +
                     " aclOut=${aclOut?.let { "0x${hexOf(it.address)}(mps=${it.maxPacketSize})" } ?: "none"}",
             )
-            return UsbBtDriver(
+            val driver = UsbBtDriver(
                 connection, iface, events, aclIn, aclOut, listener, onDiagnostic,
                 device.vendorId, device.productId,
             )
+            // vc207：注册进程级活实例并顶掉上一个（若有）。close 在锁外执行，避免
+            // close 内的 join 阻塞后续 open；被顶掉一方的上游结果由 standby 代际守卫丢弃。
+            val previous: UsbBtDriver?
+            synchronized(activeDriverLock) {
+                previous = activeDriver
+                activeDriver = driver
+            }
+            if (previous != null) {
+                onDiagnostic("usbbt: open 抢占：顶掉上一个活实例（vc207 进程级互斥）")
+                runCatching { previous.close() }
+            }
+            return driver
         }
 
         /** 描述符字节 → 两位十六进制（诊断用）。 */
@@ -351,6 +355,64 @@ internal class UsbBtDriver private constructor(
         }
 
         /**
+         * vc183/vc190fix 的 portReset 序列抽块：USBDEVFS_RESET → close → 循环等重枚举重开。
+         * 返回重开后的新连接；RESET 失败或 4s 内未重枚举返回 null（调用方按 open 失败处理）。
+         */
+        private fun portResetAndReopen(
+            usb: UsbManager,
+            device: UsbDevice,
+            connection: UsbDeviceConnection,
+            onDiagnostic: (String) -> Unit,
+        ): UsbDeviceConnection? {
+            val resetErrno = try {
+                LegacyUsbHostNative.portReset(connection.fileDescriptor)
+            } catch (_: Throwable) {
+                -1
+            }
+            onDiagnostic("usbbt: portReset errno=$resetErrno (0/19=reset done, fd invalidated)")
+            if (resetErrno != 0 && resetErrno != 19) return null
+            try {
+                connection.close()
+            } catch (_: Throwable) {
+            }
+            var reopened: UsbDeviceConnection? = null
+            var attempt = 0
+            while (attempt < 40 && reopened == null) {
+                reopened = tryOpenDongle(usb, device)
+                if (reopened == null) {
+                    try {
+                        Thread.sleep(100)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                    attempt++
+                }
+            }
+            if (reopened == null) {
+                onDiagnostic("usbbt: reopen after portReset failed after $attempt attempts")
+                return null
+            }
+            onDiagnostic("usbbt: reopened after portReset (attempts=$attempt)")
+            return reopened
+        }
+
+        /**
+         * vc207：进程级单实例互斥（K60 实测根因：两个 standby 循环并发 open 同一 dongle，
+         * 互相 forceClaim 夺接口 → 端点读 n=-1、配对事件进不来、日志炸弹）。语义=**抢占**：
+         * 新 open 生效、旧实例被 close（配合 UsbBtStandby 代际守卫，被顶掉一方的 openDirect
+         * 结果会被丢弃并 close；forceClaim 从此只对外部占用者/内核 btusb，抢不到自己人）。
+         */
+        private val activeDriverLock = Any()
+        private var activeDriver: UsbBtDriver? = null
+
+        /** 2026-11-03：portReset 兜底每进程只放行一次（K60 CSR8510「写通读空」修复），防重入/循环。 */
+        private val portResetFallbackUsed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /** 初始化首轮超时（首命令无应答）时由 bootstrap 调用：true=本次放行兜底（之后不再放）。 */
+        fun claimPortResetFallback(): Boolean =
+            portResetFallbackUsed.compareAndSet(false, true)
+
+        /**
          * vc190fix：KK usbfs 端点激活 —— claim 后须显式 SET_INTERFACE(alt=0) 让内核同步 ep 表，
          * 否则 HCI 接口 bulk/interrupt 端点处于 disable 态 ⇒ bulkTransfer ENOENT=-1（t3 实测）。
          * 照搬 NcmUsbBridge 的 KK 兼容法：L+ 先 framework，退化走 native USBDEVFS_SETINTERFACE。
@@ -412,6 +474,13 @@ internal class UsbBtDriver private constructor(
     @Volatile
     private var closed = false
 
+    /** vc205：idle 探测在飞守卫（event/ACL 双读线程共享，CAS 防并发探测）。 */
+    private val idleProbeInFlight = AtomicBoolean(false)
+
+    /** vc205：探测成功代际（仅探测线程自增）——读线程据此清零本地失败计数。 */
+    @Volatile
+    private var idleProbeGeneration = 0L
+
     /** 单写锁：控制端点命令与 ACL bulk OUT 串行化（上游 writeLock 同款）。 */
     private val writeLock = Object()
 
@@ -439,6 +508,22 @@ internal class UsbBtDriver private constructor(
     }
 
     /**
+     * vc207：只发不等。异步命令（INQUIRY 等无 Command Complete、只回 CommandStatus + 后续事件）
+     * 若走 hciCommand 会白等满 timeout 才返回；此入口仅做控制写，完成与否由事件流上报给 host。
+     */
+    fun hciSend(opcode: Int, params: ByteArray = ByteArray(0)): Boolean {
+        if (!running) return false
+        val packet = HciCommands.command(opcode, params)
+        val t0 = System.currentTimeMillis()
+        val sent = synchronized(writeLock) {
+            connection.controlTransfer(0x20, 0, 0, 0, packet, packet.size, 1000)
+        }
+        val writeElapsedMs = System.currentTimeMillis() - t0
+        onDiagnostic("usbbt: hci cmd 0x%04x sent=$sent writeElapsedMs=$writeElapsedMs（只发不等）".format(opcode))
+        return sent >= 0
+    }
+
+    /**
      * 同步 HCI 命令/应答：控制端点发命令，事件线程等匹配 opcode 的 Command Complete。
      * 返回其返回参数（status 已确认为 0）；控制传输错误 / 超时返回 null；
      * 命令被控制器拒绝抛 [HciStatusException]。
@@ -453,6 +538,8 @@ internal class UsbBtDriver private constructor(
             return null
         }
         try {
+            // 调试埋点（同批，不改行为）：控制写返回值+耗时+opcode——定性「写方向是否生效」。
+            val t0 = System.currentTimeMillis()
             val sent = synchronized(writeLock) {
                 connection.controlTransfer(
                     0x20, // CLASS | HOST_TO_DEVICE（上游 stop() 同款）
@@ -461,8 +548,11 @@ internal class UsbBtDriver private constructor(
                     1000,
                 )
             }
+            val writeElapsedMs = System.currentTimeMillis() - t0
+            onDiagnostic("usbbt: hci cmd 0x%04x sent=$sent writeElapsedMs=$writeElapsedMs".format(opcode))
             if (sent < 0) return null // 控制传输错误
             if (!waiter.latch.await(timeoutMillis, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                onDiagnostic("usbbt: hci cmd 0x%04x await timeout %dms（无 Command Complete）".format(opcode, timeoutMillis))
                 return null // HCI 超时
             }
             val complete = waiter.complete ?: return null
@@ -539,7 +629,8 @@ internal class UsbBtDriver private constructor(
 
     /**
      * 读循环（上游 readLoop 移植）：按 [headerBytes] 头长解帧（事件=2、ACL=4），
-     * 跨 bulk 包拼接；连续失败超阈值触发 [Listener.onTransportFailure] 并退出。
+     * 跨 bulk 包拼接；连续失败超阈值先走 idle 探测（[startIdleProbe]），
+     * 探测也无应答才触发 [Listener.onTransportFailure] 并退出。
      */
     private fun readLoop(endpoint: UsbEndpoint, headerBytes: Int, isEvent: Boolean) {
         var maxPacketSize = endpoint.maxPacketSize
@@ -548,8 +639,13 @@ internal class UsbBtDriver private constructor(
         var acc = ByteArray(0)
         var failures = 0
         var lastTickMillis = 0L
+        var probeGenerationSeen = 0L
         while (running) {
+            // 调试埋点（2026-11-03 K60 CSR8510 定性，不改行为）：记录单次 bulkTransfer 耗时——
+            // ≈timeout 返回 = 读超时（端点通、dongle 不应答）；立即返回 = 端点错误（ENOENT 等）。
+            val t0 = System.currentTimeMillis()
             val n = connection.bulkTransfer(endpoint, buffer, maxPacketSize, 500)
+            val readElapsedMs = System.currentTimeMillis() - t0
             if (!running) return
             if (n > 0) {
                 failures = 0
@@ -578,15 +674,42 @@ internal class UsbBtDriver private constructor(
                 // 用于区分「端点表残缺(ENOENT)」/「被内核驱动占用(EBUSY/EPIPE)」/「超时」。
                 if (failures <= 3 || failures % 5 == 0) {
                     val line = "usbbt: bulk read fail ep=0x${hexOf(endpoint.address)} n=$n" +
-                        " failures=$failures (${if (isEvent) "event" else "ACL"})"
+                        " elapsedMs=$readElapsedMs failures=$failures (${if (isEvent) "event" else "ACL"})"
                     Log.w(TAG, line)
                     onDiagnostic(line)
                 }
+                // 同埋点批：失败累积到 10 次时打一行端点状态快照（能读到什么记什么，读不到写 unavailable）。
+                if (failures == 10) {
+                    val cfg = runCatching { kernelActiveConfiguration(connection) }
+                        .map { it.toString() }.getOrElse { "unavailable" }
+                    val fd = runCatching { connection.fileDescriptor.toString() }.getOrElse { "unavailable" }
+                    val state = "usbbt: ep state @failures=10 ep=0x${hexOf(endpoint.address)}" +
+                        " type=${endpoint.type} mps=${endpoint.maxPacketSize}" +
+                        " activeConfig=$cfg fd=$fd"
+                    Log.w(TAG, state)
+                    onDiagnostic(state)
+                }
                 if (failures > MAX_CONSECUTIVE_TRANSFER_FAILURES) {
-                    Log.w(TAG, (if (isEvent) "event" else "ACL") + " endpoint keeps failing; dongle gone?")
-                    listener.onTransportFailure("USB ${if (isEvent) "事件" else "ACL"}端点持续失败（dongle 掉线?）")
-                    running = false
-                    return
+                    // vc205（K60 CSR8510 定性）：广播空闲期 read 超时是常态，达阈值 ≠ 掉线。
+                    // 先探测再判死；探测在飞/有命令在飞时不判死，下轮再评估。
+                    if (probeGenerationSeen != idleProbeGeneration) {
+                        // 探测已确认 dongle 存活：清零本轮计数，继续广播
+                        probeGenerationSeen = idleProbeGeneration
+                        failures = 0
+                    } else if (pendingCommands.isEmpty() && idleProbeInFlight.compareAndSet(false, true)) {
+                        startIdleProbe()
+                    }
+                }
+                // vc207：端点被抢占/释放时 bulkTransfer 立即返回 n<0（elapsedMs≈0），
+                // 不退避会空转烧 CPU 并把 logcat 缓冲冲爆（K60 实测 49s 灌 23 万行，
+                // failures 冲到 2 万+），配对证据全被冲掉。即时错误 → 退避 50ms。
+                if (readElapsedMs < INSTANT_FAIL_ELAPSED_MILLIS && running) {
+                    try {
+                        Thread.sleep(INSTANT_FAIL_BACKOFF_MILLIS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return
+                    }
                 }
             }
             if (isEvent) {
@@ -597,6 +720,41 @@ internal class UsbBtDriver private constructor(
                 }
             }
         }
+    }
+
+    /**
+     * vc205（K60 CSR8510 定性）：idle 探测。连续读超时达阈值时，在独立线程发一条最省的
+     * ReadLocalVersion —— 收到 Command Complete（哪怕 status 拒绝）即证明控制通道存活，
+     * 递增 [idleProbeGeneration] 让读线程清零失败计数、继续广播；探测本身也无应答才判
+     * 「dongle 掉线」走 [Listener.onTransportFailure]。
+     * 节流与隔离：探测成功后 failures 清零 ⇒ 下次探测至少再隔一轮阈值（≥20×500ms≈10s）；
+     * 探测走控制端点 ep0（非 bulk/interrupt），且仅查询本地版本，不打断进行中的广播/链路状态。
+     */
+    private fun startIdleProbe() {
+        Thread({
+            var alive = false
+            try {
+                alive = hciCommand(
+                    HciCommands.READ_LOCAL_VERSION_INFORMATION,
+                    ByteArray(0),
+                    IDLE_PROBE_TIMEOUT_MILLIS,
+                ) != null
+            } catch (_: HciStatusException) {
+                alive = true // 控制器拒绝也是应答：控制通道存活
+            } catch (_: Throwable) {
+            }
+            if (alive) {
+                idleProbeGeneration++
+                Log.i(TAG, "host: idle probe ok (cleared)")
+                onDiagnostic("host: idle probe ok (cleared)")
+            } else if (running) {
+                Log.w(TAG, "host: idle probe failed -> offline")
+                onDiagnostic("host: idle probe failed -> offline")
+                listener.onTransportFailure("idle 探测无应答（dongle 掉线）")
+                running = false
+            }
+            idleProbeInFlight.set(false)
+        }, "usb-bt-idle-probe").apply { isDaemon = true }.start()
     }
 
     private fun dispatchEvent(frame: ByteArray) {
@@ -681,6 +839,10 @@ internal class UsbBtDriver private constructor(
         try {
             connection.close()
         } catch (_: Throwable) {
+        }
+        // vc207：注销进程级活实例（仅在仍登记时；被抢占时登记已属新实例）。
+        synchronized(activeDriverLock) {
+            if (activeDriver === this) activeDriver = null
         }
         Log.i(TAG, "driver stopped; interface #${iface.id} released")
     }

@@ -37,6 +37,19 @@ class BdAddr(val value: Long) {
     }
 
     companion object {
+        /** vc207：从 "AA:BB:CC:DD:EE:FF"（大小写均可）解析；非法返回 null。 */
+        fun parseColon(text: String): BdAddr? {
+            val parts = text.trim().split(":")
+            if (parts.size != 6) return null
+            var v = 0L
+            for (part in parts) {
+                if (part.length != 2) return null
+                val n = part.toLongOrNull(16) ?: return null
+                v = (v shl 8) or n
+            }
+            return BdAddr(v)
+        }
+
         /** 从 HCI 参数 [params] 的 [offset] 起取 6 字节（LSB 在前）构造。 */
         fun of(params: ByteArray, offset: Int): BdAddr {
             require(params.size >= offset + 6) { "BD_ADDR needs 6 bytes" }
