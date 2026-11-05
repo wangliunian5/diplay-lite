@@ -2527,8 +2527,11 @@ class CarPlayController(
         val bringUpMs = wirelessBringUpStartedAtMs.takeIf { it > 0 }?.let { now - it } ?: -1L
         // vc202：纯 handoff 段耗时（请求→完成），区分慢在 bring-up 还是 handoff 判据。
         val handoffMs = wirelessHandoffRequestedAtMs.takeIf { it > 0 }?.let { now - it } ?: -1L
-        val reconnectTotalMs =
+        // vc239（LOG-238-03）：首轮也要可读——没有「重连纪元」时用本代 bringUpMs 顶上，
+        // 并标注 first-run，避免 4/4 全是 n/a(first-run) 无法判读。不改任何计时逻辑。
+        val reconnectEpisodeMs =
             wirelessRestartEpisodeStartedAtMs.takeIf { it > 0 }?.let { now - it }
+        val reconnectTotalMs = reconnectEpisodeMs ?: bringUpMs.takeIf { it > 0 } ?: 0L
         wirelessRestartEpisodeStartedAtMs = 0L
         // vc202：degraded 先行完成后隧道才就绪时，补记隧道落后已激活的毫秒数（未走 degraded 则省略）。
         val tunnelReadyAfterActiveMs = if (!degraded && wirelessDegradedAtMs > 0L) {
@@ -2543,12 +2546,15 @@ class CarPlayController(
             else -> "unknown"
         }
         debugLog(
-            "wireless SESSION_ACTIVE gen=$generation attempt=$attempt" +
+            // vc239（LOG-238-03）：attempt 内部是 0 基重试计数，展示改 1 基（首轮 attempt=1），
+            // gen/attempt 两值首轮即可读；不改计数与重试逻辑。
+            "wireless SESSION_ACTIVE gen=$generation attempt=${attempt + 1}" +
                 "${if (degraded) " (degraded)" else ""} " +
                 "bringUpMs=$bringUpMs handoffMs=$handoffMs handoffReason=$handoffReason " +
                 "wifiBand=$wifiBand " +
                 (tunnelReadyAfterActiveMs?.let { "tunnelReadyAfterActiveMs=$it " } ?: "") +
-                "reconnectTotalMs=${reconnectTotalMs ?: "n/a(first-run)"}",
+                "reconnectTotalMs=$reconnectTotalMs" +
+                (if (reconnectEpisodeMs == null) "(first-run,bringUpMs)" else ""),
         )
     }
 

@@ -1,6 +1,7 @@
 package com.shilapi.xcertplay.usbbt
 
 import android.util.Log
+import com.shilapi.xcertplay.diag.AnchorLog
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -231,10 +232,15 @@ internal class UsbBtHost(
         /** vc206：进入配对模式（可发现开 [windowMillis]，对齐 UsbBtStandby.LINK_WINDOW_MILLIS=10min）。 */
         fun requestPairingMode(windowMillis: Long) {
             pairingModeUntil = System.currentTimeMillis() + windowMillis
+            // vc239（LOG-238-02）：配对窗打开锚点（带 session/gen）。
+            // companion 无实例日志出口，落 logcat；App 侧同步补一条 LiteLog（见配对弹窗）。
+            Log.i(UsbBtSession.TAG, AnchorLog.mark("pair-window-open"))
         }
 
         /** vc206：退出配对模式（可发现立即关闭）。 */
         fun cancelPairingMode() {
+            // vc239（LOG-238-02）：只有窗口原本开着才落关闭锚点，避免重复空打。
+            if (pairingModeUntil != 0L) Log.i(UsbBtSession.TAG, AnchorLog.mark("pair-window-close"))
             pairingModeUntil = 0L
         }
 
@@ -389,8 +395,8 @@ internal class UsbBtHost(
         pairedRemoteSnapshot = remoteText
         log("pair state=$state remote=${remoteText ?: "-"}")
         if (state == PairState.PAIRED) {
-            // 日志头段锚点：配对完成（固定文案，可 grep）。
-            log("ANCHOR pair-done")
+            // 日志头段锚点：配对完成（固定文案，可 grep）。vc239：带 session/gen。
+            log(AnchorLog.mark("pair-done"))
         }
     }
 
@@ -984,6 +990,8 @@ internal class UsbBtHost(
                         pairingStore?.save(event.addr.key(), event.key, pairedNames[event.addr.key()])
                     } catch (_: Throwable) {
                     }
+                    // vc239（LOG-238-02）：配对成功即关窗，先落关闭锚点再清零。
+                    if (pairingModeUntil != 0L) log(AnchorLog.mark("pair-window-close"))
                     pairingModeUntil = 0L // vc206：配对成功即关可发现窗口（下个 tick 回落 scan=2）
                     if (event.addr.key() == pairTarget) pairTarget = null // vc207：主动配对目标达成
                     updatePairState(PairState.PAIRED, event.addr)
@@ -1092,6 +1100,12 @@ internal class UsbBtHost(
             return
         }
         connections[event.handle] = event.addr
+        // vc239（BT-238-01）：关闭期仍建链成功 → 直接证伪「关掉后配对设备也连不上」，
+        // 并把当时的实际 scan 状态一并落盘（只加打点）。
+        if (!discoverableEnabled) {
+            log("gate-off: ACL 链路建立 addr=${event.addr.redacted()} scan=$currentScanMode " +
+                "（关闭期已配对设备主动回连成功）")
+        }
         pageRetryAddr = null // vc215：连上了，重试作废
         pageRetryLeft = 0
         pageRetryAt = 0
@@ -1124,6 +1138,12 @@ internal class UsbBtHost(
                 event.addr.toLittleEndian() + byteArrayOf(13),
             )
             return
+        }
+        // vc239（BT-238-01）：总闸关闭期间把 iPhone 主动寻呼事件与「可发现关闭」的实际
+        // 状态各打一行（只加打点，不改接受/拒绝逻辑）——用于证实「搜不到但仍可被已配对设备连上」。
+        if (!discoverableEnabled) {
+            log("gate-off: iPhone 主动连接/寻呼 addr=${event.addr.redacted()} " +
+                "（可发现关闭：inquiry scan=关 / scan=$currentScanMode，page scan 保留）")
         }
         // vc232：对端主动连进来的瞬间就把在飞 page 让掉（同 addr 才算同一个对端）。
         // page 与 incoming 互斥：两条建链请求同时在飞时，谁先完成都可能导致对方被拆。
@@ -1258,6 +1278,11 @@ internal class UsbBtHost(
                         else -> "可连接·不可发现"
                     } + "）",
                 )
+            }
+            // vc239（LOG-238-02）：配对窗自然到期 → 落关闭锚点（清零后本 tick 不再重复）。
+            if (pairingModeUntil != 0L && now >= pairingModeUntil) {
+                pairingModeUntil = 0L
+                log(AnchorLog.mark("pair-window-close"))
             }
         }
         // vc207：配对窗口内持续 inquiry（附近设备发现）；窗口关闭即取消。

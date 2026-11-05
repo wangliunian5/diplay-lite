@@ -29,6 +29,7 @@ import com.shilapi.xcertplay.airplay.AirPlaySession
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
 import com.shilapi.xcertplay.airplay.CarPlayMediaEngine
 import com.shilapi.xcertplay.airplay.PairingStore
+import com.shilapi.xcertplay.diag.AnchorLog
 import com.shilapi.xcertplay.media.AndroidMediaSink
 import com.shilapi.xcertplay.mfi.LocalMfiAuthenticationClient
 import com.shilapi.xcertplay.orchestration.CarPlayController
@@ -174,6 +175,8 @@ class LiteSessionService : Service() {
                 if (userStopped) "会话已结束"
                 else "连接已断开：重新插入 USB 线（或点连接）即可自动恢复"
             LiteLog.log("airplay", "会话已结束 userStopped=$userStopped")
+            // vc239（LOG-238-02）：清锚点代际的「等链路」状态，避免下次连接误沿用本代。
+            AnchorLog.onSessionEnded()
         }
 
         override fun onTransportError(message: String) {
@@ -192,7 +195,8 @@ class LiteSessionService : Service() {
             LiteLog.log("airplay", message)
             // 日志头段锚点：首帧上屏（当前为固定英文文案，可 grep）。
             if (message.contains("first frame rendered")) {
-                LiteLog.log("anchor", "ANCHOR first-frame")
+                // vc239：带 session/gen，与同代 connect-begin/link-ready 对齐。
+                LiteLog.log("anchor", AnchorLog.firstFrame())
             }
             // vc96（FE-6 断链取证）：wedge/断链事件触发内核级快照（sysfs 设备树 + dmesg 尾部），
             // 回答「谁先动手」（iPhone 侧复位 vs host 端口楔死）。探针未启用（无 root）时 no-op。

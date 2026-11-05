@@ -2,6 +2,7 @@ package com.shilapi.xcertplay.usbbt
 
 import android.content.Context
 import android.util.Log
+import com.shilapi.xcertplay.diag.AnchorLog
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 
 /**
@@ -114,7 +115,7 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
             val dongle = UsbBtSession.findDongle(usb)
                 ?: fail("未检测到 USB 蓝牙 dongle（请确认已插入）")
             status("已检测到 dongle（${UsbBtSession.deviceLabel(dongle)}）")
-            diagSink("ANCHOR dongle-detected")
+            diagSink(AnchorLog.mark("dongle-detected"))
             if (!UsbBtSession.hasPermission(context, dongle)) {
                 // vc184（t3 反馈）：原地等系统授权弹窗结果——用户点「允许」后本轮直接继续建链，
                 // 不再要求「允许后重试连接」；ROM 不弹窗/被拒/超时则带明确状态失败。
@@ -203,7 +204,7 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
                     driver = null
                 }
                 val readyHost = host ?: fail("dongle 初始化超时（host 缺失）")
-                diagSink("ANCHOR init-done")
+                diagSink(AnchorLog.mark("init-done"))
                 readyHost.localAddress()?.let { lastBdAddr = it.toString() }
                 // 等 iPhone 回连 → Just-Works 配对 → 加密 → SDP/RFCOMM → DLC
                 // vc192：状态里带上广播名 —— 外测的下一步动作是「去 iPhone 蓝牙列表里选这个名字」。

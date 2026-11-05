@@ -747,6 +747,10 @@ internal class MicrophoneUplink(
         var windowPeak = 0
         var windowBytes = 0
         var lastLevelLog = 0L
+        // vc239（MIC-238-01）：增益前/后峰值对比窗口（5 s 一条，低频，不逐帧刷）。
+        var gainWindowStartMs = 0L
+        var gainWindowPrePeak = 0
+        var gainWindowPostPeak = 0
         // 1.1.1：胜出参数恰好等于协商参数时走零转换快路径（对正常车机零行为变化）。
         // e5t1：改为动态判定——静默自愈轮换可能改变 native 参数，不能用启动时的快照。
         // e5t1：连续全零秒计数（数字静默自愈触发器，见字段注释）。
@@ -884,6 +888,21 @@ internal class MicrophoneUplink(
                         "Microphone level window frames=$frames peak=$windowPeak " +
                             "pad=$silencePaddedFrames root=${if (rootActive) "on" else "off"}",
                     )
+                    // vc239（MIC-238-01）：累计 5 s 窗口的增益前/后峰值；输出当前 mic_gain_db 现值，
+                    // 用于证实「设置里的增益确实作用到上行 PCM」。纯观测，不参与任何音频处理。
+                    gainWindowPrePeak = maxOf(gainWindowPrePeak, windowPeak)
+                    gainWindowPostPeak = maxOf(gainWindowPostPeak, gainPeakAfter(windowPeak))
+                    if (gainWindowStartMs == 0L) gainWindowStartMs = nowMs
+                    if (nowMs - gainWindowStartMs >= 5_000) {
+                        diagnostics?.invoke(
+                            "Microphone gain window mic_gain_db=${micGainDb()} " +
+                                "prePeak=$gainWindowPrePeak postPeak=$gainWindowPostPeak " +
+                                "spanMs=${nowMs - gainWindowStartMs}",
+                        )
+                        gainWindowStartMs = nowMs
+                        gainWindowPrePeak = 0
+                        gainWindowPostPeak = 0
+                    }
                     // e5t1：数字静默自愈——peak==0（真全零）连续 SILENT_HEAL_SECONDS 秒
                     // 才触发；<300 的近静音是环境噪音，绝不触发（避免正常静场轮流拆建）。
                     zeroPeakSeconds = if (windowBytes > 0 && windowPeak == 0) {
@@ -1688,6 +1707,20 @@ internal class MicrophoneUplink(
             frame[i + 1] = ((out shr 8) and 0xff).toByte()
             i += 2
         }
+    }
+
+    /**
+     * vc239（MIC-238-01）：按 [applyMicGain] 同一套软膝公式，算出「给定峰值增益后会变成多少」。
+     * 仅用于 5 s 窗口的增益前/后对比打点，不参与实际采样处理。
+     */
+    private fun gainPeakAfter(peak: Int): Int {
+        val gainDb = micGainDb()
+        if (gainDb <= 0) return peak
+        val factor = Math.pow(10.0, gainDb / 20.0).toFloat()
+        val knee = MIC_GAIN_KNEE
+        val span = FULL_SCALE - knee
+        val scaled = (peak * factor).toInt()
+        return if (scaled <= knee) scaled else knee + span * (scaled - knee) / (scaled - knee + span)
     }
 
     private fun sendFrame(socket: DatagramSocket, counters: MicrophoneCounters, frame: ByteArray) {

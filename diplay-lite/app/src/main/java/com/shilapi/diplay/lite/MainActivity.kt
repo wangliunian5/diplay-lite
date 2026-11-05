@@ -33,6 +33,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.shilapi.xcertplay.diag.AnchorLog
 import com.shilapi.xcertplay.media.CarPlayTouchMapper
 import com.shilapi.xcertplay.usbbt.UsbBtStandby
 import com.shilapi.xcertplay.network.WiredVpnService
@@ -1590,7 +1591,9 @@ class MainActivity : Activity() {
 
     private fun startSession(config: LiteConfig, videoKey: String, channel: String = "car") {
         // 日志头段锚点：固定文案、可 grep，供 dongle 日志头尾双保留定位连接起点。
-        LiteLog.log("anchor", "ANCHOR connect-begin")
+        // vc239（LOG-238-02）：同一轮 1.5s 内的重复调用只打第一条；带 session/gen 归属，
+        // 若常驻广播的 link-ready 先到，本行沿用那一代（消除 vc238「晚 2.6s」错配）。
+        AnchorLog.beginConnect()?.let { LiteLog.log("anchor", it) }
         LiteConfig.saveAppliedVideoKey(this, videoKey)
         // 记录本轮会话通道：每卡绿点按它判定"哪张卡在连/已连"（UI 层自有键，不动 LiteConfig）。
         getSharedPreferences(SESSION_PREFS, MODE_PRIVATE)
@@ -1744,11 +1747,8 @@ class MainActivity : Activity() {
      * 免去「先点连接、再等手机回连」的对时序要求（legacy 也是回连即建链）。
      */
     private fun onUsbBtLinkReady() {
-        // vc207：「优先用外置蓝牙广播」关 → iPhone 回连 dongle 后不自动发起连接（只记日志）
-        if (!LiteConfig.usbBtPreferExternalOf(this)) {
-            LiteLog.log("ui", "外置蓝牙：iPhone 已回连（「优先用外置蓝牙广播」已关，不自动发起连接）")
-            return
-        }
+        // vc241：「优先用外置蓝牙广播」设置项已删除——固定为外置广播，iPhone 回连后一律自动发起连接。
+        LiteLog.log("ui", "外置蓝牙：已固定为外置广播（iPhone 回连后自动发起连接）")
         handler.post {
             // vc231：FAILED 是上一轮 teardown 遗留状态（48s watchdog 超时等），
             // 这时 iPhone 重新连过来（standby publish）也应该触发自动连接。

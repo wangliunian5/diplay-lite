@@ -9,10 +9,8 @@ import android.graphics.drawable.ClipDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.util.Base64
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -34,18 +32,6 @@ import java.io.File
 import com.shilapi.xcertplay.transport.PcapTap
 import com.shilapi.xcertplay.usbbt.UsbBtBootstrapStream
 import com.shilapi.xcertplay.usbbt.UsbBtStandby
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import java.util.Timer
-import java.util.TimerTask
-import java.util.concurrent.atomic.AtomicBoolean
-import javax.net.ssl.HttpsURLConnection
-import javax.net.ssl.SSLContext
-import org.json.JSONObject
 
 /**
  * 横竖屏模式落到窗口上：land/portrait 强制。
@@ -1534,191 +1520,37 @@ class SettingsPage(private val activity: MainActivity) {
         toast("已导出：${exported.name}")
     }
 
-    // ---------- M6k25：运行日志上传到 Gitee（无自有服务器，用户给的固定仓库+令牌） ----------
+    // ---------- vc240：运行日志上传（含 dongle 链路，四段式统一件） ----------
 
     private var giteeUploadButton: Button? = null
     @Volatile private var giteeUploading = false
 
-    /** 组装日志文本 → 本地落盘重命名副本 → worker 线程上传 Gitee。 */
+    /** 组装四段式上传件（失败回落 dongle skeleton 模式）→ worker 线程上传 Gitee（60s 总超时）。 */
     private fun uploadLogToGitee() {
         if (giteeUploading) return
-        val logFile = LiteLog.currentFile()
-        if (logFile == null || !logFile.isFile || logFile.length() == 0L) {
+        val prepared = RuntimeLogUploader.prepare(activity)
+        if (prepared == null) {
             toast("上传失败：日志为空")
             return
-        }
-        val versionName = try {
-            activity.packageManager.getPackageInfo(activity.packageName, 0).versionName
-        } catch (_: Exception) {
-            "unknown"
-        }
-        val systemVersion = "Android${Build.VERSION.RELEASE}-api${Build.VERSION.SDK_INT}"
-        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        // 文件名 = 年月日时间 + 系统版本 + 软件版本（去除文件系统不友好字符）
-        val safeModel = Build.MODEL.trim().replace(Regex("[^0-9A-Za-z._-]"), "-")
-        val fileName =
-            "diplay-$stamp-$systemVersion-v$versionName-$safeModel.txt"
-                .replace(Regex("[\\s]+"), "")
-        val maxBytes = 512 * 1024
-        val raw = logFile.readBytes()
-        val logPart = if (raw.size > maxBytes) raw.copyOfRange(raw.size - maxBytes, raw.size) else raw
-        val header = buildString {
-            append("设备：").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n")
-            val metrics = android.content.res.Resources.getSystem().displayMetrics
-            append("分辨率：").append(metrics.widthPixels).append("x").append(metrics.heightPixels)
-                .append(" density=").append(metrics.density).append("\n")
-            append("系统版本：").append(systemVersion).append("（release ").append(Build.VERSION.RELEASE).append("）\n")
-            // vc95：ROM 标识 + ROM 编译时间——同 Android 版本的白牌车机大量雷同（鼎微多台
-            // 同为 4.4.2、FE-6 各车 5.1），仅凭 MODEL 无法定位到具体一台测试机；display.id
-            // 缺失/雷同（generic）时回退 Build.ID，再以 ROM 编译时间兜底区分。
-            val romDisplay = Build.DISPLAY?.trim().orEmpty().ifEmpty { Build.ID }
-            append("ROM版本：").append(romDisplay)
-                .append("（built ").append(SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(Build.TIME)))
-                .append("）\n")
-            append("软件版本：").append(versionName).append("\n")
-            append("上传时间：").append(stamp).append("\n")
-            append("──── 运行日志 ────\n")
-        }
-        // 先在本地生成重命名副本（同一目录），网络不通时用户可从这里取
-        val localCopy = File(logFile.parentFile, fileName)
-        try {
-            localCopy.outputStream().use { it.write(header.toByteArray(Charsets.UTF_8)); it.write(logPart) }
-        } catch (error: Exception) {
-            LiteLog.log("log", "Gitee 上传：本地副本写入失败 ${error.message.orEmpty()}")
         }
         giteeUploading = true
         giteeUploadButton?.isEnabled = false
         Thread({
-            val outcome = try {
-                val headerEncoded = Base64.encodeToString(
-                    header.toByteArray(Charsets.UTF_8) + logPart,
-                    Base64.NO_WRAP,
-                )
-                uploadLogToGitee(fileName, stamp, headerEncoded)
-                // 成功
-                "上传成功"
-            } catch (error: UploadException) {
-                LiteLog.log("log", "Gitee 上传失败：HTTP ${error.code} ${error.sanitized}")
-                val reason = if (error.code == 0) error.sanitized else "网络不通或服务异常（HTTP ${error.code}）"
-                "上传失败：$reason。\n已生成「${fileName}」，本地文件：${localCopy.absolutePath}"
-            } catch (error: Exception) {
-                LiteLog.log("log", "Gitee 上传异常：${error.javaClass.simpleName} ${error.message.orEmpty()}")
-                "上传失败：网络不通。\n已生成「${fileName}」，本地文件：${localCopy.absolutePath}"
-            }
+            val result = RuntimeLogUploader.upload(prepared)
             activity.runOnUiThread {
                 giteeUploading = false
                 giteeUploadButton?.isEnabled = true
-                toast(outcome)
+                if (result.ok) {
+                    toast("上传成功：${result.remoteName ?: prepared.fileName}")
+                } else {
+                    // 失败路径留痕：日志侧由 RuntimeLogUploader 记录，界面给出可被用户取用的真实路径。
+                    toast(
+                        "上传失败（${result.error.orEmpty()}）\n" +
+                            "已生成「${prepared.fileName}」，本地文件：${prepared.file.absolutePath}",
+                    )
+                }
             }
         }, "diplay-gitee-upload").start()
-    }
-
-    private class UploadException(val code: Int, val sanitized: String) : Exception("HTTP $code")
-
-    /** 上传到固定仓库（worker 线程调用）；30s 总时长超时，同名冲突加 -1 后缀重试一次。 */
-    private fun uploadLogToGitee(name: String, stamp: String, encoded: String) {
-        val owner = "wangliunian"
-        val repo = "display--log-collection"
-        // 1.1.3（20261012 轮换）：旧 token 27a79346… 已作废。
-        // 脱敏（公开源码前置）：token 由 local.properties 经 BuildConfig.GITEE_LOG_TOKEN 注入，
-        // 未配置时为空串——下方判空降级为「生成文件后手动发送」路径，不再硬编码进源码。
-        val token = BuildConfig.GITEE_LOG_TOKEN
-        if (token.isEmpty()) throw UploadException(0, "GITEE_LOG_TOKEN not configured")
-        val timeoutMillis = 30_000L
-        val deadline = System.currentTimeMillis() + timeoutMillis
-        var attemptName = name
-        var lastCode = 0
-        var lastBody = ""
-        for (attempt in 0..1) {
-            // 总时长上限覆盖建连、写正文、等响应（write 没有独立超时 API）
-            val remaining = deadline - System.currentTimeMillis()
-            if (remaining <= 0) throw UploadException(0, "上传超时（30s）")
-            val timedOut = AtomicBoolean(false)
-            val (code, body) = try {
-                postGiteeContents(owner, repo, token, attemptName, stamp, encoded, remaining, timedOut)
-            } catch (error: Exception) {
-                if (timedOut.get()) throw UploadException(0, "上传超时（30s）")
-                throw error
-            }
-            if (timedOut.get()) throw UploadException(0, "上传超时（30s）")
-            lastCode = code
-            lastBody = body.replace(token, "***").let { if (it.length > 1200) it.substring(0, 1200) + "…" else it }
-            if (code in 200..299) {
-                val path = runCatching {
-                    JSONObject(body).optJSONObject("content")?.optString("path").orEmpty()
-                }.getOrDefault("")
-                LiteLog.log("log", "Gitee 上传成功：${path.ifEmpty { attemptName }}")
-                return
-            }
-            if ((code == 409 || body.contains("already exists", ignoreCase = true)) && attempt == 0) {
-                attemptName = attemptName.removeSuffix(".txt") + "-1.txt"
-                continue
-            }
-            throw UploadException(code, lastBody)
-        }
-        throw UploadException(lastCode, lastBody)
-    }
-
-    /**
-     * POST Gitee contents API（worker 线程调用）。
-     * [timedOut] 由 watchdog 置位：connect/readTimeout 管不到 `outputStream.write()`，
-     * 慢网下写正文会无限期停在「上传中」；daemon Timer 到点 disconnect() 打断写操作。
-     */
-    private fun postGiteeContents(
-        owner: String,
-        repo: String,
-        token: String,
-        name: String,
-        stamp: String,
-        encoded: String,
-        timeoutMs: Long,
-        timedOut: AtomicBoolean,
-    ): Pair<Int, String> {
-        val url = URL(
-            "https://gitee.com/api/v5/repos/$owner/$repo/contents/" + URLEncoder.encode(name, "UTF-8") +
-                "?access_token=" + URLEncoder.encode(token, "UTF-8"),
-        )
-        val body = JSONObject()
-            .put("content", encoded)
-            .put("branch", "master")
-            .put("message", "DiPlay Lite 运行日志 $stamp")
-            .toString()
-        val connection = url.openConnection() as HttpURLConnection
-        val perCallTimeout = if (timeoutMs > Int.MAX_VALUE) Int.MAX_VALUE else timeoutMs.toInt()
-        val watchdog = Timer(true)
-        try {
-            watchdog.schedule(object : TimerTask() {
-                override fun run() {
-                    timedOut.set(true)
-                    runCatching { connection.disconnect() }
-                }
-            }, timeoutMs)
-            connection.requestMethod = "POST"
-            connection.connectTimeout = perCallTimeout
-            connection.readTimeout = perCallTimeout
-            connection.doOutput = true
-            connection.setRequestProperty("Content-Type", "application/json;charset=UTF-8")
-            enableTls12OnKitKat(connection)
-            connection.outputStream.use { out -> out.write(body.toByteArray(Charsets.UTF_8)) }
-            val code = connection.responseCode
-            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-            val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-            return code to text
-        } finally {
-            watchdog.cancel()
-            connection.disconnect()
-        }
-    }
-
-    /** Android 4.x（API16-20）默认不启用 TLSv1.2，Gitee 需要：显式换 SSLContext 兜底。 */
-    private fun enableTls12OnKitKat(connection: HttpURLConnection) {
-        if (Build.VERSION.SDK_INT > 20 || connection !is HttpsURLConnection) return
-        try {
-            val context = SSLContext.getInstance("TLSv1.2")
-            context.init(null, null, null)
-            connection.sslSocketFactory = context.socketFactory
-        } catch (_: Exception) {
-        }
     }
 
     private fun toast(message: String) {

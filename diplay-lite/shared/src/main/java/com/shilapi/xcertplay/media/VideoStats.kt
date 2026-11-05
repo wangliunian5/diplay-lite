@@ -21,6 +21,10 @@ internal class VideoStats(
     // dueGated   = 该上屏时 16ms 门控（RENDER_MIN_INTERVAL_NS）未到期而未上屏（即使没有新帧）。
     private var superseded = 0
     private var dueGated = 0
+    // vc239（VID-234-03）：两个零行为计数器——待渲队列峰值深度、单帧「入队→上屏」最大耗时。
+    // 只观测，用于定论 A1 在 rx≈0 / 静屏时是否扣 buffer。
+    private var pendingDepthPeak = 0
+    private var maxHoldMs = 0L
     private var bytes = 0L
     private var maxArrivalGapNs = 0L
     private var touchSamples = 0
@@ -57,6 +61,17 @@ internal class VideoStats(
     /** vc235：该上屏时 16ms 门控未到期 → 本次不上屏（不是被新帧取代）。 */
     @Synchronized fun onDueGated() { dueGated++ }
 
+    /** vc239（VID-234-03）：待渲队列当前深度（非合并模式按队列长度；合并模式恒为 0/1）。 */
+    @Synchronized fun onPendingDepth(depth: Int) {
+        if (depth > pendingDepthPeak) pendingDepthPeak = depth
+    }
+
+    /** vc239（VID-234-03）：一帧从入队到真正上屏的耗时（含 VSYNC/16ms 门控等待）。 */
+    @Synchronized fun onHold(holdNs: Long) {
+        val holdMs = holdNs / 1_000_000L
+        if (holdMs > maxHoldMs) maxHoldMs = holdMs
+    }
+
 
     @Synchronized fun onInputStalled() { inputStalled++ }
 
@@ -84,10 +99,12 @@ internal class VideoStats(
         val heapMaxMb = runtime.maxMemory() / (1024 * 1024)
         val line = ("video stats$label rx=%.1ffps shown=%.1ffps maxGap=%dms kbps=%d recoveries=%d " +
             "backlog=%d stalled=%d flush=%d superseded=%d dueGated=%d " +
+            "pendingDepthPeak=%d maxHoldMs=%d " +
             "heap=%d/%dMB touch2frame avg=%dms max=%dms n=%d touchSendMax=%dms").format(
             rx, shown, maxGapMs,
             (bytes * 8 / 1000 / seconds).toLong(), recoveries,
             backlogs, inputStalled, flushes, superseded, dueGated,
+            pendingDepthPeak, maxHoldMs,
             heapUsedMb, heapMaxMb,
             touchAvgMs, maxTouchLatencyNs / 1_000_000, touchSamples, TouchLatencyProbe.maxSendNs / 1_000_000,
         ) + " " + (processLoad.sample(now) ?: "cpu=? threads=?")
@@ -96,6 +113,7 @@ internal class VideoStats(
         windowStartNs = now
         received = 0; rendered = 0; recoveries = 0; backlogs = 0; inputStalled = 0; flushes = 0
         superseded = 0; dueGated = 0
+        pendingDepthPeak = 0; maxHoldMs = 0
         bytes = 0; maxArrivalGapNs = 0
         touchSamples = 0; touchLatencySumNs = 0; maxTouchLatencyNs = 0
         return line

@@ -581,7 +581,9 @@ private class VideoDecoder(
     private var lastRenderVsyncSeq = 0L
     // vc237（A1）：待渲输出缓冲队列（仅在 noCoalesce=true 时使用；仅解码线程访问）。
     // 关开关时完全不走这里，合并行为与 vc236 一致。队列长度天然受解码器输出缓冲个数限制。
-    private val pendingOutputs = java.util.ArrayDeque<Int>()
+    // vc239（VID-234-03）：元素带出队时刻，供统计「入队→上屏」最大耗时（纯观测，不影响出队顺序）。
+    private class PendingOutput(val index: Int, val enqueuedNs: Long)
+    private val pendingOutputs = java.util.ArrayDeque<PendingOutput>()
     // M6k：最近一次喂入的帧是不是随机访问帧（IDR）。解码失败时落盘，用于判读"是否从 P 帧续解"。
     @Volatile private var lastFrameKeyFrame = true
     // 1.0.29（AC8227 倒车闪屏）：恢复看门狗计数——关键帧连发无渲染 = control 通道疑似死亡。
@@ -1052,14 +1054,17 @@ private class VideoDecoder(
         // 改法：只持有最新一个输出缓冲，被更新帧取代的旧帧静默归还（render=false），
         // 等没有新帧时才真正渲染最新帧 —— burst 期间合成量 N→1，撕裂源消失。
         var pendingIndex = -1
+        // vc239（VID-234-03）：合并模式下当前持有帧的入队时刻（纯观测）。
+        var pendingSinceNs = 0L
         fun renderPending(): Boolean {
             // vc237（A1）：待渲帧先出队；未到节拍再放回队首。关开关仍走原 pendingIndex，
             // 合并/丢弃行为与 vc236 逐字节一致。加锁只为防 close/flush 线程并发清队。
-            val index = if (noCoalesce) {
+            val queued = if (noCoalesce) {
                 synchronized(pendingOutputs) {
-                    if (pendingOutputs.isEmpty()) -1 else pendingOutputs.removeFirst()
+                    if (pendingOutputs.isEmpty()) null else pendingOutputs.removeFirst()
                 }
-            } else pendingIndex
+            } else null
+            val index = if (noCoalesce) (queued?.index ?: -1) else pendingIndex
             if (index >= 0) {
                 // 1.1.3 修复（8815 011235 无画面定案②）：**不得按 info.size 过滤**——Surface 输出模式下
                 // 高通 OMX 的输出 BufferInfo.size 恒为 0（数据直送 surface，size 无意义），
@@ -1086,6 +1091,9 @@ private class VideoDecoder(
                 if (render) {
                     lastRenderRequestNs = nowNs
                     if (vsyncDriven) lastRenderVsyncSeq = vsyncSeq
+                    // vc239（VID-234-03）：入队→上屏耗时（含节拍等待），只记最大值，不影响调度。
+                    val enqueuedNs = if (noCoalesce) (queued?.enqueuedNs ?: nowNs) else pendingSinceNs
+                    if (enqueuedNs > 0) stats.onHold(nowNs - enqueuedNs)
                 }
                 // vc237（A1）：不合并且未到 VSYNC 时**不归还**缓冲——帧放回队首等下一次节拍；
                 // 合并模式与 vc236 完全相同（无论是否渲染都归还缓冲）。
@@ -1101,7 +1109,9 @@ private class VideoDecoder(
                         pendingIndex = -1
                     }
                 } else if (outputSurface != null && !renderHold) {
-                    synchronized(pendingOutputs) { pendingOutputs.addFirst(index) }
+                    // 放回队首时必须带原始入队时刻，否则 maxHoldMs 会被门控等待反复清零。
+                    val frame = queued
+                    if (frame != null) synchronized(pendingOutputs) { pendingOutputs.addFirst(frame) }
                 } else {
                     // 无 surface / 恢复挂起：不积压，直接归还，避免解码器输出缓冲被长期占用。
                     try {
@@ -1144,7 +1154,13 @@ private class VideoDecoder(
                         if (renderHold) {
                             codec.releaseOutputBuffer(index, false)
                         } else {
-                            synchronized(pendingOutputs) { pendingOutputs.addLast(index) }
+                            // vc239（VID-234-03）：入队即记时刻，并在入队后采样队列深度峰值。
+                            val pending = PendingOutput(index, System.nanoTime())
+                            val depth = synchronized(pendingOutputs) {
+                                pendingOutputs.addLast(pending)
+                                pendingOutputs.size
+                            }
+                            stats.onPendingDepth(depth)
                         }
                     } else {
                         // 上一帧被更新帧取代：静默归还，不上合成器。
@@ -1155,6 +1171,7 @@ private class VideoDecoder(
                             stats.onSuperseded()
                         }
                         pendingIndex = index
+                        pendingSinceNs = System.nanoTime()
                     }
                 }
                 // 负值未知码（防御）：与 TRY_AGAIN 同样必须退出，防忙循环。
@@ -1205,7 +1222,7 @@ private class VideoDecoder(
     private fun discardPendingOutputs(codec: MediaCodec) {
         while (true) {
             val index = synchronized(pendingOutputs) {
-                if (pendingOutputs.isEmpty()) -1 else pendingOutputs.removeFirst()
+                if (pendingOutputs.isEmpty()) -1 else pendingOutputs.removeFirst().index
             }
             if (index < 0) return
             try {

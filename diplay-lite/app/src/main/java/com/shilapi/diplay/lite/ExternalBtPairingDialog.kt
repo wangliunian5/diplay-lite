@@ -24,13 +24,11 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.shilapi.xcertplay.diag.AnchorLog
 import com.shilapi.xcertplay.usbbt.DiscoveredDevice
 import com.shilapi.xcertplay.usbbt.PairedDevice
 import com.shilapi.xcertplay.usbbt.PairState
 import com.shilapi.xcertplay.usbbt.UsbBtStandby
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * vc207：外置蓝牙配对窗 v2（设计稿 工程文档/设计稿-外置蓝牙配对-v2-20261103 + 用户截图字段）。
@@ -46,8 +44,8 @@ import java.util.Locale
  * 此时 host 因已存 link key 仍保持 scan=3 可发现）。已发现设备来自 host 侧 inquiry 快照
  * （窗口开着时约 10s 一轮），整行可点 → startPairing() 发起 dedicated bonding（复用既有 SSP 应答链）。
  *
- * dongle 日志：只保留「上传」[DongleLogUploader]（Gitee 私有仓，30s 超时，TLS1.2 兜底），
- * 上传键与标题同行；下方状态行：尚未生成 / 上传中 / 上次上传时间 / 失败（含本地绝对路径）。
+ * vc240：本弹层的 dongle 独立上传入口已删除（统一到设置页「运行日志」）；
+ * dongle 链路组装能力保留在 [DongleLogUploader]（skeleton 模式，供四段式组装失败兜底）。
  *
  * API16：全部自绘（GradientDrawable/Canvas/ToggleView），无 Switch/Material 组件。
  */
@@ -91,8 +89,6 @@ object ExternalBtPairingDialog {
         )
     }
 
-    private enum class UploadState { IDLE, UPLOADING, SUCCESS, FAIL }
-
     @SuppressLint("SetTextI18n") // 全仓中文硬编码惯例（同 AppDialog），本弹层文案随状态动态拼接
     private class DialogUi(
         private val activity: MainActivity,
@@ -106,11 +102,6 @@ object ExternalBtPairingDialog {
 
         private var dongleName: String = LiteConfig.load(activity).usbBtDongleName
         private var settingsExpanded = false // 竖屏设置组默认折叠
-        private var uploadState = UploadState.IDLE
-        private var uploadFileName: String? = null // 本地生成/上传成功的文件名
-        private var uploadDetail: String? = null   // 失败原因
-        private var uploadFilePath: String? = null // 失败时本地文件的绝对路径（File.absolutePath）
-        private var uploadTime: String? = null     // 上次上传成功时间（HH:mm:ss）
 
         private val tick = object : Runnable {
             override fun run() {
@@ -277,7 +268,9 @@ object ExternalBtPairingDialog {
                 LiteConfig.usbBtKeepStandbyOf(activity) &&
                 state == PairState.UNPAIRED && UsbBtStandby.pairingRemainingMillis() <= 0
             ) {
+                // vc239（LOG-238-02）：配对窗打开锚点也落 LiteLog（shared 侧 companion 只能落 logcat）。
                 UsbBtStandby.enterPairingMode()
+                LiteLog.log("anchor", AnchorLog.mark("pair-window-open"))
                 LiteLog.log("ui", "外置蓝牙：未配对，自动保持配对窗口（可被发现）")
             }
             val paired = UsbBtStandby.pairedDevices()
@@ -295,10 +288,7 @@ object ExternalBtPairingDialog {
                 append('|').append(pairTarget)
                 append('|').append(dongleName)
                 append('|').append(settingsExpanded)
-                append('|').append(uploadState).append('|').append(uploadFileName)
-                append('|').append(uploadTime).append('|').append(uploadFilePath).append('|').append(uploadDetail)
                 append('|').append(LiteConfig.usbBtAutoInitOf(activity))
-                append(LiteConfig.usbBtPreferExternalOf(activity))
                 append(LiteConfig.usbBtKeepStandbyOf(activity))
             }
             if (!force && signature == lastSignature) return
@@ -329,7 +319,7 @@ object ExternalBtPairingDialog {
             column.addView(nameRow(state))
             column.addView(sectionTitle("外置蓝牙设置", null))
             column.addView(chipInfoBlock(address, info))
-            column.addView(dongleLogBlock())
+            // vc240：dongle 日志独立入口已删除（统一到设置页运行日志上传）。
             column.addView(settingRow(
                 "开机自动初始化", "上电即初始化，缩短首次等待；老车机可能拖慢启动。",
                 recommendOn = false,
@@ -338,14 +328,7 @@ object ExternalBtPairingDialog {
                 LiteConfig.setUsbBtAutoInit(activity, v)
                 true
             })
-            column.addView(settingRow(
-                "优先用外置蓝牙广播", "连接优先走 dongle，减少与车机蓝牙抢设备。",
-                recommendOn = true,
-                checked = LiteConfig.usbBtPreferExternalOf(activity),
-            ) { v ->
-                LiteConfig.setUsbBtPreferExternal(activity, v)
-                true
-            })
+            // vc241：「优先用外置蓝牙广播」设置项已删除，固定走外置 dongle 广播。
             column.addView(keepStandbyRow())
         }
 
@@ -593,7 +576,7 @@ object ExternalBtPairingDialog {
                 if (!pairingThis && !alreadyPaired) {
                     setOnClickListener {
                         // 日志头段锚点：配对开始（固定文案，可 grep）。
-                        LiteLog.log("anchor", "ANCHOR pair-begin")
+                        LiteLog.log("anchor", AnchorLog.mark("pair-begin"))
                         val ok = UsbBtStandby.startPairing(dev.address)
                         LiteLog.log("ui", "外置蓝牙：点击已发现设备发起配对 addr=${dev.address} ok=$ok")
                         toast(if (ok) "已发起配对：$displayName" else "当前不可发起配对（需开着可被发现）")
@@ -624,7 +607,7 @@ object ExternalBtPairingDialog {
             })
             if (collapsible && !settingsExpanded) return
             column.addView(chipInfoBlock(address, info))
-            column.addView(dongleLogBlock())
+            // vc240：dongle 日志独立入口已删除（统一到设置页运行日志上传）。
             column.addView(settingRow(
                 "开机自动初始化", "上电即初始化，缩短首次等待；老车机可能拖慢启动。",
                 recommendOn = false,
@@ -633,14 +616,7 @@ object ExternalBtPairingDialog {
                 LiteConfig.setUsbBtAutoInit(activity, v)
                 true
             })
-            column.addView(settingRow(
-                "优先用外置蓝牙广播", "连接优先走 dongle，减少与车机蓝牙抢设备。",
-                recommendOn = true,
-                checked = LiteConfig.usbBtPreferExternalOf(activity),
-            ) { v ->
-                LiteConfig.setUsbBtPreferExternal(activity, v)
-                true
-            })
+            // vc241：「优先用外置蓝牙广播」设置项已删除，固定走外置 dongle 广播。
             column.addView(keepStandbyRow())
         }
 
@@ -659,10 +635,25 @@ object ExternalBtPairingDialog {
                 toast(if (want) "当前连接使用中，断开后再开启" else "当前连接使用中，断开后再关闭")
                 false
             } else {
+                // vc239（LOG-238-02 / BT-238-01）：总闸开关锚点 + 关闭时的实际可发现状态，
+                // 供日志侧证实「关掉后不可被搜索、但已配对设备仍可主动连上」。
+                LiteLog.log("anchor", AnchorLog.mark(if (want) "gate-on" else "gate-off"))
+                LiteLog.log(
+                    "usbbt",
+                    if (want) {
+                        "gate-on 实际状态：Write_Scan_Enable=0x03（inquiry scan 开 / page scan 开，可被搜索）"
+                    } else {
+                        "gate-off 实际状态：Write_Scan_Enable=0x02（inquiry scan 关 / page scan 开，不可被搜索但可回连）"
+                    },
+                )
                 LiteConfig.setUsbBtKeepStandby(activity, want)
                 if (want) {
                     // 重新开播：未配对先续配对窗口，配对窗「已发现设备」随即恢复搜索。
-                    if (UsbBtStandby.pairState == PairState.UNPAIRED) UsbBtStandby.enterPairingMode()
+                    if (UsbBtStandby.pairState == PairState.UNPAIRED) {
+                        UsbBtStandby.enterPairingMode()
+                        // vc239（LOG-238-02）：配对窗打开锚点（LiteLog 侧）。
+                        LiteLog.log("anchor", AnchorLog.mark("pair-window-open"))
+                    }
                     activity.ensureUsbBtStandby()
                 }
                 true
@@ -687,109 +678,6 @@ object ExternalBtPairingDialog {
                     setPadding(0, dp(3), 0, 0)
                 })
             }
-
-        /** vc238：dongle 连接日志 —— 标题与[上传]同一行，下方只留状态行（无导出键/无说明文字）。
-         *  上传中按钮冻结并置灰为「上传中…」；成功记上次上传时间；失败/超时给本地绝对路径。 */
-        private fun dongleLogBlock(): View =
-            LinearLayout(activity).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(0, dp(8), 0, dp(2))
-                val uploading = uploadState == UploadState.UPLOADING
-                addView(LinearLayout(activity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    addView(TextView(activity).apply {
-                        text = "dongle 连接日志"
-                        setTextColor(Ui.TEXT)
-                        textSize = 13f
-                    }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-                    addView(logButton(if (uploading) "上传中" else "上传", enabled = !uploading) {
-                        startUpload()
-                    })
-                })
-                addView(TextView(activity).apply {
-                    text = when (uploadState) {
-                        UploadState.IDLE -> "尚未生成日志文件"
-                        UploadState.UPLOADING -> "上传中… · ${uploadFileName.orEmpty()}"
-                        UploadState.SUCCESS -> "上次上传 ${uploadTime.orEmpty()} · ${uploadFileName.orEmpty()}"
-                        UploadState.FAIL -> "上传失败：${uploadDetail.orEmpty()}\n本地文件：${uploadFilePath.orEmpty()}"
-                    }
-                    setTextColor(
-                        when (uploadState) {
-                            UploadState.SUCCESS -> 0xFF8FF0AE.toInt()
-                            UploadState.FAIL -> Ui.WARNING
-                            else -> 0xFF7F91AB.toInt()
-                        },
-                    )
-                    textSize = 10f
-                    typeface = Typeface.MONOSPACE
-                    setLineSpacing(0f, 1.3f)
-                    setPadding(0, dp(5), 0, 0)
-                })
-            }
-
-        /** vc238：只保留主按钮样式（导出键已删，次按钮样式无引用，一并去掉）。 */
-        private fun logButton(
-            text: String,
-            enabled: Boolean,
-            onClick: () -> Unit,
-        ): View = TextView(activity).apply {
-            this.text = if (!enabled) "$text…" else text
-            textSize = 12.5f
-            gravity = Gravity.CENTER
-            setPadding(dp(9), 0, dp(9), 0)
-            isEnabled = enabled
-            if (!enabled) {
-                setTextColor(0xFF7F91AB.toInt())
-                background = GradientDrawable().apply {
-                    setColor(0x852E3B52.toInt())
-                    cornerRadius = dp(7).toFloat()
-                }
-            } else {
-                setTextColor(Ui.PRIMARY_ON)
-                background = GradientDrawable().apply {
-                    setColor(Ui.ACCENT)
-                    cornerRadius = dp(7).toFloat()
-                }
-            }
-            if (enabled) setOnClickListener { onClick() }
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(30))
-        }
-
-        /** 上传四态：点击即冻结按钮、后台上传；成功记上次上传时间；失败/超时给本地绝对路径。 */
-        private fun startUpload() {
-            if (uploadState == UploadState.UPLOADING) return
-            val prepared = DongleLogUploader.prepare(activity)
-            if (prepared == null) {
-                toast("上传失败：暂无 dongle 日志")
-                return
-            }
-            uploadState = UploadState.UPLOADING
-            uploadFileName = prepared.fileName
-            uploadDetail = null
-            uploadFilePath = prepared.file.absolutePath
-            refresh(force = true)
-            Thread({
-                val result = DongleLogUploader.upload(prepared)
-                activity.runOnUiThread {
-                    if (result.ok) {
-                        uploadState = UploadState.SUCCESS
-                        uploadFileName = result.remoteName ?: prepared.fileName
-                        uploadDetail = null
-                        uploadFilePath = prepared.file.absolutePath
-                        uploadTime = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
-                        toast("上传成功：$uploadFileName")
-                    } else {
-                        uploadState = UploadState.FAIL
-                        uploadDetail = result.error.orEmpty().ifEmpty { "超时或网络不可用" }
-                        uploadFilePath = prepared.file.absolutePath
-                        // 已删「导出」键：失败时必须给出可被用户取用的真实绝对路径。
-                        toast("上传失败（$uploadDetail）\n本地文件：$uploadFilePath")
-                    }
-                    refresh(force = true)
-                }
-            }, "dongle-log-upload").start()
-        }
 
         /** 设置开关行：名称 + 建议 tag + ToggleView；下挂说明。
          *  vc238：onChange 返回 false = 拒绝本次切换（开关弹回原状态），用于总闸占用中保护。 */

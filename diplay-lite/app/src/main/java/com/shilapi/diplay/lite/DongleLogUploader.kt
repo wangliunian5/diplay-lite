@@ -159,10 +159,19 @@ object DongleLogUploader {
         }
         if (tailStart < headEnd) tailStart = headEnd
         val omitted = tailStart - headEnd
-        val marker = if (omitted > 0 && headEnd < lines.size) {
+        val truncated = omitted > 0 && headEnd < lines.size
+        val marker = if (truncated) {
             "… 已省略 $omitted 行（${lineTime(lines[headEnd])} ~ ${lineTime(lines[tailStart - 1])}；超 512KB，头尾双保留）…\n"
         } else {
             ""
+        }
+        // vc239（LOG-262-01）：真正触发头尾双保留时才落这一行，让日志侧能证实标记确实插入。
+        if (truncated) {
+            LiteLog.log(
+                "log",
+                "已截断：省略 $omitted 行（${lineTime(lines[headEnd])} ~ " +
+                    "${lineTime(lines[tailStart - 1])}；头尾双保留）",
+            )
         }
         val headText = lines.subList(headStart, headEnd).joinToString("\n")
         val tailText = if (tailStart < lines.size) {

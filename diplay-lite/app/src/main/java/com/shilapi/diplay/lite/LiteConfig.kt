@@ -228,12 +228,8 @@ data class LiteConfig(
         fun setUsbBtAutoInit(context: Context, v: Boolean) =
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("usb_bt_auto_init", v).apply()
 
-        /** vc207：优先用外置蓝牙广播（默认开；关=iPhone 回连 dongle 后不自动发起连接）。 */
-        fun usbBtPreferExternalOf(context: Context): Boolean =
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("usb_bt_prefer_external", true)
-
-        fun setUsbBtPreferExternal(context: Context, v: Boolean) =
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("usb_bt_prefer_external", v).apply()
+        // vc241：删除「优先用外置蓝牙广播」配置项——固定走外置 dongle 广播，旧键
+        // usb_bt_prefer_external 不再读取，残留值自然失效。
 
         /** vc207：保持常驻广播（默认开；关=空闲一轮后停广播，省电）。 */
         fun usbBtKeepStandbyOf(context: Context): Boolean =

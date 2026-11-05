@@ -2,6 +2,7 @@ package com.shilapi.xcertplay.usbbt
 
 import android.content.Context
 import android.util.Log
+import com.shilapi.xcertplay.diag.AnchorLog
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 
 /**
@@ -361,8 +362,10 @@ object UsbBtStandby {
                 }
                 diag(onDiagnostic, "usbbt-standby: iPhone 链路已就绪，等待控制器取用")
                 // 日志头段锚点：首次连上（固定文案，可 grep）。直接走诊断出口，不覆盖 UI 状态行。
-                Log.i(TAG, "ANCHOR link-ready")
-                onDiagnostic?.let { runCatching { it("ANCHOR link-ready") } }
+                // vc239（LOG-238-02）：带 session/gen；若本轮 connect-begin 已在等链路则归属同一代。
+                val linkReadyAnchor = AnchorLog.linkReady()
+                Log.i(TAG, linkReadyAnchor)
+                onDiagnostic?.let { runCatching { it(linkReadyAnchor) } }
                 runCatching { onLinkReady?.invoke() }
 
                 // 1) 等控制器取走（窗口 HANDOFF_WAIT_MILLIS）。
@@ -400,6 +403,10 @@ object UsbBtStandby {
                 // 2) 控制器已取走（slot 已空）→ 所有权转移：loop 暂停迭代，等控制器 close 再恢复广播。
                 handedOff = stream
                 diag(onDiagnostic, "usbbt-standby: 流已交出，暂停迭代（等控制器 close 后恢复常驻广播）")
+                // vc239（LOG-238-02）：所有权交接开始锚点（带 session/gen）。
+                val handoffBeginAnchor = AnchorLog.mark("handoff-begin")
+                Log.i(TAG, handoffBeginAnchor)
+                onDiagnostic?.let { runCatching { it(handoffBeginAnchor) } }
                 awaitHandoffClosed(stream, myGeneration)
                 // vc236（BT-235-01）：只有真正 close 才清引用。若是本代先被 stop（Activity
                 // 销毁）而控制器还没关，保留 handedOff 给下一代 loop 先等它释放。
@@ -409,6 +416,10 @@ object UsbBtStandby {
                     break
                 }
                 diag(onDiagnostic, "usbbt-standby: 流 close，恢复常驻广播")
+                // vc239（LOG-238-02）：所有权交接结束锚点（控制器已 close，链路归还）。
+                val handoffEndAnchor = AnchorLog.mark("handoff-end")
+                Log.i(TAG, handoffEndAnchor)
+                onDiagnostic?.let { runCatching { it(handoffEndAnchor) } }
                 // vc233（BT-232-02）：重开前静默 500ms，让内核与旧 driver 把接口释放干净，
                 // 避免 forceClaim 抢在 release 之前 → 首命令 ReadLocalVersion 白等 3s。
                 // sleepQuietly 内部每 200ms 校验 isRunning 与代际，stop()/换轮即刻退出，
