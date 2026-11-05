@@ -226,6 +226,13 @@ class CarPlayController(
     @Volatile private var bonjour: CarPlayBonjour? = null
     @Volatile private var bluetoothSocket: BluetoothSocket? = null
     @Volatile private var bluetoothStream: BlockingDuplexByteStream? = null
+
+    /**
+     * vc246（两处误报修正）：蓝牙链路真正交出时的代次。First TCP 看门狗与
+     * 「等常驻广播交出链路」阶段的提示都要先确认该值等于当前代次，
+     * 避免「链路从未建立」被误报成「iPhone 没连 Wi-Fi」。
+     */
+    @Volatile private var bluetoothLinkReadyGeneration = 0
     @Volatile private var wirelessTunnelChannel: Iap2Session? = null
     @Volatile private var wirelessIdentification: Iap2IdentificationConfig? = null
     @Volatile private var wirelessAirPlayEndpoint: Iap2WirelessCarPlayEndpoint? = null
@@ -851,7 +858,9 @@ class CarPlayController(
                 closeWirelessStack(keepHotspotForReuse = true)
                 // M6k11：僵尸族第 3 次起，teardown 后顺带 reset 本机蓝牙适配器，
                 // 清车机侧 RFCOMM 服务状态。失败只记日志不阻断重连。
-                if (!closed && wirelessZombieMode && wirelessRetryCount.get() >= 3) {
+                // vc244：外置 dongle 链路不 reset 机内适配器——本链路不走机内蓝牙，
+                // disable()/enable() 只会把机内适配器拉起来，给 iPhone 多一个可配对目标。
+                if (!config.usbBtDongle && !closed && wirelessZombieMode && wirelessRetryCount.get() >= 3) {
                     try {
                         val adapter = bluetoothAdapter
                         if (adapter?.isEnabled == true) {
@@ -1023,17 +1032,11 @@ class CarPlayController(
             // 而不是挂到 45s handoff 超时（旧路径 bootstrap 超时不触发重连，等于死等）。
             // [RELAY-TEST] 实验模式下看门狗须让位：三阶段总时长 ~134s（60 重发+2+10+60 恢复），
             // 30s 默认值会在假凭证发出前把会话判死（00:28 日志实证 phase2 从未触达）。
-            armFirstTcpWatchdog(
-                generation,
-                timeoutMillis = if (
-                    Iap2WirelessControlClient.RELAY_TEST_ENABLED &&
-                    config.wirelessHotspotMode == WirelessHotspotMode.RELAY
-                ) {
-                    RELAY_TEST_FIRST_TCP_TIMEOUT_MILLIS
-                } else {
-                    FIRST_TCP_TIMEOUT_MILLIS
-                },
-            )
+            //
+            // vc246（两处误报修正）：看门狗改到「蓝牙链路真正交出」之后再启动（见下方
+            // bluetoothStream 赋值处）。此前在这里启动，dongle 路径还卡在「等常驻广播交出
+            // iPhone 链路」时就被判 First TCP timeout 并弹 WLAN 提示——真实原因（链路未交出）
+            // 反而被抢在它前面报出。未建立链路阶段不得启动、更不得判死。
             if (isStaleWirelessRun(generation)) {
                 closeWirelessStack()
                 return
@@ -1121,6 +1124,19 @@ class CarPlayController(
             } else {
                 BluetoothRfcommDuplexStream(socket!!)
             }.also { bluetoothStream = it }
+            // vc246（两处误报修正）：蓝牙链路已真正交出，此刻才启动 First TCP 看门狗。
+            bluetoothLinkReadyGeneration = generation
+            armFirstTcpWatchdog(
+                generation,
+                timeoutMillis = if (
+                    Iap2WirelessControlClient.RELAY_TEST_ENABLED &&
+                    config.wirelessHotspotMode == WirelessHotspotMode.RELAY
+                ) {
+                    RELAY_TEST_FIRST_TCP_TIMEOUT_MILLIS
+                } else {
+                    FIRST_TCP_TIMEOUT_MILLIS
+                },
+            )
             // [BT-PROBE] t3 蓝牙兼容实验：每代连接轮换一次握手策略，一轮重试拿满三种模式的现场。
             // mode 0 = 现行（发 Marker，等 iPhone 回 Marker 后协商）
             // mode 1 = 静默等待（不发 Marker，纯等 iPhone 先发 Marker）
@@ -1850,6 +1866,8 @@ class CarPlayController(
                     closed ||
                     phase != Phase.WIRELESS ||
                     generation != wirelessGeneration.get() ||
+                    // vc246（两处误报修正）：链路从未交出的阶段不启动、不判死、不提示 WLAN。
+                    bluetoothLinkReadyGeneration != generation ||
                     wirelessActiveReported.get() ||
                     wirelessDegradedActive.get() ||
                     // handoff 流程有自己的 45s 看门狗与降级判定，互不干预。

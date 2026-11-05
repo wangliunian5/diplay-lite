@@ -273,6 +273,16 @@ internal class UsbBtHost(
         /** vc207：我方主动配对目标（null=未发起）。 */
         fun pairTargetSnapshot(): String? = pairTarget
 
+        /**
+         * vc246（自动连接撞常驻广播窗口）：控制器正在等常驻广播交出链路。
+         * 置位期间，host 初始化完成会**补踢一次**回连（去掉 vc219「只踢一次」的单发语义）。
+         */
+        @Volatile
+        internal var controllerWaitingForLink: Boolean = false
+
+        /** vc246：当前活 host 是否已完成初始化（仅用于观测/自检，不参与踢回连判定）。 */
+        fun isHostReady(): Boolean = activeHost?.phase == Phase.DISCOVERABLE
+
         /** vc207：点击已发现设备 → 发起配对（dedicated bonding：page 连上后主动要认证走 SSP）。 */
         fun startPairing(address: String): Boolean = activeHost?.pageForPairing(address) ?: false
 
@@ -287,6 +297,9 @@ internal class UsbBtHost(
          */
         internal fun requestActiveConnect(): Boolean {
             val host = activeHost ?: return false
+            // vc246（自动连接撞常驻广播窗口）：host 尚未完成初始化时不能踢——
+            // 上一代残留实例会让本函数假返回 true（踢出去的 page 无人承接）。
+            if (host.phase != Phase.DISCOVERABLE) return false
             // vc232：链路已在（iPhone 已 incoming 连进来，或上一轮 page 已建链）→ 绝不再 page。
             // page 与 incoming 互斥：vc231 实测「iPhone 手动连上后我们补发 page」把对方
             // 的 incoming 链路打断（双方各自等 ConnectionComplete），表现为「卡在网络链路中」。
@@ -672,6 +685,10 @@ internal class UsbBtHost(
             aclCredits = aclPackets
             activeHost = this // vc207：注册活实例（UI 发起配对/inquiry 状态入口）
             setStatus("dongle 就绪（${localAddr ?: "地址未知"}），等待 iPhone 连接")
+            // vc246：控制器正在等链路的话，初始化完成即补踢一次（vc219 的单发语义已去掉）。
+            if (controllerWaitingForLink && requestActiveConnect()) {
+                Log.i(UsbBtSession.TAG, "host: 初始化完成且控制器在等链路 → 补踢回连")
+            }
             onReady?.invoke()
         } else {
             // 派发下一步（本函数仅由 commandLoop 线程调用，stepIndex 单线程推进，无并发；越界已被上分支拦截）

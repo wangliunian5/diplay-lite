@@ -536,14 +536,12 @@ internal object Diagnostics {
             log("=== 诊断取证开始 device=${Build.MODEL} api=${Build.VERSION.SDK_INT} ===")
             val adapter = runCatching { BluetoothAdapter.getDefaultAdapter() }.getOrNull()
             if (adapter != null) runCatching {
+                // vc246（USB-246-08）：诊断只读 scanMode，不再反射 setScanMode。
+                // 如实口径：本机 framework 蓝牙栈未编入内核（内核 config 无任何 CONFIG_BT*），
+                // t3-p1 只是设备型号名，适配器名下没有 HCI —— 不存在「可被发现」状态；
+                // PIN 由车机内置的杰理模块触发，与本 App / 外置 dongle 无关。
                 log("bt: state=${adapter.state} enabled=${adapter.isEnabled} " +
                     "address=${adapter.address} name=${adapter.name} scanMode=${adapter.scanMode}")
-                val scan = runCatching {
-                    adapter.javaClass.getMethod("setScanMode", Int::class.javaPrimitiveType)
-                        .invoke(adapter, 3)
-                    true
-                }.getOrDefault(false)
-                log("bt: setScanMode(DISCOVERABLE)=$scan afterScanMode=${adapter.scanMode}")
             }
             val propKeys = listOf(
                 "ro.build.version", "ro.product", "ro.board", "ro.hardware",

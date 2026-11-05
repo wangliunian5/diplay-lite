@@ -85,6 +85,15 @@ object UsbBtStandby {
     @Volatile
     private var generation = 0
 
+    /**
+     * vc246（USB-246-02）：本代际 host 初始化完成的代际号（0=未就绪）。
+     * 由 loop 传入 openDirect 的 onHostInitialized 回调写入；换轮/stop 自动失效。
+     * 「踢回连」只有在该值等于当前 generation 时才有意义（否则会在 host 尚未
+     * 初始化时踢空，vc245 实测空等 120s）。
+     */
+    @Volatile
+    private var hostReadyGeneration = 0
+
     @Volatile
     private var linkName: String = "DiPlay 车机"
 
@@ -137,6 +146,7 @@ object UsbBtStandby {
             }
             isRunning = true
             generation++
+            hostReadyGeneration = 0
             myGeneration = generation
         }
         val appContext = context.applicationContext ?: context
@@ -155,6 +165,7 @@ object UsbBtStandby {
             if (!isRunning) return
             isRunning = false
             generation++ // vc207：使仍阻塞在 openDirect 里的旧循环失效（ABA 自愈）
+            hostReadyGeneration = 0
             val pending = slot
             slot = null
             runCatching { pending?.close() }
@@ -170,6 +181,20 @@ object UsbBtStandby {
         statusText = "常驻广播已停止"
         runCatching { worker?.join(1000) }
     }
+
+    /**
+     * vc246（USB-246-02 / USB-246-04）：当前代际快照（六字段日志用）。
+     * 只做观测，不参与任何判定。
+     */
+    val generationSnapshot: Int
+        get() = synchronized(lock) { generation }
+
+    /**
+     * vc246（USB-246-02）：本代际的 host 是否已完成初始化（可接受「踢回连」）。
+     * 未启动 / 正在 open / 初始化中一律 false。
+     */
+    val isHostReady: Boolean
+        get() = synchronized(lock) { isRunning && hostReadyGeneration == generation && generation != 0 }
 
     /**
      * 控制器侧取流：等常驻广播交出 iPhone 链路，超时返回 null（调用方决定如何报错）。
@@ -350,6 +375,12 @@ object UsbBtStandby {
                     linkName,
                     onDiagnostic ?: {},
                     LINK_WINDOW_MILLIS,
+                    onHostInitialized = {
+                        synchronized(lock) {
+                            if (isRunning && myGeneration == generation) hostReadyGeneration = myGeneration
+                            lock.notifyAll()
+                        }
+                    },
                 )
                 failures = 0
                 // vc232：包一层只为记 close —— 控制器取走这条流后 loop 必须停迭代等它 close；
@@ -432,17 +463,26 @@ object UsbBtStandby {
             } catch (error: Throwable) {
                 failures++
                 statusText = error.message ?: "常驻广播失败"
-                diag(onDiagnostic, "usbbt-standby: 本轮失败（第 $failures 次）: ${error.message}")
-                sleepQuietly(
-                    if (failures >= 3) RETRY_DELAY_MILLIS * 2 else RETRY_DELAY_MILLIS,
-                    myGeneration,
+                // vc246（USB-246-01）：与手动/掉线重连共用同一节律 1s→2s→4s→8s（封顶），
+                // 连续 5 次失败即停并让状态可见（不再 2s/4s 无上限地反复重开 dongle）。
+                val delay = UsbBtRetryPolicy.delayAfterFailure(failures)
+                diag(
+                    onDiagnostic,
+                    "usbbt-standby: 本轮失败（第 $failures/${UsbBtRetryPolicy.MAX_ATTEMPTS} 次）: ${error.message}，" +
+                        (if (failures >= UsbBtRetryPolicy.MAX_ATTEMPTS) "停止自动重试" else "${delay}ms 后重试"),
                 )
+                if (failures >= UsbBtRetryPolicy.MAX_ATTEMPTS) {
+                    statusText = "连续 ${UsbBtRetryPolicy.MAX_ATTEMPTS} 次重开失败，已停止自动重试（可插拔 dongle 或重启车机）"
+                    break
+                }
+                sleepQuietly(delay, myGeneration)
             }
         }
         if (myGeneration != generation) {
             Log.i(TAG, "usbbt-standby: 旧代际（g=$myGeneration）循环退出（当前 g=$generation）")
         }
-        statusText = "常驻广播已停止"
+        // vc246：重试耗尽退出时保留「已停止自动重试」的原因，不被通用文案覆盖。
+        if (failures < UsbBtRetryPolicy.MAX_ATTEMPTS) statusText = "常驻广播已停止"
         diag(onDiagnostic, "usbbt-standby: 线程退出")
     }
 

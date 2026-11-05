@@ -32,8 +32,31 @@ object SystemSettingsJumps {
         toast(activity, "本机无法打开 Wi-Fi 设置，请手动连接")
     }
 
-    /** 蓝牙设置：蓝牙页 → 系统设置首页 → 失败 toast。 */
+    /**
+     * 蓝牙设置：蓝牙页 → 系统设置首页 → 失败 toast。
+     *
+     * vc246（USB-246-08）更正：vc244 的前提「打开系统蓝牙页会让 framework 适配器进入
+     * 可被发现状态」**不成立**——本机框架蓝牙栈未编入内核（内核 config 无任何 CONFIG_BT*），
+     * t3-p1 只是设备型号名，适配器名下没有 HCI，因此不存在该状态；PIN 由车机内置的
+     * 杰理模块触发，与本 App 无关。跳转前的确认弹层保留（无害），文案改为如实说明。
+     */
     fun openBluetoothSettings(activity: Activity) {
+        if (!LiteConfig.usbBtDongleOf(activity)) {
+            startBluetoothSettings(activity)
+            return
+        }
+        AppDialog.Builder(activity)
+            .setTitle("打开系统蓝牙页？")
+            .setMessage(
+                "当前使用外置蓝牙。系统蓝牙页对应的是车机内置蓝牙（杰理模块），" +
+                    "与外置 dongle 无关；本机框架蓝牙栈未编入内核，该页面不会产生蓝牙配对动作。",
+            )
+            .setNegativeButton("取消", null)
+            .setPositiveButton("仍要打开") { _, _ -> startBluetoothSettings(activity) }
+            .show()
+    }
+
+    private fun startBluetoothSettings(activity: Activity) {
         try {
             activity.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
             LiteLog.log("ui", "蓝牙设置：已打开系统蓝牙页")

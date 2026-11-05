@@ -9,6 +9,7 @@ import android.hardware.usb.UsbRequest
 import android.os.Build
 import android.os.Environment
 import android.util.Log
+import com.shilapi.xcertplay.usbbt.UsbBtResetCounter
 import java.io.Closeable
 import java.io.File
 import java.io.FileWriter
@@ -1056,6 +1057,8 @@ class NcmUsbBridge internal constructor(
                             // 全量重解析，常规 claim/SET_INTERFACE 全部正常）。
                             // resetErrno -1 = native 不可用（LinkageError），维持旧行为失败。
                             val resetFd = runCatching { connection.fileDescriptor }.getOrDefault(-1)
+                            // vc246（USB-246-07）：有线路径保留此 reset，单独计入计数（仅观测）。
+                            UsbBtResetCounter.note("ncm-ep-probe")
                             val resetErrno = try {
                                 LegacyUsbHostNative.portReset(resetFd)
                             } catch (_: LinkageError) {

@@ -34,6 +34,12 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
         private const val LINK_TIMEOUT_MILLIS = 90_000L
         private const val TAKE_SLICE_MILLIS = 1000L
 
+        /** vc246：等常驻广播交流的轮询切片（每片 1s，期间可补踢回连）。 */
+        private const val HANDOFF_SLICE_MILLIS = 1_000L
+
+        /** vc246：已配对时补踢回连的最小间隔。 */
+        private const val KICK_RETRY_MILLIS = 2_000L
+
         /** vc184：等系统 USB 授权弹窗的最长窗口（车机屏幕上用户读题+点允许要留足时间）。 */
         private const val PERMISSION_WAIT_MILLIS = 90_000L
 
@@ -62,26 +68,48 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
         ): BlockingDuplexByteStream {
             if (UsbBtStandby.isRunning) {
                 status("等待常驻广播交出 iPhone 链路…")
-                // vc215：已配对则主动 page 回连（用户指令：配对成功后主动用 dongle 建立 iAP2 链路），
-                // 不再只等 iPhone 自发回连；未配对/发起失败维持原被动等待语义不变。
-                // vc219：实测点连接时 standby 的 host 可能还在初始化（kicked=false）→ 轮询重踢，
-                // 最多等 20s，踢出去为止再进 awaitStream。
-                if (UsbBtHost.pairStateSnapshot == PairState.PAIRED) {
-                    var kicked = UsbBtHost.requestActiveConnect()
-                    val kickDeadline = System.currentTimeMillis() + 20_000L
-                    while (!kicked && System.currentTimeMillis() < kickDeadline && UsbBtStandby.isRunning) {
-                        try {
-                            Thread.sleep(2_000L)
-                        } catch (_: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                            break
+                // vc246（自动连接撞常驻广播窗口，必现 bug 根修）：
+                // vc219 的「kicked=requestActiveConnect() + 20s 轮询」在 host 尚未初始化时
+                // 返回 true（activeHost 是上一代残留实例 / phase 尚未 DISCOVERABLE），
+                // 踢出去的 page 没有任何 host 承接，之后无人补踢 → 空等 120s。
+                // 现在：
+                //   (a) 踢回连前置 host 就绪（本代际 onHostInitialized 已回调）；
+                //   (b) 等待期按 1s 切片，每 2s 补踢一次（去掉「只踢一次」的单发语义）。
+                // 结果是「未交出链路」窗口不再出现，而不是被拉长。
+                UsbBtHost.controllerWaitingForLink = true
+                try {
+                    val paired = UsbBtHost.pairStateSnapshot == PairState.PAIRED
+                    val deadline = System.currentTimeMillis() + UsbBtStandby.HANDOFF_WAIT_MILLIS
+                    var nextKickAt = 0L
+                    var kickLogState: String? = null
+                    while (true) {
+                        val now = System.currentTimeMillis()
+                        if (paired && now >= nextKickAt && UsbBtStandby.isHostReady) {
+                            val kicked = UsbBtHost.requestActiveConnect()
+                            nextKickAt = now + KICK_RETRY_MILLIS
+                            val state = "kicked=$kicked"
+                            if (kickLogState != state) {
+                                diagSink("usbbt: 已配对，主动回连已配对 iPhone（$state）")
+                                kickLogState = state
+                            }
+                        } else if (paired && kickLogState == null && !UsbBtStandby.isHostReady) {
+                            // 只落一次「等 host 初始化」锚点，不刷屏：这段时间**不再踢空**。
+                            diagSink("usbbt: 等待常驻广播 host 初始化完成后回连（当前 ${UsbBtStandby.describe()}）")
+                            kickLogState = "wait-host"
+                            nextKickAt = now
                         }
-                        kicked = UsbBtHost.requestActiveConnect()
+                        val stream = UsbBtStandby.awaitStream(HANDOFF_SLICE_MILLIS)
+                        if (stream != null) return stream
+                        if (!UsbBtStandby.isRunning) {
+                            return fail("常驻广播已停止，未交出 iPhone 链路（${UsbBtStandby.describe()}）")
+                        }
+                        if (System.currentTimeMillis() >= deadline) {
+                            return fail("常驻广播未在 ${UsbBtStandby.HANDOFF_WAIT_MILLIS / 1000}s 内交出 iPhone 链路（${UsbBtStandby.describe()}）")
+                        }
                     }
-                    diagSink("usbbt: 已配对，主动回连已配对 iPhone（kicked=$kicked）")
+                } finally {
+                    UsbBtHost.controllerWaitingForLink = false
                 }
-                return UsbBtStandby.awaitStream(UsbBtStandby.HANDOFF_WAIT_MILLIS)
-                    ?: fail("常驻广播未在 ${UsbBtStandby.HANDOFF_WAIT_MILLIS / 1000}s 内交出 iPhone 链路（${UsbBtStandby.describe()}）")
             }
             return openDirect(context, name, onDiagnostic, LINK_TIMEOUT_MILLIS)
         }
@@ -96,6 +124,7 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
             name: String,
             onDiagnostic: (String) -> Unit = {},
             linkTimeoutMillis: Long = LINK_TIMEOUT_MILLIS,
+            onHostInitialized: (() -> Unit)? = null,
         ): BlockingDuplexByteStream {
             // vc186：诊断出口——usbbt 过程日志此前只走 system logcat，而日志上云只带 LiteLog，
             // 导致 vc183~vc185 三份 t3 日志里 usbbt 过程 0 条、根因无法二分。
@@ -111,12 +140,20 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
                 iap2RfcommChannel = 1,
                 ioCapability = 1, // DisplayYesNo（vc212：弹码确认；MITM 由 host 侧 auth=5 携带）
             )
+            // vc246（USB-246-03）：manager 与 findDongle(deviceList) 都是 USB binder 调用，
+            // 单独计时；>3s 即置粘性 D 态门禁（T3 上 `usbdev_open` 卡死时这些调用同样会挂住）。
+            val managerStartedMs = System.currentTimeMillis()
             val usb = UsbBtSession.manager(context) ?: fail("USB 服务不可用")
+            noteBinderSpan("UsbManager", managerStartedMs)
+            val findStartedMs = System.currentTimeMillis()
             val dongle = UsbBtSession.findDongle(usb)
                 ?: fail("未检测到 USB 蓝牙 dongle（请确认已插入）")
+            noteBinderSpan("getDeviceList", findStartedMs)
             status("已检测到 dongle（${UsbBtSession.deviceLabel(dongle)}）")
             diagSink(AnchorLog.mark("dongle-detected"))
+            val permissionStartedMs = System.currentTimeMillis()
             if (!UsbBtSession.hasPermission(context, dongle)) {
+                noteBinderSpan("hasPermission", permissionStartedMs)
                 // vc184（t3 反馈）：原地等系统授权弹窗结果——用户点「允许」后本轮直接继续建链，
                 // 不再要求「允许后重试连接」；ROM 不弹窗/被拒/超时则带明确状态失败。
                 status("等待 USB 授权（请在系统弹窗中点允许）…")
@@ -124,6 +161,8 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
                     fail("USB 授权未完成（弹窗未出现/被拒绝/超时），请重试连接并在弹窗中点允许")
                 }
                 status("USB 授权完成，继续建链")
+            } else {
+                noteBinderSpan("hasPermission", permissionStartedMs)
             }
             // host 与 driver 互需引用：先开 driver（转发 listener 兜住早期事件），再建 host 回接
             val hostRef = arrayOfNulls<UsbBtHost>(1)
@@ -172,7 +211,11 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
                     diagSink("usbbt: firmware load result=$fw")
                     host = UsbBtHost(identity, driver!!, { msg -> Log.i(TAG, msg); diagSink("host: $msg") }).also {
                         it.onStatus = { text -> status(text) }
-                        it.onReady = { ready.countDown() }
+                        it.onReady = {
+                            // vc246：本代际 host 初始化完成信号 —— 常驻广播据此放行「踢回连」。
+                            ready.countDown()
+                            runCatching { onHostInitialized?.invoke() }
+                        }
                         hostRef[0] = it
                     }
                     host!!.start()
@@ -238,6 +281,41 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
             }
         }
 
+        /**
+         * vc246（USB-246-03 配套）：HCI 初始化探针。
+         *
+         * 自检成功判据从「openDevice 非 null」升级为「控制器真的应答 HCI」：打开驱动后发
+         * ReadLocalVersion（0x1001），拿到 Command Complete 参数才算成功。这样能消掉
+         * 「USB 枚举正常但控制器已经不应答」的假恢复。
+         *
+         * @return null = 成功；非 null = 失败原因（可直接上屏）。
+         * 调用方需保证常驻广播已停止（否则 forceClaim 会顶掉正在跑的链路）。
+         */
+        fun probeHci(context: Context, onDiagnostic: (String) -> Unit = {}): String? {
+            if (UsbBinderGate.suspect) return "D 态门禁生效（${UsbBinderGate.reason}），请重启车机"
+            val usb = UsbBtSession.manager(context) ?: return "USB 服务不可用"
+            val dongle = UsbBtSession.findDongle(usb) ?: return "未检测到 USB 蓝牙 dongle"
+            if (!usb.hasPermission(dongle)) return "无 USB 访问权限（请重新插拔并允许授权）"
+            val driver = UsbBtDriver.open(context, dongle, onDiagnostic = onDiagnostic)
+                ?: return "打开 dongle 失败（${UsbBtSession.deviceLabel(dongle)}）"
+            return try {
+                val reply = driver.hciCommand(
+                    HciCommands.READ_LOCAL_VERSION_INFORMATION,
+                    ByteArray(0),
+                    3_000,
+                )
+                if (reply == null) {
+                    "HCI 初始化无应答（ReadLocalVersion 超时，${UsbBtSession.deviceLabel(dongle)}）"
+                } else {
+                    null
+                }
+            } catch (e: Throwable) {
+                "HCI 初始化异常（${e.javaClass.simpleName}: ${e.message}）"
+            } finally {
+                runCatching { driver.close() }
+            }
+        }
+
         /** 供设置页状态行：优先显示真实探测进度，未探测过则退回枚举结果。 */
         fun describe(context: Context): String {
             lastStatusText.takeIf { it.isNotBlank() }?.let { return it }
@@ -267,6 +345,18 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
             lastStatusText = text
             // vc186：状态行进 diagSink（→LiteLog 上云），不再只落 system logcat。
             diagSink(text)
+        }
+
+        /** vc246（USB-246-03）：USB binder 调用耗时采样；超 3s 置粘性门禁并落六字段日志。 */
+        private fun noteBinderSpan(source: String, startedMs: Long) {
+            val elapsed = System.currentTimeMillis() - startedMs
+            if (UsbBinderGate.noteCall(source, elapsed)) {
+                diagSink(
+                    "usb_246_03: layer=usb trigger=binder-slow holder=none" +
+                        " gen=${UsbBtStandby.generationSnapshot} present=true" +
+                        " next=forbid-open detail=$source ${elapsed}ms",
+                )
+            }
         }
 
         private fun fail(reason: String): Nothing {

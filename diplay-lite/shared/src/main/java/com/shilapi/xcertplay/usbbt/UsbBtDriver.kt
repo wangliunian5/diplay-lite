@@ -14,7 +14,9 @@ import com.shilapi.xcertplay.transport.LegacyUsbHostNative
 import java.io.Closeable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * vc167（外置 USB 蓝牙 dongle 第 2 步 B 批）/ vc181（外置 USB 蓝牙 C/D 批）：USB 传输层。
@@ -101,7 +103,60 @@ internal class UsbBtDriver private constructor(
          *   的一次性兜底（初始化 Reset 不应答，2026-11-03 K60 CSR8510 定性）时经
          *   `portResetFirst=true` 进入，正常机型路径不受影响。
          */
+        /**
+         * vc245：有界打开。openDevice / claimInterface（连同 KK 的 RESET 重枚举循环）整段
+         * 放独立线程，[OPEN_TIMEOUT_MS] 看门狗超时即判失败返回 null，绝不再无限等。
+         *
+         * 天花板（实测结论）：若 system_server 已 D 态卡在 usbdev_open，worker 线程会永久
+         * 滞留（uninterruptible），App 层无法回收；此时看门狗只保证调用方不再被拖死。
+         */
         fun open(
+            context: Context,
+            device: UsbDevice,
+            listener: Listener = NO_OP,
+            onDiagnostic: (String) -> Unit = {},
+            portResetFirst: Boolean = false,
+        ): UsbBtDriver? {
+            val latch = CountDownLatch(1)
+            val result = AtomicReference<UsbBtDriver?>()
+            // vc246（USB-246-03）：粘性 D 态门禁 —— 一旦某次 USB binder 调用超 3s，
+            // 进程内永久拒绝再 open（继续 open 只会把更多线程堆进内核 D 态）。
+            if (UsbBinderGate.suspect) {
+                onDiagnostic("usbbt: D 态门禁生效（${UsbBinderGate.reason}），拒绝 open，请重启车机")
+                return null
+            }
+            val worker = Thread({
+                try {
+                    result.set(openInternal(context, device, listener, onDiagnostic, portResetFirst))
+                } catch (error: Throwable) {
+                    onDiagnostic(
+                        "usbbt: open 异常 ${error.javaClass.simpleName}: ${error.message}",
+                    )
+                } finally {
+                    latch.countDown()
+                }
+            }, "usbbt-open")
+            worker.isDaemon = true
+            worker.start()
+            val finished = runCatching {
+                latch.await(OPEN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            }.getOrDefault(false)
+            if (!finished) {
+                // vc246（USB-246-03）：open 整段 15s 未返回 = 卡在 binder（usbdev_open）。
+                // 置粘性 D 态门禁并上屏原因，后续 auto/手动重连一律快速失败。
+                UsbBinderGate.noteCall("usbbt-open-watchdog", OPEN_TIMEOUT_MS)
+                onDiagnostic(
+                    "usbbt: open 超时 ${OPEN_TIMEOUT_MS}ms → 判失败（调用可能滞留内核 D 态）",
+                )
+                return null
+            }
+            return result.get()
+        }
+
+        /** 看门狗上限：正常路径实测 <1s，KK RESET 重枚举最多 ~4s，留 15s 余量。 */
+        const val OPEN_TIMEOUT_MS = 15_000L
+
+        private fun openInternal(
             context: Context,
             device: UsbDevice,
             listener: Listener = NO_OP,
@@ -110,7 +165,18 @@ internal class UsbBtDriver private constructor(
         ): UsbBtDriver? {
             val usb = UsbBtSession.manager(context) as? UsbManager ?: return null
             val iface = UsbBtSession.hciInterface(device) ?: return null
+            // vc246（USB-246-03）：openDevice 是到 system_server 的 binder 调用，单独计时；
+            // 超 3s = D 态判据（写入进程级粘性门禁）。
+            val openStartedMs = System.currentTimeMillis()
             var connection = usb.openDevice(device) ?: return null
+            val openElapsedMs = System.currentTimeMillis() - openStartedMs
+            if (UsbBinderGate.noteCall("openDevice", openElapsedMs)) {
+                onDiagnostic(
+                    "usb_246_03: layer=usb trigger=binder-slow holder=none" +
+                        " gen=${UsbBtStandby.generationSnapshot} present=${UsbBinderGate.suspect}" +
+                        " next=forbid-open detail=openDevice ${openElapsedMs}ms",
+                )
+            }
             val kkNative = Build.VERSION.SDK_INT <= Build.VERSION_CODES.KITKAT &&
                 LegacyUsbHostNative.available
             // vc186 P0：usbbt 此前全程只有 system logcat（Log.i），而日志上云只带 LiteLog，
@@ -125,9 +191,15 @@ internal class UsbBtDriver private constructor(
             // 「非默认端点表」需要时间。若同步立即 openDevice+claim，拿到的端点表残缺 → 控制端点0
             // 可用(故固件下载成功)但 bulk/interrupt 端点 ENOENT=-1（t3 实测：首灌/二次跳过重灌均复现）。
             // 必须先 close 旧连接，循环等待重枚举完成（同 VID/PID 兜底 deviceName 随重枚举变化）再重开。
-            // 2026-11-03（K60 CSR8510 定性后）：同一序列抽为 portResetAndReopen()，KK 常态走；
-            // 非 KK 仅在调用方显式 portResetFirst=true（初始化 Reset 无应答的一次性兜底）时走。
-            if (kkNative || portResetFirst) {
+            //
+            // vc246（USB-246-03 / 用户 2026-11-05 拍板）：**KK 常态不再 reset**。每次 open 都
+            // USBDEVFS_RESET 会把端口打断重枚举 → DETACHED/ATTACHED → vc245 再重连 → 再 reset
+            // 的自激回路，且是 T3「掉线与 D 态」的首要嫌疑。只保留调用方显式
+            // portResetFirst=true（初始化首轮超时的一次性救援，≤1 次/进程）时走这条序列。
+            if (portResetFirst) {
+                // vc246（USB-246-07）：仅此一处会发 port reset，单独计数（启动路径应为 0）。
+                UsbBtResetCounter.note("init-timeout-fallback")
+                onDiagnostic("usb_246_reset: src=init-timeout-fallback count=${UsbBtResetCounter.portResets}")
                 val reopened = portResetAndReopen(usb, device, connection, onDiagnostic)
                     ?: return null
                 connection = reopened
@@ -235,6 +307,10 @@ internal class UsbBtDriver private constructor(
             val driver = UsbBtDriver(
                 connection, iface, events, aclIn, aclOut, listener, onDiagnostic,
                 device.vendorId, device.productId,
+            )
+            // vc246（USB-246-07）：本次 open 未走 reset 路径——落一行计数证据（启动路径应为 0）。
+            onDiagnostic(
+                "usb_246_reset: src=none gen=${UsbBtStandby.generationSnapshot} count=${UsbBtResetCounter.portResets}",
             )
             // vc207：注册进程级活实例并顶掉上一个（若有）。close 在锁外执行，避免
             // close 内的 join 阻塞后续 open；被顶掉一方的上游结果由 standby 代际守卫丢弃。
@@ -487,6 +563,14 @@ internal class UsbBtDriver private constructor(
     /** 同步命令等待表：opcode → 闩锁（事件线程收到匹配 Command Complete 后放行）。 */
     private val pendingCommands = ConcurrentHashMap<Int, PendingCommand>()
 
+    /**
+     * vc246（USB-246-04）：bulk read n<0 的连续计数（仅计数，不参与判定）。
+     * 供六字段日志取快照；空闲期该值长期为 0~数百属正常。
+     */
+    @Volatile
+    var consecutiveReadFailures: Int = 0
+        private set
+
     private class PendingCommand {
         val latch = CountDownLatch(1)
 
@@ -649,6 +733,7 @@ internal class UsbBtDriver private constructor(
             if (!running) return
             if (n > 0) {
                 failures = 0
+                consecutiveReadFailures = 0
                 acc += buffer.copyOfRange(0, n)
                 while (acc.size >= headerBytes) {
                     val total = when (headerBytes) {
@@ -670,25 +755,10 @@ internal class UsbBtDriver private constructor(
                 }
             } else if (n < 0) {
                 failures++
-                // vc186：errno/失败计数采样（前 3 次 + 每 5 次一次），既留证据又不刷屏——
-                // 用于区分「端点表残缺(ENOENT)」/「被内核驱动占用(EBUSY/EPIPE)」/「超时」。
-                if (failures <= 3 || failures % 5 == 0) {
-                    val line = "usbbt: bulk read fail ep=0x${hexOf(endpoint.address)} n=$n" +
-                        " elapsedMs=$readElapsedMs failures=$failures (${if (isEvent) "event" else "ACL"})"
-                    Log.w(TAG, line)
-                    onDiagnostic(line)
-                }
-                // 同埋点批：失败累积到 10 次时打一行端点状态快照（能读到什么记什么，读不到写 unavailable）。
-                if (failures == 10) {
-                    val cfg = runCatching { kernelActiveConfiguration(connection) }
-                        .map { it.toString() }.getOrElse { "unavailable" }
-                    val fd = runCatching { connection.fileDescriptor.toString() }.getOrElse { "unavailable" }
-                    val state = "usbbt: ep state @failures=10 ep=0x${hexOf(endpoint.address)}" +
-                        " type=${endpoint.type} mps=${endpoint.maxPacketSize}" +
-                        " activeConfig=$cfg fd=$fd"
-                    Log.w(TAG, state)
-                    onDiagnostic(state)
-                }
+                // vc246（USB-246-04）：bulk read n<0 在空闲期是常态（vc205 K60 定性），
+                // 因此**只计数、不判定、不单列层**：不再逐次打诊断行，也不再打 @failures=10
+                // 端点快照；计数由 consecutiveReadFailures 暴露给六字段日志。
+                consecutiveReadFailures = failures
                 if (failures > MAX_CONSECUTIVE_TRANSFER_FAILURES) {
                     // vc205（K60 CSR8510 定性）：广播空闲期 read 超时是常态，达阈值 ≠ 掉线。
                     // 先探测再判死；探测在飞/有命令在飞时不判死，下轮再评估。

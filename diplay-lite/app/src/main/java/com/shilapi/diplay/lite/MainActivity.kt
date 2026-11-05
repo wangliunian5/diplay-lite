@@ -35,6 +35,8 @@ import android.widget.TextView
 import android.widget.Toast
 import com.shilapi.xcertplay.diag.AnchorLog
 import com.shilapi.xcertplay.media.CarPlayTouchMapper
+import com.shilapi.xcertplay.usbbt.UsbBinderGate
+import com.shilapi.xcertplay.usbbt.UsbBtRetryPolicy
 import com.shilapi.xcertplay.usbbt.UsbBtStandby
 import com.shilapi.xcertplay.network.WiredVpnService
 import kotlin.math.abs
@@ -137,6 +139,9 @@ class MainActivity : Activity() {
     private var shownStatus: String? = null
     // 自动连接一个进程生命周期只发起一次，避免用户断开后再被拉起
     private var autoConnectTried = false
+    // vc245：手动重连的退避状态（运行中 = 已在重试链里，防重复点击叠加）。
+    private var dongleRetryRunning = false
+    private var dongleRetryAttempt = 0
 
     // 1.0.16（方案四②）：开机自启等待弹窗——上电后等勾选的蓝牙/热点就绪并稳定 10s 再自动连接。
     private var autostartWaitActive = false
@@ -247,6 +252,9 @@ class MainActivity : Activity() {
         // 的脏会话）。拔线即执行「用户断开等价清理」（LiteSessionService.onDestroy 全拆
         // controller 栈 + mediaSink + VPN），重插 ATTACHED 经 onNewIntent 触发全新建链。
         registerUsbDetachReceiver()
+        // vc245：外置蓝牙兜底自检（有界 3s、三态可判别）。只挂 dongle 链路，
+        // 车机蓝牙链路零变化。
+        if (LiteConfig.load(this).usbBtDongle) startDongleSelfCheck()
         // vc151（targetSdk 34）：targetSdk 19→34 后 RECORD_AUDIO（语音上行）/
         // ACCESS_FINE_LOCATION（无线 B3 信道）/POST_NOTIFICATIONS（33+ 通知）变运行时权限。
         // 启动即批量申请（系统弹一次窗），拒绝则对应功能降级、不阻塞连接主流程；
@@ -300,6 +308,22 @@ class MainActivity : Activity() {
                 if (intent.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
                 @Suppress("DEPRECATION")
                 val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE) ?: return
+                // vc245：外置蓝牙（0a12）此前被完全忽略——掉线/拔插后 App 零感知，
+                // 这是 T3「重新拔插没反应」的直接原因之一。这里置为待重连并上屏提示。
+                if (device.vendorId == UsbDongleGuard.VENDOR_ID) {
+                    LiteLog.log("usbdongle", "USB 拔出：外置蓝牙 detach ${device.deviceName}，进入掉线重连")
+                    usbSixFields("usb", "detach", "receiver", "reconnect-after-1.0s")
+                    autoConnectTried = false
+                    Toast.makeText(
+                        this@MainActivity,
+                        "外置蓝牙已掉线：正在释放旧句柄并自动重连（失败 5 次后停止）",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    // vc246（USB-246-03）：DETACHED 后 1.0s 静默期（原 500ms 太短，重枚举未收尾
+                    // 就 open 会撞上内核重建端点表窗口）。插回 dongle 后无需手动点键。
+                    handler.postDelayed({ reconnectDongle() }, 1_000)
+                    return
+                }
                 if (device.vendorId != APPLE_USB_VENDOR_ID) return
                 // vc176（K60 实测）：0x52 重枚举等待期内旧实例的 detach 是必经步骤、
                 // 不是用户拔线——此时停服务会杀掉重枚举兜底、误弹「控制通道已结束」，
@@ -336,6 +360,8 @@ class MainActivity : Activity() {
         super.onNewIntent(intent)
         if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
         autoConnectTried = false
+        usbSixFields("usb", "attach-settle", "receiver", "auto-connect-after-1.5s")
+        // vc246（USB-246-03）：ATTACHED 后 1.5s 静默期（与 DETACHED 后 1.0s 对称）。
         handler.postDelayed({ maybeAutoConnect() }, 1_500)
     }
 
@@ -371,6 +397,7 @@ class MainActivity : Activity() {
         videoStretchMode = LiteConfig.load(this).resolutionMode == "stretch"
         handler.post(refreshTask)
         syncUsbBtStandby()
+        usbSixFields("bt", "resume", if (UsbBtStandby.isRunning) "standby-running" else "standby-stopped", "auto-connect")
         maybeAutoConnect()
         // 1.1.4 系统诊断：新装无检测记录时，主界面就绪后延迟 5 秒触发首启快检（可跳过）。
         Diagnostics.quickCheckIfDue(this)
@@ -445,7 +472,15 @@ class MainActivity : Activity() {
         usbDetachReceiver = null
         LiteVideoBridge.setVideoSizeListener(null)
         // vc192：退出页面释放 dongle（不留在后台常驻广播；下次进前台 onResume 会重新拉起）。
-        UsbBtStandby.stop()
+        // vc246（自动连接撞常驻广播窗口，候选 (c)）：仅 Activity **真正结束**（finish）时才停；
+        // 配置变更 / 低内存重建 / 从设置页返回一律保留本代际 host，避免每次重建都重新
+        // open dongle（3–10s 初始化窗口正是 auto-connect「踢空」的来源）。
+        if (isFinishing) {
+            LiteLog.log("usbdongle", "Activity 结束：停止常驻广播并释放 dongle")
+            UsbBtStandby.stop()
+        } else {
+            LiteLog.log("usbdongle", "Activity 重建：保留常驻广播（g=${UsbBtStandby.generationSnapshot}）")
+        }
         detachCurrentPage()
         // vc108：退出时还原车机栏（写回 false），否则车机桌面栏被永久藏住
         setVendorFullScreen(false)
@@ -1125,6 +1160,7 @@ class MainActivity : Activity() {
             "WiFi" to { SystemSettingsJumps.openWifiSettings(this) },
             "蓝牙" to { SystemSettingsJumps.openBluetoothSettings(this) },
             "热点" to { SystemSettingsJumps.openHotspotSettings(this) },
+            // vc246（USB-246-05）：摘除「重连蓝牙」入口，掉线自动重连（DETACHED）已覆盖。
         )
         entries.forEachIndexed { index, (title, onClick) ->
             val entry = button(title, primary = false, height = 48, click = onClick)
@@ -1134,6 +1170,137 @@ class MainActivity : Activity() {
             rowView.addView(entry)
         }
         return rowView
+    }
+
+    /**
+     * vc245：启动自检（后台 + 10s 看门狗）。只落日志、异常时上屏，不改连接状态机。
+     * vc246（USB-246-03 配套）：成功判据升级为 HCI 初始化真实应答（见 UsbDongleGuard）。
+     */
+    private fun startDongleSelfCheck() {
+        LiteLog.log("usbdongle", "启动自检：已挂载（usbBtDongle=true）")
+        Thread {
+            val report = UsbDongleGuard.check(this, "启动自检", expectStandby = true)
+            usbSixFields("usb", "self-check", "gate", report.status.toString())
+            if (report.status != UsbDongleGuard.Status.OK) {
+                val dstate = if (UsbBinderGate.suspect) "；D 态疑似（${UsbBinderGate.reason}），请重启车机" else ""
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "外置蓝牙自检异常：${report.status}$dstate（详见日志 usbdongle）",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * vc245：手动「重连蓝牙」入口 —— 不依赖拔插。
+     *
+     * 顺序（对齐验收标准）：
+     * 1. 先彻底释放旧句柄：`UsbBtStandby.stop()` 会 close 常驻广播持有的 driver/interface/fd，
+     *    并让旧 open 循环的 generation 失效（否则第二次 open 会排在卡住的旧调用后面）；
+     * 2. 留 500ms 静默窗（沿用 vc233 实测的 release 收尾时间）；
+     * 3. 有界自检；正常 → 重正常驻广播 + 重进自动连接；异常 → 退避重试，封顶后上屏并停。
+     */
+    private fun reconnectDongle() {
+        if (UsbBinderGate.suspect) {
+            // vc246（USB-246-03）：粘性门禁 —— 已判定 D 态疑似，再 open 只会把线程堆进内核卡死。
+            LiteLog.log("usbdongle", "重连被 D 态门禁拒绝：${UsbBinderGate.describe()}")
+            usbSixFields("usb", "reconnect-blocked", "gate", "reboot-required")
+            Toast.makeText(this, "D 态疑似（${UsbBinderGate.reason}），已禁止重开，请重启车机", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (dongleRetryRunning) {
+            Toast.makeText(this, "重连已在进行中…", Toast.LENGTH_SHORT).show()
+            return
+        }
+        dongleRetryRunning = true
+        dongleRetryAttempt = 0
+        usbSixFields("usb", "reconnect-begin", "none", "release-then-check")
+        Toast.makeText(this, "正在释放旧句柄并检测外置蓝牙…", Toast.LENGTH_SHORT).show()
+        Thread {
+            // 第一步：释放旧句柄（这是「拔插没反应」的关键：旧 connection/interface/fd 未放，
+            // 后续 open 会排在被卡住的内核调用后面）。
+            LiteLog.log("usbdongle", "手动重连：先释放旧句柄 UsbBtStandby.stop()")
+            runCatching { UsbBtStandby.stop() }
+            runCatching { Thread.sleep(1_000) }
+            dongleRetryStep()
+        }.start()
+    }
+
+    /** vc245：退避 1s/2s/4s/8s…（封顶 [UsbBtRetryPolicy.MAX_DELAY_MILLIS]），连续 [DONGLE_RETRY_MAX] 次失败即停。 */
+    private fun dongleRetryStep() {
+        dongleRetryAttempt += 1
+        val attempt = dongleRetryAttempt
+        Thread {
+            val report = UsbDongleGuard.check(this, "手动重连#$attempt")
+            usbSixFields("usb", "retry-step-$attempt", "none", report.status.toString())
+            runOnUiThread {
+                when {
+                    report.status == UsbDongleGuard.Status.OK -> {
+                        dongleRetryRunning = false
+                        Toast.makeText(
+                            this, "外置蓝牙已恢复：${report.detail}", Toast.LENGTH_SHORT,
+                        ).show()
+                        autoConnectTried = false
+                        // 重新拉常驻广播（iPhone 回连后既有 onLinkReady 会自动发起连接）。
+                        syncUsbBtStandby(force = true)
+                    }
+                    attempt >= DONGLE_RETRY_MAX -> {
+                        dongleRetryRunning = false
+                        usbSixFields("usb", "retry-exhausted", "none", "stopped")
+                        LiteLog.log(
+                            "usbdongle",
+                            "手动重连：连续 $attempt 次失败（${report.status}），停止自动重试" +
+                                if (UsbBinderGate.suspect) "；D 态疑似（${UsbBinderGate.reason}）" else "",
+                        )
+                        Toast.makeText(
+                            this,
+                            "外置蓝牙连续 $attempt 次重连失败（${report.status}）：" +
+                                (if (UsbBinderGate.suspect) "D 态疑似，请重启车机" else "已停止自动重试，可插拔 dongle 或重启车机"),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        if (report.status == UsbDongleGuard.Status.OPEN_TIMEOUT ||
+                            report.status == UsbDongleGuard.Status.OPEN_FAILED
+                        ) {
+                            offerSoftReset(report)
+                        }
+                    }
+                    else -> {
+                        // 退避：与常驻广播共用 UsbBtRetryPolicy（1s/2s/4s/8s，封顶 8s）。
+                        val delay = UsbBtRetryPolicy.delayAfterFailure(attempt)
+                        LiteLog.log(
+                            "usbdongle",
+                            "手动重连：第 $attempt 次 ${report.status}（${report.detail}），" +
+                                "${delay}ms 后重试",
+                        )
+                        handler.postDelayed({ dongleRetryStep() }, delay)
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun offerSoftReset(report: UsbDongleGuard.Report) {
+        AppDialog.Builder(this)
+            .setTitle("外置蓝牙打不开")
+            .setMessage(
+                "${report.detail}\n\n可尝试 root 软复位（只对 dongle 自己的 sysfs 节点写 authorized）。" +
+                    "若内核已卡在 usbdev_open，软复位也不会生效，只能重启车机。",
+            )
+            .setNegativeButton("取消", null)
+            .setPositiveButton("软复位") { _, _ ->
+                Thread {
+                    val after = UsbDongleGuard.softReset(this)
+                    runOnUiThread {
+                        Toast.makeText(
+                            this, "软复位后：${after.status} ${after.detail}", Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }.start()
+            }
+            .show()
     }
 
     // ---------- 视图状态 ----------
@@ -1690,7 +1857,49 @@ class MainActivity : Activity() {
     }
 
     /** vc207：配对窗入口 —— 无论「开机自动初始化」开关如何，确保常驻广播已启动。 */
-    internal fun ensureUsbBtStandby() = syncUsbBtStandby(force = true)
+    internal fun ensureUsbBtStandby() {
+        // vc246（USB-246-02）：收口为一个「等待上限 5s」的后台确认。
+        // 未在跑 → 立即拉起；在跑但 host 仍在初始化（后台正在重开）→ 等最多 5s，
+        // 超时则跳过本次（不叠加第二次 open），并上屏说明。
+        if (!UsbBtStandby.isRunning) {
+            syncUsbBtStandby(force = true)
+            return
+        }
+        if (UsbBtStandby.isHostReady) return
+        Thread {
+            val deadline = System.currentTimeMillis() + STANDBY_ENSURE_WAIT_MILLIS
+            while (System.currentTimeMillis() < deadline && UsbBtStandby.isRunning && !UsbBtStandby.isHostReady) {
+                try {
+                    Thread.sleep(200)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return@Thread
+                }
+            }
+            if (!UsbBtStandby.isHostReady) {
+                LiteLog.log("usbdongle", "配对入口：常驻广播 5s 内未就绪，跳过本次拉起")
+                runOnUiThread {
+                    Toast.makeText(this, "后台正在重开，已跳过本次", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * vc246（USB-246-04）：USB 链路的六字段判别日志。
+     *
+     * `layer=usb|bt / trigger / holder / gen / present / next`
+     * - layer：usb=端口/句柄层，bt=蓝牙链路层；**bulk read -1 不再单列一层**，只计入计数。
+     * - holder：当前持有句柄的一方（standby / controller / gate / none）。
+     * - present：sysfs 是否仍能看到 0a12（只读旁证，不走 binder，不惧 D 态）。
+     */
+    private fun usbSixFields(layer: String, trigger: String, holder: String, next: String) {
+        LiteLog.log(
+            "usb",
+            "layer=$layer trigger=$trigger holder=$holder gen=${UsbBtStandby.generationSnapshot}" +
+                " present=${UsbDongleGuard.sysfsPresent} next=$next",
+        )
+    }
 
     /**
      * vc212：SSP 弹码确认（DisplayYesNo + MITM）。dongle 收到 UserConfirmationRequest 时
@@ -1971,5 +2180,12 @@ class MainActivity : Activity() {
         const val AUTOSTART_STABLE_SECS = 10
         /** 等待勾选项就绪的总超时。 */
         const val AUTOSTART_WAIT_TIMEOUT_MILLIS = 60_000L
+
+        // vc245：外置蓝牙掉线重连——退避 1s/2s/4s/8s（封顶 8s），连续 5 次失败即停并上屏。
+        // vc246（USB-246-01）：数值统一由 UsbBtRetryPolicy 提供（与常驻广播同一条序列）。
+        const val DONGLE_RETRY_MAX = UsbBtRetryPolicy.MAX_ATTEMPTS
+
+        /** vc246（USB-246-02）：配对入口等待常驻广播就绪的上限。 */
+        const val STANDBY_ENSURE_WAIT_MILLIS = 5_000L
     }
 }
