@@ -42,6 +42,13 @@
 > ---
 >
 > The remainder of this README is the upstream project's description, preserved for reference.
+>
+> **迁移说明（2026-11）**
+> 本项目已迁移至 https://gitee.com/wangliunian/diplay-lite
+>
+> 迁移原因：GitHub 在国内网络环境下访问不稳定（连接超时、推送失败频发），为便于长期维护，源码与发行包统一迁至 Gitee。
+>
+> 本仓库已停止维护（转为只读归档），后续更新请以 Gitee 仓库为准。
 
 **CarPlay for compatible Android head units.** Wired and wireless, with the familiar DiAuto interface. Independent app: `com.shihab.diplay`.
 
