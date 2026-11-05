@@ -375,10 +375,15 @@ class Iap2LinkChannel private constructor(
         return true
     }
 
+    /**
+     * vc243：只保留首个失败，不再 addSuppressed 串链。
+     * API19（T3 Android 4.4）的 Throwable.printStackTrace 对抑制链无环保护，
+     * 多次 close/失败聚合可能形成 A↔B 环并自递归到 StackOverflowError（实测崩溃根因）。
+     */
     private fun combineFailures(first: Throwable?, second: Throwable?): Throwable? {
         if (first == null) return second
-        if (second != null && second !== first) first.addSuppressed(second)
-        return first
+        if (second == null) return first
+        return if (second is Error) second else first
     }
 
     companion object {

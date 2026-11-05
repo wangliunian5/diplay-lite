@@ -305,10 +305,8 @@ class IphoneUsbHost(
                     try {
                         result.session.close()
                     } catch (closeError: Throwable) {
-                        // API16 适配：Throwable.addSuppressed 是 API 19+。
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-                            error.addSuppressed(closeError)
-                        }
+                        // vc243：不再 addSuppressed 串抑制链（API19 printStackTrace 遇环会自递归）。
+                        if (closeError is Error) throw closeError
                     }
                 }
                 throw error

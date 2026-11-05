@@ -8,6 +8,7 @@ import com.shilapi.xcertplay.airplay.AirPlayMediaHandler
 import com.shilapi.xcertplay.airplay.AirPlaySession
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
 import com.shilapi.xcertplay.airplay.PairingStore
+import com.shilapi.xcertplay.diag.boundedTrace
 import com.shilapi.xcertplay.mfi.MfiAuthenticator
 import java.io.File
 import java.io.IOException
@@ -347,7 +348,7 @@ class AirPlayTcpServer {
         error: Throwable,
     ) {
         val message = error.message ?: error.javaClass.simpleName
-        Log.e(TAG, "CarPlay transport stopped: $message", error)
+        Log.e(TAG, "CarPlay transport stopped: $message | ${error.boundedTrace()}")
         Thread(
             {
                 synchronized(this) {

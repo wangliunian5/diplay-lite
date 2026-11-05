@@ -1,6 +1,7 @@
 package com.shilapi.xcertplay.airplay
 
 import android.util.Log
+import com.shilapi.xcertplay.diag.boundedTrace
 import com.shilapi.xcertplay.mfi.MfiAuthenticator
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 import java.io.BufferedInputStream
@@ -310,7 +311,7 @@ class AirPlaySession(
                         activeCipher.decrypt(encBuf)
                     } catch (error: Exception) {
                         lastCloseReason = "control decrypt failed: ${error.message ?: error.javaClass.simpleName}"
-                        Log.e(TAG, "airplay $lastCloseReason encrypted=${encBuf.size}", error)
+                        Log.e(TAG, "airplay $lastCloseReason encrypted=${encBuf.size} | ${error.boundedTrace()}")
                         break
                     }
                     encBuf = decrypted.rest
@@ -338,13 +339,13 @@ class AirPlaySession(
                     } catch (error: Exception) {
                         Log.e(
                             TAG,
-                            "airplay handler failed ${request.method} ${request.path} cseq=$cseq",
-                            error,
+                            "airplay handler failed ${request.method} ${request.path} cseq=$cseq | " +
+                                error.boundedTrace(),
                         )
                         // 实机无 adb：异常此前只进 logcat，文件日志里看不到根因，此处补写
                         debugLog(
                             "airplay handler failed ${request.method} ${request.path} cseq=$cseq: " +
-                                Log.getStackTraceString(error),
+                                error.boundedTrace(),
                         )
                         RtspMessage.Response(status = 500)
                     }
@@ -366,7 +367,7 @@ class AirPlaySession(
             }
         } catch (error: Exception) {
             lastCloseReason = "control I/O failed: ${error.message ?: error.javaClass.simpleName}"
-            if (!closed.get()) Log.e(TAG, "airplay $lastCloseReason", error)
+            if (!closed.get()) Log.e(TAG, "airplay $lastCloseReason | ${error.boundedTrace()}")
         } finally {
             debugLog("airplay control closing reason=$lastCloseReason activeStreams=$activeStreams")
             close()
@@ -480,7 +481,7 @@ class AirPlaySession(
         val dict = try {
             asMap(BplistCodec.decode(request.body)) ?: return RtspMessage.Response(status = 400)
         } catch (error: Exception) {
-            Log.e(TAG, "airplay SETUP plist decode failed body=${request.body.size}", error)
+            Log.e(TAG, "airplay SETUP plist decode failed body=${request.body.size} | ${error.boundedTrace()}")
             return RtspMessage.Response(status = 400)
         }
         debugLog("airplay SETUP keys=${dict.keys.sorted()}")
@@ -813,7 +814,7 @@ class AirPlaySession(
             runEventRead(socket)
         } catch (error: Exception) {
             if (!closed.get()) {
-                Log.e(TAG, "airplay event accept failed", error)
+                Log.e(TAG, "airplay event accept failed | ${error.boundedTrace()}")
                 close()
             }
         }
@@ -845,7 +846,7 @@ class AirPlaySession(
                 val decrypted = try {
                     cipher.decrypt(encrypted)
                 } catch (error: Exception) {
-                    Log.e(TAG, "airplay event decrypt failed encrypted=${encrypted.size}", error)
+                    Log.e(TAG, "airplay event decrypt failed encrypted=${encrypted.size} | ${error.boundedTrace()}")
                     break
                 }
                 encrypted = decrypted.rest
@@ -870,7 +871,7 @@ class AirPlaySession(
                 }
             }
         } catch (error: Exception) {
-            if (!closed.get()) Log.e(TAG, "airplay event read failed", error)
+            if (!closed.get()) Log.e(TAG, "airplay event read failed | ${error.boundedTrace()}")
         } finally {
             debugLog("airplay event connection closed idleMs=${System.currentTimeMillis() - lastInboundAt}")
             if (eventSocket === socket) eventSocket = null

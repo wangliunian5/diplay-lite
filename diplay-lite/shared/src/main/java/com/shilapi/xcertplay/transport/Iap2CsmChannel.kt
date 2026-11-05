@@ -174,7 +174,7 @@ class Iap2CsmChannel private constructor(
             close()
         } catch (closeFailure: Throwable) {
             if (closeFailure is Error) throw closeFailure
-            if (closeFailure !== terminal) terminal.addSuppressed(closeFailure)
+            // vc243：不再把 closeFailure 挂到 terminal 的抑制链（API19 遇环会自递归）。
         }
         throw terminal
     }
@@ -197,7 +197,7 @@ class Iap2CsmChannel private constructor(
                 terminalFailure = failure
                 return failure
             }
-            if (prior !== failure) prior.addSuppressed(failure)
+            // vc243：只保留首个失败，不再串抑制链（API19 printStackTrace 遇环会自递归）。
             return prior
         }
     }

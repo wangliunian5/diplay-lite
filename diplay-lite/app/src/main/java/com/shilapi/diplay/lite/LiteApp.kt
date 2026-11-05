@@ -2,6 +2,7 @@ package com.shilapi.diplay.lite
 
 import android.app.Application
 import android.os.Environment
+import com.shilapi.xcertplay.diag.boundedTrace
 import java.io.File
 
 /**
@@ -19,7 +20,10 @@ class LiteApp : Application() {
             // 兜 Throwable：若是 OutOfMemoryError，拼字符串本身也可能抛 Error，
             // 用 catch(Exception) 会让崩溃日志本身二次失败、日志里什么都留不下。
             try {
-                LiteLog.log("crash", "线程 $thread 未捕获异常：${throwable.stackTraceToString()}")
+                LiteLog.log(
+                    "crash",
+                    "线程 $thread 未捕获异常：${throwable.boundedTrace(maxFrames = 12)}",
+                )
             } catch (_: Throwable) {
             }
             previous?.uncaughtException(thread, throwable)

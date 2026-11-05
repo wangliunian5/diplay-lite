@@ -15,6 +15,7 @@ import com.shilapi.xcertplay.airplay.MicrophoneConfig
 import com.shilapi.xcertplay.airplay.MicrophoneCounters
 import com.shilapi.xcertplay.airplay.MicrophonePacketizer
 import com.shilapi.xcertplay.airplay.toHexString
+import com.shilapi.xcertplay.diag.boundedTrace
 import java.io.Closeable
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -262,7 +263,7 @@ internal class MicrophoneUplink(
         val nextSocket = try {
             bindAnyPort()
         } catch (error: Exception) {
-            Log.e(TAG, "microphone socket creation failed", error)
+            Log.e(TAG, "microphone socket creation failed | ${error.boundedTrace()}")
             nextRecorder.release()
             nextEncoder?.close()
             return fail("socket creation failed: ${error.message}")
@@ -327,7 +328,7 @@ internal class MicrophoneUplink(
             )
             true
         } catch (error: Exception) {
-            Log.e(TAG, "microphone recording failed", error)
+            Log.e(TAG, "microphone recording failed | ${error.boundedTrace()}")
             fail("recording failed to start: ${error.message}")
             release()
             false
@@ -718,7 +719,7 @@ internal class MicrophoneUplink(
                     rotateSilentRecorder(old)
                 }
             } catch (error: Throwable) {
-                Log.e(TAG, "microphone rescue failed", error)
+                Log.e(TAG, "microphone rescue failed | ${error.boundedTrace()}")
                 diagnostics?.invoke(
                     "Microphone rescue failed: ${error.javaClass.simpleName}: ${error.message}",
                 )
@@ -934,7 +935,7 @@ internal class MicrophoneUplink(
             }
         } catch (error: Exception) {
             if (running.get()) {
-                Log.e(TAG, "microphone capture failed", error)
+                Log.e(TAG, "microphone capture failed | ${error.boundedTrace()}")
                 // 1.0.7：采集线程死亡必须落盘，否则字段日志看到"uplink started"后无下文。
                 diagnostics?.invoke(
                     "Microphone capture failed: ${error.javaClass.simpleName}: ${error.message}",
@@ -1430,7 +1431,7 @@ internal class MicrophoneUplink(
         try {
             opened.recorder.startRecording()
         } catch (error: Exception) {
-            Log.e(TAG, "microphone heal restart failed", error)
+            Log.e(TAG, "microphone heal restart failed | ${error.boundedTrace()}")
             // 回滚：attachAudioEffects 第一步（vc178 防泄漏）已把旧实例的 AEC/NS 放掉，
             // 而字段现指向挂在未启动新实例上的效果。先放掉新效果、释放新实例，
             // 再给旧实例重挂——否则旧源继续收音但平台回声消除永久丢失，

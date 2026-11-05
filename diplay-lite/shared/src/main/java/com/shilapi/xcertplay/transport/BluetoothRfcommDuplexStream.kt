@@ -203,9 +203,9 @@ class BluetoothRfcommDuplexStream(
         return if (Long.MAX_VALUE - now < delta) Long.MAX_VALUE else now + delta
     }
 
+    /** vc243：只保留首个失败，不再 addSuppressed 串链（API19 printStackTrace 遇环会自递归）。 */
     private fun combine(first: IOException?, second: IOException): IOException {
         if (first == null) return second
-        if (first !== second) first.addSuppressed(second)
         return first
     }
 

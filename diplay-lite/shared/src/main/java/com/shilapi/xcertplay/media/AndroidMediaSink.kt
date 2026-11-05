@@ -21,6 +21,7 @@ import com.shilapi.xcertplay.airplay.MediaSink
 import com.shilapi.xcertplay.airplay.MicrophoneConfig
 import com.shilapi.xcertplay.airplay.VideoCodec
 import com.shilapi.xcertplay.airplay.toHexString
+import com.shilapi.xcertplay.diag.boundedTrace
 import com.shilapi.xcertplay.media.BandwidthMonitor
 import java.io.Closeable
 import java.nio.ByteBuffer
@@ -660,7 +661,7 @@ private class VideoDecoder(
                     maybeRecoverRenderStall()
                     if (referenceChain.needsKeyFrame && lastConfig != null && outputSurface != null) requestKeyFrameIfDue()
                 } catch (error: Exception) {
-                    if (running) Log.e(TAG, "video decoder job failed: ${job?.javaClass?.simpleName}", error)
+                    if (running) Log.e(TAG, "video decoder job failed: ${job?.javaClass?.simpleName} | ${error.boundedTrace()}")
                     if (running) report(errorReport("decoder error", error))
                     fallBackFromSoftwareDecoder(error)
                     releaseDecoder()
@@ -671,7 +672,7 @@ private class VideoDecoder(
                     // 码率/帧长突变时可能抛 Error（OutOfMemoryError 等），catch(Exception) 兜不住，
                     // 逃出 run() 即线程死亡 → 进程被杀（用户反馈"视频流突然变大就闪退"）。
                     // 这里按普通解码失败处理：释放解码器、等下一个关键帧，保住进程。
-                    if (running) Log.e(TAG, "video decoder job crashed: ${job?.javaClass?.simpleName}", error)
+                    if (running) Log.e(TAG, "video decoder job crashed: ${job?.javaClass?.simpleName} | ${error.boundedTrace()}")
                     if (running) report(errorReport("decoder crashed", error))
                     fallBackFromSoftwareDecoder(error)
                     releaseDecoder()
@@ -1507,7 +1508,7 @@ private class AudioRenderer(
             // Worker shut down.
         } catch (error: Exception) {
             if (running) {
-                Log.e(TAG, "audio renderer worker failed", error)
+                Log.e(TAG, "audio renderer worker failed | ${error.boundedTrace()}")
                 report("Audio: renderer failed audioType=${format.audioType} error=${error.javaClass.simpleName}")
             }
         } catch (error: Throwable) {
@@ -1515,7 +1516,7 @@ private class AudioRenderer(
             // catch(Exception)；逃出去就是线程死亡 → 进程被系统杀掉（实测 C8815 无声闪退、零日志）。
             // 这里兜住并写进文件日志，让"哪条流、什么类型"可判读。
             if (running) {
-                Log.e(TAG, "audio renderer worker crashed", error)
+                Log.e(TAG, "audio renderer worker crashed | ${error.boundedTrace()}")
                 report("Audio: renderer crashed audioType=${format.audioType} error=${error.javaClass.name}")
             }
         } finally {
@@ -1573,7 +1574,7 @@ private class AudioRenderer(
                 }
             }
         } catch (error: Exception) {
-            Log.e(TAG, "audio decoder configuration failed mime=$mime", error)
+            Log.e(TAG, "audio decoder configuration failed mime=$mime | ${error.boundedTrace()}")
             report("Audio: decoder unavailable mime=$mime codec=${format.codec} type=${format.payloadType}")
             null
         }

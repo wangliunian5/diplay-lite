@@ -24,12 +24,14 @@ import javax.net.ssl.SSLContext
  *
  * 文件结构（用户拍板 vc240-upload-merge）：
  * ① 头区：元信息 + 采集范围说明；
- * ② 骨架区：dongle/配对/锚点/总闸链路行，完整不裁剪（上限 160KB，含 -old.txt，old 在前）；
+ * ② 骨架区：dongle/配对/锚点/总闸链路行（上限 160KB，含 -old.txt，old 在前）；
  * ③ 滚动区：最近 20 分钟（整段丢弃 `TRACE airplay`；`bulk read fail` 仅首尾取样+计数）；
  * ④ 尾区：最后 30 秒 + 收尾锚点 + 裁剪说明。
  *
  * 体积上限 768KB；裁剪优先级：TRACE → bulk 噪声 → 非关键杂项 → 周期 stats 只留最近 2 分钟
- * → 骨架（除超 160KB 外绝不裁）。每次裁剪都在文件里留一行明确的省略说明。
+ * → 骨架明细。骨架超 160KB 时按 gen 裁剪，但**每个出现过的 gen 至少保留一条关键锚点行**
+ * （vc242 修 vc241 缺陷：旧策略「保首个 gen + 最近 3 个 gen」会让中间 gen 整段消失），
+ * 每个 gen 内优先省略 HCI init 明细并落一行计数说明；每次裁剪都在文件里留明确的省略说明。
  *
  * 失败兜底：四段式组装异常/为空时回落到 [DongleLogUploader]（skeleton 模式，文件名与头部
  * 字段格式保持 `dongle-*.txt` 兼容，`ANCHOR` 前缀不变）。
@@ -43,15 +45,17 @@ object RuntimeLogUploader {
     private const val STATS_RECENT_MILLIS = 2 * 60_000L
     private const val TIMEOUT_MILLIS = 60_000L
     private const val RESERVE_BYTES = 2048
-    private const val MAX_SKELETON_GENS_KEPT = 4 // 首个 gen + 最近 3 个 gen
+
+    /** 骨架裁剪时给统计行/每段省略标记预留的字节。 */
+    private const val SKELETON_NOTE_RESERVE = 2048
 
     private const val TRACE_MARK = "TRACE airplay"
     private const val BULK_MARK = "bulk read fail"
     private const val ANCHOR_MARK = "ANCHOR "
 
-    private const val SKELETON_SEP = "──── 骨架区（完整，不裁剪） ────"
-    private const val ROLLING_SEP = "──── 滚动区（最近 20 分钟） ────"
-    private const val TAIL_SEP = "──── 尾区（最后 30 秒 + 收尾锚点） ────"
+    internal const val SKELETON_SEP = "──── 骨架区（每个 gen 至少保留锚点行） ────"
+    internal const val ROLLING_SEP = "──── 滚动区（最近 20 分钟） ────"
+    internal const val TAIL_SEP = "──── 尾区（最后 30 秒 + 收尾锚点） ────"
 
     private val TIME_REGEX = Regex("^(\\d{2})-(\\d{2}) (\\d{2}):(\\d{2}):(\\d{2})\\.(\\d{3})")
     private val GEN_REGEX = Regex("gen=(\\d+)")
@@ -64,6 +68,22 @@ object RuntimeLogUploader {
         "session_active", "acl",
     )
 
+    /**
+     * 骨架关键锚点行（小写匹配）：任何裁剪下每个 gen 至少保留一条，
+     * 保证「某个 gen 存在过」始终可查。配对事件只收中文/显式 pair 事件，
+     * 避免把 HCI init 的 `WriteSimplePairingMode` 也算成锚点。
+     */
+    private val SKELETON_KEY_MARKS = arrayOf(
+        "anchor ", "session_active", "scan mode ->", "gate-off", "gate-on",
+        "acl 链路建立", "pair-begin", "pair-done", "配对",
+    )
+
+    /** 骨架里优先省略的 HCI 初始化明细。 */
+    private val SKELETON_HCI_MARKS = arrayOf(
+        "hci cmd", "writeelapsedms", "init sequence", "enqueue first command",
+        "host: start entered",
+    )
+
     /** 非关键杂项 tag：滚动区超预算时优先省略（[ui]/[media]/[log]/配对与锚点不在此列）。 */
     private val MISC_TAGS = setOf("statusbar", "cluster", "app", "service", "usbfx", "pcap", "vpn")
 
@@ -73,7 +93,7 @@ object RuntimeLogUploader {
     /** 上传结果：ok=true 时 remoteName=仓库内真实文件名（409 冲突可能加 -1 后缀）。 */
     class Result(val ok: Boolean, val remoteName: String?, val error: String?)
 
-    private class Entry(val line: String, val tod: Long?)
+    internal class Entry(val line: String, val tod: Long?)
 
     private class GenGroup(val gen: Int?, val lines: ArrayList<String>)
 
@@ -232,7 +252,7 @@ object RuntimeLogUploader {
         return traceDropped
     }
 
-    private fun isSkeletonLine(lower: String): Boolean {
+    internal fun isSkeletonLine(lower: String): Boolean {
         if (lower.contains(BULK_MARK)) return false
         if (lower.contains(ANCHOR_MARK.lowercase(Locale.US))) return true
         for (keyword in SKELETON_KEYWORDS) {
@@ -241,9 +261,48 @@ object RuntimeLogUploader {
         return false
     }
 
-    /** 骨架区：完整保留；超 160KB 时保首个 gen + 最近 3 个 gen，再超则首尾双保留。 */
-    private fun fitSkeleton(entries: List<Entry>, cap: Int): Pair<String, Int> {
+    /**
+     * 骨架区：不超 160KB 时原样保留；超限时按 gen 分组裁剪，但**每个出现过的 gen 至少保留
+     * 一条关键锚点行**（vc242）。每个 gen 内优先省略 HCI init 明细，保留头尾若干行，
+     * 每段落一行省略计数；顶部落总体统计（保留 gen 数、每段行数、省略行数、抽样规则）。
+     */
+    internal fun fitSkeleton(entries: List<Entry>, cap: Int): Pair<String, Int> {
         if (entries.isEmpty()) return "（无 dongle/链路骨架行）\n" to 0
+        val groups = groupByGen(entries)
+        val fullBytes = bytesOfGroups(groups)
+        if (fullBytes <= cap) {
+            val text = buildString {
+                groups.forEach { group -> group.lines.forEach { append(it).append('\n') } }
+            }
+            return text to entries.size
+        }
+
+        // 关键锚点行必须保留；某段完全没有关键行时用该段首行代表，保证 gen 存在过可查。
+        val keySets = groups.map { group ->
+            group.lines.indices.filter { isKeyAnchorLine(group.lines[it]) }.toMutableSet()
+        }
+        keySets.forEachIndexed { i, set ->
+            if (set.isEmpty() && groups[i].lines.isNotEmpty()) set.add(0)
+        }
+
+        val mustBytes = bytesOfIndices(groups, keySets)
+        val contextBudget = (cap - SKELETON_NOTE_RESERVE - mustBytes).coerceAtLeast(0)
+        var keep = buildKeep(groups, keySets, contextBudget)
+        var text = renderSkeleton(groups, keep, entries.size, fullBytes)
+        if (sectionBytes(text) > cap) {
+            // 极端兜底：关键锚点行本身超额 → 每段只留首条锚点，仍保证 gen 连续可查。
+            val minimal = keySets.map { set ->
+                if (set.isEmpty()) mutableSetOf() else mutableSetOf(set.minOrNull()!!)
+            }
+            keep = buildKeep(groups, minimal, 0)
+            text = renderSkeleton(groups, keep, entries.size, fullBytes)
+        }
+        val kept = keep.sumOf { arr -> arr.count { it } }
+        return text to kept
+    }
+
+    /** 按行内 `gen=` 分组；无 gen 的前导行单独成段（gen=null）。 */
+    private fun groupByGen(entries: List<Entry>): List<GenGroup> {
         val groups = ArrayList<GenGroup>()
         var current: GenGroup? = null
         for (entry in entries) {
@@ -258,60 +317,136 @@ object RuntimeLogUploader {
                 group.lines.add(entry.line)
             }
         }
-        var selected: List<GenGroup> = groups
-        if (bytesOfGroups(groups) > cap) {
-            val genGroups = groups.filter { it.gen != null }
-            if (genGroups.size > MAX_SKELETON_GENS_KEPT) {
-                val keep = HashSet<GenGroup>()
-                keep.add(genGroups.first())
-                keep.addAll(genGroups.takeLast(3))
-                selected = groups.filter { it.gen == null || keep.contains(it) }
-            }
-        }
-        var lines = selected.flatMap { it.lines }
-        var omitted = entries.size - lines.size
-        if (bytesOfLines(lines) > cap) {
-            val budget = (cap - 512).coerceAtLeast(256)
-            val (head, tail, dropped) = headTail(lines, budget)
-            val marker = "… 骨架区超 160KB：省略 $dropped 行" +
-                "（保首个 gen 与最近 3 个 gen 的首尾锚点，中间已裁）…"
-            lines = head + listOf(marker) + tail
-            omitted += dropped
-        }
-        val text = buildString {
-            if (omitted > 0) {
-                append("（骨架区：完整骨架超 160KB，按「首个 gen + 最近 3 个 gen」保留，省略 ")
-                    .append(omitted).append(" 行）\n")
-            }
-            lines.forEach { append(it).append('\n') }
-        }
-        return text to lines.size
+        return groups
     }
 
-    /** 骨架超限兜底：按字节保留首尾各一半（中间插省略标记）。 */
-    private fun headTail(
-        lines: List<String>,
-        budget: Int,
-    ): Triple<List<String>, List<String>, Int> {
-        val half = (budget / 2).coerceAtLeast(128)
-        var headBytes = 0
-        var headEnd = 0
-        while (headEnd < lines.size) {
-            val next = lineBytes(lines[headEnd])
-            if (headBytes + next > half) break
-            headBytes += next
-            headEnd++
+    /** 关键锚点：ANCHOR / SESSION_ACTIVE / scan mode -> / gate-off|on / ACL 建立 / 配对事件。 */
+    private fun isKeyAnchorLine(line: String): Boolean {
+        val lower = line.lowercase(Locale.US)
+        for (mark in SKELETON_KEY_MARKS) {
+            if (lower.contains(mark)) return true
         }
-        var tailBytes = 0
-        var tailStart = lines.size
-        while (tailStart > headEnd) {
-            val next = lineBytes(lines[tailStart - 1])
-            if (tailBytes + next > half) break
-            tailBytes += next
-            tailStart--
-        }
-        return Triple(lines.subList(0, headEnd), lines.subList(tailStart, lines.size), tailStart - headEnd)
+        return false
     }
+
+    private fun isHciDetailLine(line: String): Boolean {
+        if (isKeyAnchorLine(line)) return false
+        val lower = line.lowercase(Locale.US)
+        for (mark in SKELETON_HCI_MARKS) {
+            if (lower.contains(mark)) return true
+        }
+        return false
+    }
+
+    /** 在必须保留的锚点之外，按段均分预算补头尾上下文行。 */
+    private fun buildKeep(
+        groups: List<GenGroup>,
+        must: List<Set<Int>>,
+        budget: Int,
+    ): List<BooleanArray> {
+        val keep = groups.map { group -> BooleanArray(group.lines.size) }
+        groups.indices.forEach { i -> must[i].forEach { keep[i][it] = true } }
+        if (budget <= 0 || groups.isEmpty()) return keep
+        val share = budget / groups.size
+        groups.forEachIndexed { i, group ->
+            val set = keep[i]
+            val half = (share / 2).coerceAtLeast(64)
+            var used = 0
+            var head = 0
+            while (head < group.lines.size) {
+                if (!set[head]) {
+                    val next = lineBytes(group.lines[head])
+                    if (used + next > half) break
+                    set[head] = true
+                    used += next
+                }
+                head++
+            }
+            used = 0
+            var tail = group.lines.size - 1
+            while (tail >= 0) {
+                if (!set[tail]) {
+                    val next = lineBytes(group.lines[tail])
+                    if (used + next > half) break
+                    set[tail] = true
+                    used += next
+                }
+                tail--
+            }
+        }
+        return keep
+    }
+
+    /** 渲染骨架区：顶部统计行 + 每段保留行 + 每段省略计数。 */
+    private fun renderSkeleton(
+        groups: List<GenGroup>,
+        keep: List<BooleanArray>,
+        totalLines: Int,
+        totalBytes: Int,
+    ): String {
+        var keptLines = 0
+        var keptBytes = 0
+        var omittedLines = 0
+        var omittedHci = 0
+        groups.forEachIndexed { i, group ->
+            keep[i].forEachIndexed { idx, on ->
+                if (on) {
+                    keptLines++
+                    keptBytes += lineBytes(group.lines[idx])
+                } else {
+                    omittedLines++
+                    if (isHciDetailLine(group.lines[idx])) omittedHci++
+                }
+            }
+        }
+        val gens = groups.mapNotNull { it.gen }.distinct()
+        val stats = buildString {
+            append("（骨架区：完整 $totalLines 行 / ${kbText(totalBytes)} 超 160KB 上限；")
+            append("按「每个 gen 强制保留关键锚点行 + 该 gen 头尾各若干行、优先省略 HCI 明细」裁剪：")
+            append("保留 ${gens.size} 个 gen")
+            if (gens.isNotEmpty()) {
+                append("（").append(gens.joinToString("、") { "gen=$it" }).append("）")
+            }
+            append("，保留 $keptLines 行 / ${kbText(keptBytes)}，")
+            append("省略 $omittedLines 行（其中 HCI 明细 $omittedHci 行）)\n")
+            val perGroup = groups.indices.joinToString("、") { i ->
+                val label = groups[i].gen?.let { "gen=$it" } ?: "无 gen 段"
+                "$label:${keep[i].count { it }}"
+            }
+            if (perGroup.isNotEmpty()) append("（骨架区每段保留行数：$perGroup）\n")
+        }
+        val body = buildString {
+            groups.forEachIndexed { i, group ->
+                val label = group.gen?.let { "gen=$it" } ?: "无 gen 段"
+                var idx = 0
+                while (idx < group.lines.size) {
+                    if (keep[i][idx]) {
+                        append(group.lines[idx]).append('\n')
+                        idx++
+                    } else {
+                        val start = idx
+                        var hci = 0
+                        while (idx < group.lines.size && !keep[i][idx]) {
+                            if (isHciDetailLine(group.lines[idx])) hci++
+                            idx++
+                        }
+                        append("… 骨架裁剪：$label 已省略 ${idx - start} 行（其中 HCI 明细 $hci 行）…\n")
+                    }
+                }
+            }
+        }
+        return stats + body
+    }
+
+    /** 关键锚点行 + 上下文行合计字节。 */
+    private fun bytesOfIndices(groups: List<GenGroup>, sets: List<Set<Int>>): Int {
+        var total = 0
+        groups.indices.forEach { i -> sets[i].forEach { total += lineBytes(groups[i].lines[it]) } }
+        return total
+    }
+
+    private fun kbText(bytes: Int): String =
+        String.format(Locale.US, "%.1fKB", bytes / 1024.0)
 
     /** 滚动区：已过滤 TRACE/bulk；超预算按 非关键杂项 → 周期 stats(2min) → 硬裁 依次省略。 */
     private fun fitRolling(
@@ -442,7 +577,8 @@ object RuntimeLogUploader {
             .append(if (hasOld) "（含 -old.txt 轮转段，old 在前）" else "（无轮转段）")
             .append('\n')
         append("──── 采集范围 ────\n")
-        append("骨架区：dongle 检测/初始化/配对/锚点/总闸链路，完整不裁剪（上限 160KB，含 -old.txt）\n")
+        append("骨架区：dongle 检测/初始化/配对/锚点/总闸链路（上限 160KB，含 -old.txt；")
+        append("超限时每个 gen 至少保留一条锚点行，优先省略 HCI 明细）\n")
         append("滚动区：最近 20 分钟（").append(todText(rollingStart)).append(" ~ ")
             .append(todText(nowTod - TAIL_WINDOW_MILLIS)).append("），整段丢弃 TRACE airplay\n")
         append("尾区：最后 30 秒（").append(todText(nowTod - TAIL_WINDOW_MILLIS)).append(" ~ ")

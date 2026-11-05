@@ -6,7 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
-import android.util.Log
+import com.shilapi.xcertplay.diag.boundedTrace
 
 /**
  * 开机自启：
@@ -49,7 +49,7 @@ class BootReceiver : BroadcastReceiver() {
                 if (config.bootAutoHotspot) ensureHotspotOn(context)
                 LiteLog.log("boot", "开机自启流程完成")
             } catch (error: Throwable) {
-                LiteLog.log("boot", "开机自启流程失败: ${Log.getStackTraceString(error)}")
+                LiteLog.log("boot", "开机自启流程失败: ${error.boundedTrace()}")
             } finally {
                 pending.finish()
             }
